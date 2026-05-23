@@ -81,6 +81,34 @@
         "gpt5": "gpt-5.5",
         "gpt5-mini": "gpt-5.4-mini"
       }
+    },
+    "mistral": {
+      "displayName": "Mistral Vibe",
+      "tier": "D",
+      "candidate": true,
+      "comment": "Model IDs sourced from canonical Mistral models registry (https://docs.mistral.ai/getting-started/models/models_overview, retrieved 2026-05-23). Each id is the date-stamped canonical form Mistral's own model registry uses. The short forms (devstral-2, devstral-small-2) are aliases used in Vibe's config.toml TOML examples and are exposed as user-facing aliases below. Both models have 262144-token context window per the canonical registry + DOCS-5 launch announcement.",
+      "models": [
+        {
+          "id": "devstral-2-25-12",
+          "displayName": "Devstral 2",
+          "contextWindow": 262144,
+          "deprecated": false,
+          "note": "123B-parameter dense transformer. DOCS-5: $0.40/$2.00 per million tokens (input/output). Canonical date-stamped id; Vibe config.toml accepts the short form 'devstral-2' as an alias."
+        },
+        {
+          "id": "devstral-small-2-25-12",
+          "displayName": "Devstral Small 2",
+          "contextWindow": 262144,
+          "deprecated": false,
+          "note": "24B-parameter model, runs on consumer-grade GPUs. DOCS-5: $0.10/$0.30 per million tokens (input/output). Canonical date-stamped id; Vibe config.toml accepts the short form 'devstral-small-2' as an alias."
+        }
+      ],
+      "aliases": {
+        "devstral": "devstral-2-25-12",
+        "devstral-2": "devstral-2-25-12",
+        "devstral-small": "devstral-small-2-25-12",
+        "devstral-small-2": "devstral-small-2-25-12"
+      }
     }
   }
 }

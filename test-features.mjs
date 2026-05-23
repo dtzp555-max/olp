@@ -50,6 +50,16 @@ import codex, {
   __setSpawnImpl as codexSetSpawnImpl,
   __resetSpawnImpl as codexResetSpawnImpl,
 } from './lib/providers/codex.mjs';
+import mistral, {
+  irToMistral,
+  mistralChunkToIR,
+  readAuthArtifact as mistralReadAuthArtifact,
+  estimateCost as mistralEstimateCost,
+  quotaStatus as mistralQuotaStatus,
+  healthCheck as mistralHealthCheck,
+  __setSpawnImpl as mistralSetSpawnImpl,
+  __resetSpawnImpl as mistralResetSpawnImpl,
+} from './lib/providers/mistral.mjs';
 import modelsRegistry from './models-registry.json' with { type: 'json' };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -488,9 +498,9 @@ describe('Provider contract validation', () => {
 // ── Suite 5: Plugin registry ──────────────────────────────────────────────
 
 describe('Plugin registry', () => {
-  it('STATIC_REGISTRY has 2 entries (anthropic + openai candidates) at D6', () => {
-    // D4 added anthropic; D6 adds openai. Default config has both enabled:false.
-    assert.equal(listAllProviderNames().length, 2);
+  it('STATIC_REGISTRY has 3 entries (anthropic + openai + mistral candidates) at D8', () => {
+    // D4 added anthropic; D6 adds openai; D8 adds mistral. Default config has all enabled:false.
+    assert.equal(listAllProviderNames().length, 3);
   });
 
   it('loadProviders with empty config → empty Map (anthropic not enabled)', () => {
@@ -503,9 +513,9 @@ describe('Plugin registry', () => {
     assert.equal(m.size, 0);
   });
 
-  it('listAllProviderNames returns [anthropic, openai] at D6', () => {
-    // D4: ['anthropic']. D6 adds openai.
-    assert.deepEqual(listAllProviderNames(), ['anthropic', 'openai']);
+  it('listAllProviderNames returns [anthropic, openai, mistral] at D8', () => {
+    // D4: ['anthropic']. D6 adds openai. D8 adds mistral.
+    assert.deepEqual(listAllProviderNames(), ['anthropic', 'openai', 'mistral']);
   });
 
   it('getProviderForModel returns null when no providers loaded', () => {
@@ -2124,9 +2134,10 @@ describe('Codex plugin (D6)', () => {
     assert.equal(codex.hints.concurrentSpawnSafe, true);
   });
 
-  // ── Test 15: STATIC_REGISTRY length after D6 ─────────────────────────
-  it('STATIC_REGISTRY.length === 2 after D6 (anthropic + openai)', () => {
-    assert.equal(listAllProviderNames().length, 2);
+  // ── Test 15: STATIC_REGISTRY length after D8 still includes openai ────
+  it('STATIC_REGISTRY includes openai (D6) after D8 (length >= 2)', () => {
+    // D8 adds mistral; anthropic + openai must still be present.
+    assert.ok(listAllProviderNames().length >= 2);
     assert.ok(listAllProviderNames().includes('anthropic'));
     assert.ok(listAllProviderNames().includes('openai'));
   });
@@ -2319,4 +2330,672 @@ describe('Anthropic E2E — real claude spawn (Suite 10)', { skip: !RUN_E2E }, (
       `Cache hit response should also contain "OK", got: ${content2}`,
     );
   });
+});
+
+// ── Suite 12: Mistral Vibe plugin (D8) ───────────────────────────────────
+//
+// All tests are UNIT tests. No real `vibe` binary is invoked.
+// Mock spawn is injected via mistralSetSpawnImpl / mistralResetSpawnImpl.
+//
+// Authority: Mistral Vibe docs (WebFetched 2026-05-23):
+//   DOCS-1: https://docs.mistral.ai/mistral-vibe/terminal/quickstart
+//     § "--prompt TEXT" + "--output FORMAT" — programmatic mode syntax
+//   DOCS-2: https://docs.mistral.ai/mistral-vibe/terminal/configuration
+//     § "~/.vibe/.env" — auth file; MISTRAL_API_KEY env var
+//   DOCS-5: https://mistral.ai/news/devstral-2-vibe-cli
+//     § "Devstral 2", "Devstral Small 2" — model names
+//   DOCS-6: https://help.mistral.ai/en/articles/347532
+//     § "Mistral Vibe is included in every Le Chat Pro subscription"
+//   DOCS-7: https://legal.mistral.ai/terms/usage-policy
+//     § No anti-third-party clauses (Tier D confirmed for ADR 0006)
+//
+// Spec assumption acknowledgements (see mistral.mjs header):
+//   A1 CONFIRMED: `vibe --prompt "PROMPT" --output json` spawn shape
+//   A2 CONFIRMED: MISTRAL_API_KEY env var is the auth mechanism
+//   A3 CONFIRMED: ~/.vibe/.env is the auth file path
+//   A4 UNPINNED: JSON output event schema — defensive 4-shape parser used
+//   A5 UNPINNED: --model flag existence not confirmed by docs
+//   A6 UNPINNED: exact model IDs (devstral-2, devstral-small-2) best-effort
+//   A7 UNPINNED: --output json is NDJSON not single blob
+//   A8 UNPINNED: multi-line prompt handling via --prompt flag
+//
+// Lossy-translation acknowledgements per ADR 0003 (documented in mistral.mjs header):
+//   top_p, temperature, stop, max_tokens, tools[], tool_calls → all dropped.
+
+/**
+ * Creates a fake JSON-line-emitting mock spawn for Mistral Vibe.
+ * Lines are emitted as they would arrive from `vibe --output json`
+ * (D8 assumption A7: NDJSON lines — D-later will pin the real format).
+ *
+ * @param {string[]} jsonLines — raw JSON lines emitted in order (no trailing \n needed)
+ * @param {number} [exitCode=0]
+ */
+function makeMockMistralSpawn(jsonLines, exitCode = 0) {
+  return function mockMistralSpawnImpl(_bin, _args, _opts) {
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.stdin = {
+      write: () => {},
+      end: () => {
+        setImmediate(async () => {
+          for (const line of jsonLines) {
+            proc.stdout.emit('data', Buffer.from(line + '\n'));
+          }
+          proc.stdout.emit('end');
+          proc.stderr.emit('end');
+          proc.emit('close', exitCode, null);
+        });
+      },
+    };
+    proc.killed = false;
+    proc.kill = () => {};
+    return proc;
+  };
+}
+
+describe('Mistral Vibe plugin (D8)', () => {
+
+  // ── Test 1: Contract conformance ──────────────────────────────────────
+  it('mistral module satisfies validateProvider() — all 10 fields present', () => {
+    const { valid, errors } = validateProvider(mistral);
+    assert.equal(valid, true, `Validation errors: ${errors.join('; ')}`);
+    assert.ok('name' in mistral, 'missing: name');
+    assert.ok('displayName' in mistral, 'missing: displayName');
+    assert.ok('contractVersion' in mistral, 'missing: contractVersion');
+    assert.ok('models' in mistral, 'missing: models');
+    assert.ok('auth' in mistral, 'missing: auth');
+    assert.ok(typeof mistral.spawn === 'function', 'missing: spawn');
+    assert.ok(typeof mistral.estimateCost === 'function', 'missing: estimateCost');
+    assert.ok(typeof mistral.quotaStatus === 'function', 'missing: quotaStatus');
+    assert.ok(typeof mistral.healthCheck === 'function', 'missing: healthCheck');
+    assert.ok('hints' in mistral, 'missing: hints');
+  });
+
+  // ── Test 2: contractVersion === '1.0' ────────────────────────────────
+  it('mistral declares contractVersion === "1.0"', () => {
+    assert.equal(mistral.contractVersion, '1.0');
+  });
+
+  // ── Test 3: name and displayName ─────────────────────────────────────
+  it('mistral.name === "mistral" and displayName is set', () => {
+    assert.equal(mistral.name, 'mistral');
+    assert.equal(typeof mistral.displayName, 'string');
+    assert.ok(mistral.displayName.length > 0);
+    assert.ok(mistral.displayName.toLowerCase().includes('mistral'));
+  });
+
+  // ── Test 4: models include all registry IDs + aliases ────────────────
+  it('mistral.models includes every canonical registry id AND every alias', () => {
+    // The plugin merges canonical IDs and alias keys into models[] so that
+    // getProviderForModel routes either form. Test that the registry's
+    // canonical IDs are a subset, and the aliases are all included too.
+    const registryIds = modelsRegistry.providers.mistral.models.map(m => m.id);
+    const registryAliases = Object.keys(modelsRegistry.providers.mistral.aliases ?? {});
+    for (const id of registryIds) {
+      assert.ok(mistral.models.includes(id), `canonical id ${id} missing from mistral.models`);
+    }
+    for (const alias of registryAliases) {
+      assert.ok(mistral.models.includes(alias), `alias ${alias} missing from mistral.models`);
+    }
+    assert.equal(mistral.models.length, registryIds.length + registryAliases.length);
+  });
+
+  it('mistral.models contains canonical IDs + short-form aliases', () => {
+    // Per canonical models registry (docs.mistral.ai/getting-started/models/
+    // models_overview, D8 review-2 finding): canonical IDs are date-stamped
+    // (devstral-2-25-12, devstral-small-2-25-12). Vibe config.toml uses short
+    // forms (devstral-2, devstral-small-2). Plugin exposes BOTH so
+    // getProviderForModel routes either form.
+    assert.ok(mistral.models.includes('devstral-2-25-12'), 'missing canonical devstral-2-25-12');
+    assert.ok(mistral.models.includes('devstral-small-2-25-12'), 'missing canonical devstral-small-2-25-12');
+    assert.ok(mistral.models.includes('devstral-2'), 'missing short-form alias devstral-2');
+    assert.ok(mistral.models.includes('devstral-small-2'), 'missing short-form alias devstral-small-2');
+    assert.ok(mistral.models.includes('devstral'), 'missing alias devstral');
+    assert.ok(mistral.models.includes('devstral-small'), 'missing alias devstral-small');
+    // Length: 2 canonical + 4 aliases = 6 total
+    assert.equal(mistral.models.length, 6, `Expected 6 entries (2 canonical + 4 aliases), got ${mistral.models.length}`);
+  });
+
+  // ── Test 5: getProviderForModel finds mistral for each model ──────────
+  it('getProviderForModel finds mistral for devstral-2', () => {
+    const loaded = new Map([['mistral', mistral]]);
+    const result = getProviderForModel(loaded, 'devstral-2');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'mistral');
+  });
+
+  it('getProviderForModel finds mistral for devstral-small-2', () => {
+    const loaded = new Map([['mistral', mistral]]);
+    const result = getProviderForModel(loaded, 'devstral-small-2');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'mistral');
+  });
+
+  // ── Test 6: irToMistral translation ──────────────────────────────────
+  it('irToMistral: user message → args with --prompt and --output streaming', () => {
+    // Authority: DOCS-1 § "Output Format Options" — `streaming` is the
+    // newline-delimited JSON per message mode. `json` emits a single blob
+    // at the end (D8 review-2 finding: original draft used `json`,
+    // incompatible with the line-buffered stdout parser; corrected to
+    // `streaming` per docs verbatim).
+    const ir = makeIR({
+      model: 'devstral-2',
+      messages: [{ role: 'user', content: 'Hello world' }],
+    });
+    const { args, prompt } = irToMistral(ir);
+    assert.ok(args.includes('--prompt'), 'args must include "--prompt"');
+    assert.ok(args.includes('--output'), 'args must include "--output"');
+    assert.ok(args.includes('streaming'), 'args must include "streaming" output format (NDJSON per docs)');
+    assert.ok(!args.includes('json'), 'args must NOT include "json" (single-blob mode, incompatible with line-buffered parser)');
+    // D8 assumption A5: --model NOT in args (flag existence unconfirmed from docs)
+    assert.ok(!args.includes('--model'), 'args must NOT include "--model" at D8 (A5 UNPINNED)');
+    assert.ok(typeof prompt === 'string', 'prompt must be a string');
+    assert.ok(prompt.includes('Hello world'), 'prompt must contain user text');
+  });
+
+  it('irToMistral: system + user → system annotation + user text in prompt', () => {
+    const ir = makeIR({
+      model: 'devstral-2',
+      messages: [
+        { role: 'system', content: 'You are a coding assistant.' },
+        { role: 'user', content: 'Write a function.' },
+      ],
+    });
+    const { prompt } = irToMistral(ir);
+    assert.ok(prompt.includes('[System] You are a coding assistant.'));
+    assert.ok(prompt.includes('Write a function.'));
+  });
+
+  it('irToMistral: assistant prior turn → [Assistant] annotation', () => {
+    const ir = makeIR({
+      model: 'devstral-2',
+      messages: [
+        { role: 'user', content: 'Hi' },
+        { role: 'assistant', content: 'Hello!' },
+        { role: 'user', content: 'Thanks' },
+      ],
+    });
+    const { prompt } = irToMistral(ir);
+    assert.ok(prompt.includes('[Assistant] Hello!'));
+    assert.ok(prompt.includes('Thanks'));
+  });
+
+  it('irToMistral: tool result turn → [Tool Result] annotation', () => {
+    const ir = makeIR({
+      model: 'devstral-2',
+      messages: [
+        { role: 'user', content: 'Search for X' },
+        { role: 'tool', content: '{"results":[]}', name: 'search' },
+      ],
+    });
+    const { prompt } = irToMistral(ir);
+    assert.ok(prompt.includes('[Tool Result'));
+    assert.ok(prompt.includes('search'));
+  });
+
+  it('irToMistral: response_format json_object injects system prompt (lossy)', () => {
+    // ADR 0003 § Lossy: Vibe CLI does not honor response_format natively.
+    const ir = makeIR({
+      model: 'devstral-2',
+      messages: [{ role: 'user', content: 'Give JSON' }],
+      response_format: { type: 'json_object' },
+    });
+    const { prompt } = irToMistral(ir);
+    assert.ok(prompt.includes('Reply with valid JSON only'));
+  });
+
+  it('irToMistral: tool_calls in assistant message — content preserved, metadata dropped (lossy)', () => {
+    // ADR 0003 § Lossy: structured tool_calls dropped; textual content preserved.
+    const ir = makeIR({
+      model: 'devstral-2',
+      messages: [
+        { role: 'user', content: 'Search for X' },
+        {
+          role: 'assistant',
+          content: 'Searching...',
+          tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'search', arguments: '{"q":"X"}' } }],
+        },
+      ],
+    });
+    const { prompt } = irToMistral(ir);
+    assert.ok(prompt.includes('Searching...'), 'assistant text content must be preserved');
+    // tool_calls metadata documented as dropped (lossy) — do NOT assert it's present
+  });
+
+  it('irToMistral: array content is JSON-stringified', () => {
+    const ir = makeIR({
+      model: 'devstral-2',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    });
+    const { prompt } = irToMistral(ir);
+    assert.ok(typeof prompt === 'string');
+    assert.ok(prompt.includes('text'));
+  });
+
+  // ── Test 7: mistralChunkToIR translation ──────────────────────────────
+  it('mistralChunkToIR: text field → delta chunk (Mistral La Plateforme shape)', () => {
+    // D8 assumption A4: "text" is the preferred field name.
+    const chunk = mistralChunkToIR('{"text":"Hello world"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.content, 'Hello world');
+  });
+
+  it('mistralChunkToIR: content field → delta chunk (OpenAI-compat shape)', () => {
+    // D8 assumption A4: "content" as fallback field name.
+    const chunk = mistralChunkToIR('{"content":"Hello world"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.content, 'Hello world');
+  });
+
+  it('mistralChunkToIR: delta field shape → delta chunk', () => {
+    // D8 assumption A4: { type: 'delta', delta: '...' } shape.
+    const chunk = mistralChunkToIR('{"type":"delta","delta":"token text"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.content, 'token text');
+  });
+
+  it('mistralChunkToIR: OpenAI streaming choices[0].delta.content shape → delta', () => {
+    // D8 assumption A4: Vibe may use OpenAI streaming event shape.
+    const chunk = mistralChunkToIR('{"choices":[{"delta":{"content":"output"},"finish_reason":null}]}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.content, 'output');
+  });
+
+  it('mistralChunkToIR: type === "stop" → stop chunk', () => {
+    const chunk = mistralChunkToIR('{"type":"stop"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'stop');
+    assert.equal(chunk.finish_reason, 'stop');
+  });
+
+  it('mistralChunkToIR: done === true → stop chunk', () => {
+    const chunk = mistralChunkToIR('{"done":true}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'stop');
+    assert.equal(chunk.finish_reason, 'stop');
+  });
+
+  it('mistralChunkToIR: OpenAI streaming stop via choices[0].finish_reason === "stop"', () => {
+    // D8 assumption A4: OpenAI streaming stop shape.
+    const chunk = mistralChunkToIR('{"choices":[{"delta":{},"finish_reason":"stop"}]}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'stop');
+    assert.equal(chunk.finish_reason, 'stop');
+  });
+
+  it('mistralChunkToIR: type === "error" → error chunk', () => {
+    const chunk = mistralChunkToIR('{"type":"error","error":"quota exceeded"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'error');
+    assert.equal(chunk.error, 'quota exceeded');
+  });
+
+  it('mistralChunkToIR: error field present → error chunk', () => {
+    const chunk = mistralChunkToIR('{"error":"something went wrong","code":429}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'error');
+  });
+
+  it('mistralChunkToIR: unknown/progress event type → null (silently ignored)', () => {
+    const chunk = mistralChunkToIR('{"type":"progress","step":1}');
+    assert.equal(chunk, null);
+  });
+
+  it('mistralChunkToIR: empty line → null', () => {
+    assert.equal(mistralChunkToIR(''), null);
+    assert.equal(mistralChunkToIR('   '), null);
+  });
+
+  it('mistralChunkToIR: malformed JSON → null (no throw)', () => {
+    assert.doesNotThrow(() => {
+      const result = mistralChunkToIR('{bad json');
+      assert.equal(result, null);
+    });
+  });
+
+  // ── Test 8: mock spawn — JSON stream yields correct IR chunks ──────────
+  it('spawn with mock: JSON lines → delta chunks then stop chunk', async () => {
+    const fakeSpawn = makeMockMistralSpawn([
+      '{"text":"Hello"}',
+      '{"text":" world"}',
+      '{"type":"stop"}',
+    ]);
+    mistralSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'devstral-2',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      const authCtx = { apiKey: '<fake-mistral-api-key>' };
+      const chunks = [];
+      for await (const chunk of mistral.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const deltas = chunks.filter(c => c.type === 'delta');
+      const stops = chunks.filter(c => c.type === 'stop');
+      assert.ok(deltas.length >= 1, `Expected at least 1 delta, got ${deltas.length}`);
+      assert.equal(stops.length, 1, `Expected 1 stop, got ${stops.length}`);
+      const allContent = deltas.map(c => c.content).join('');
+      assert.equal(allContent, 'Hello world');
+    } finally {
+      mistralResetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: first delta chunk has role=assistant', async () => {
+    const fakeSpawn = makeMockMistralSpawn(['{"text":"Test output"}']);
+    mistralSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'devstral-2',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hello' }],
+      });
+      const authCtx = { apiKey: '<fake-mistral-api-key>' };
+      const chunks = [];
+      for await (const chunk of mistral.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const firstDelta = chunks.find(c => c.type === 'delta');
+      assert.ok(firstDelta, 'No delta chunk found');
+      assert.equal(firstDelta.role, 'assistant');
+    } finally {
+      mistralResetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: stop event present → no extra synthetic stop appended', async () => {
+    const fakeSpawn = makeMockMistralSpawn([
+      '{"text":"done"}',
+      '{"type":"stop"}',
+    ]);
+    mistralSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'devstral-2',
+        stream: false,
+        messages: [{ role: 'user', content: 'Hello' }],
+      });
+      const authCtx = { apiKey: '<fake-mistral-api-key>' };
+      const chunks = [];
+      for await (const chunk of mistral.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const stops = chunks.filter(c => c.type === 'stop');
+      assert.equal(stops.length, 1, `Expected exactly 1 stop chunk, got ${stops.length}`);
+    } finally {
+      mistralResetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: synthetic stop emitted when JSON stream has no stop event', async () => {
+    const fakeSpawn = makeMockMistralSpawn([
+      '{"text":"only content, no stop"}',
+    ]);
+    mistralSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'devstral-2',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hello' }],
+      });
+      const authCtx = { apiKey: '<fake-mistral-api-key>' };
+      const chunks = [];
+      for await (const chunk of mistral.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const stops = chunks.filter(c => c.type === 'stop');
+      assert.equal(stops.length, 1, 'Should have exactly 1 synthetic stop chunk');
+      assert.equal(stops[0].finish_reason, 'stop');
+    } finally {
+      mistralResetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: non-zero exit code throws ProviderError(SPAWN_FAILED)', async () => {
+    const fakeSpawn = makeMockMistralSpawn([], 1);
+    mistralSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'devstral-2',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      const authCtx = { apiKey: '<fake-mistral-api-key>' };
+      let caught = null;
+      try {
+        for await (const _chunk of mistral.spawn(ir, authCtx)) { // eslint-disable-line no-unused-vars
+          // drain
+        }
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught instanceof ProviderError, `Expected ProviderError, got ${caught?.constructor?.name}`);
+      assert.equal(caught.code, 'SPAWN_FAILED');
+    } finally {
+      mistralResetSpawnImpl();
+    }
+  });
+
+  it('spawn throws ProviderError(AUTH_MISSING) when no auth context and no env/file', async () => {
+    const fakeSpawn = makeMockMistralSpawn(['{"text":"test"}']);
+    mistralSetSpawnImpl(fakeSpawn);
+    // Override auth path to nonexistent + clear MISTRAL_API_KEY env to guarantee missing auth
+    const savedApiKey = process.env.MISTRAL_API_KEY;
+    const savedAuthPath = process.env.MISTRAL_VIBE_AUTH_PATH;
+    delete process.env.MISTRAL_API_KEY;
+    process.env.MISTRAL_VIBE_AUTH_PATH = '/nonexistent/path/.env';
+    try {
+      const ir = makeIR({
+        model: 'devstral-2',
+        stream: false,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      let caught = null;
+      try {
+        for await (const _chunk of mistral.spawn(ir, null)) { // eslint-disable-line no-unused-vars
+          // drain
+        }
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught instanceof ProviderError, `Expected ProviderError, got ${caught?.constructor?.name}`);
+      assert.equal(caught.code, 'AUTH_MISSING');
+    } finally {
+      if (savedApiKey !== undefined) process.env.MISTRAL_API_KEY = savedApiKey;
+      else delete process.env.MISTRAL_API_KEY;
+      if (savedAuthPath !== undefined) process.env.MISTRAL_VIBE_AUTH_PATH = savedAuthPath;
+      else delete process.env.MISTRAL_VIBE_AUTH_PATH;
+      mistralResetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: progress events silently ignored, only content emitted', async () => {
+    const fakeSpawn = makeMockMistralSpawn([
+      '{"type":"progress","step":1}',
+      '{"type":"progress","step":2}',
+      '{"text":"actual response"}',
+      '{"type":"stop"}',
+    ]);
+    mistralSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'devstral-2',
+        stream: true,
+        messages: [{ role: 'user', content: 'Do something' }],
+      });
+      const authCtx = { apiKey: '<fake-mistral-api-key>' };
+      const chunks = [];
+      for await (const chunk of mistral.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const deltas = chunks.filter(c => c.type === 'delta');
+      assert.equal(deltas.length, 1);
+      assert.equal(deltas[0].content, 'actual response');
+    } finally {
+      mistralResetSpawnImpl();
+    }
+  });
+
+  // ── Test 9: healthCheck ───────────────────────────────────────────────
+  it('healthCheck returns {ok: false, error: "vibe binary not found"} when binary absent', async () => {
+    const result = await mistralHealthCheck({
+      _binaryExistsFn: () => false,
+      _authReadFn: () => ({ apiKey: '<fake-key>' }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'vibe binary not found');
+    assert.ok(typeof result.latencyMs === 'number');
+  });
+
+  it('healthCheck returns {ok: false, error: "auth artifact missing"} when auth missing', async () => {
+    const result = await mistralHealthCheck({
+      _binaryExistsFn: () => true,
+      _authReadFn: () => null,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'auth artifact missing');
+    assert.ok(typeof result.latencyMs === 'number');
+  });
+
+  it('healthCheck returns {ok: true} when binary and auth both present', async () => {
+    const result = await mistralHealthCheck({
+      _binaryExistsFn: () => true,
+      _authReadFn: () => ({ apiKey: '<fake-key>' }),
+    });
+    assert.equal(result.ok, true);
+    assert.ok(typeof result.latencyMs === 'number');
+  });
+
+  // ── Test 10: estimateCost ─────────────────────────────────────────────
+  it('estimateCost returns shape with currency USD', () => {
+    const request = makeIR({
+      model: 'devstral-2',
+      messages: [
+        { role: 'system', content: 'You are a coding assistant.' },
+        { role: 'user', content: 'Write hello world in Python.' },
+      ],
+    });
+    const result = mistralEstimateCost(request);
+    assert.ok(result !== null, 'estimateCost returned null');
+    assert.ok('inputTokens' in result, 'missing inputTokens');
+    assert.ok('outputTokensEstimate' in result, 'missing outputTokensEstimate');
+    assert.ok('currency' in result, 'missing currency');
+    assert.ok('usd' in result, 'missing usd');
+    assert.equal(result.currency, 'USD');
+    assert.equal(result.usd, null); // not pinned at D8
+    assert.ok(result.inputTokens > 0, 'inputTokens should be > 0');
+    assert.ok(result.outputTokensEstimate >= 0);
+  });
+
+  it('estimateCost returns null for null/missing request', () => {
+    assert.equal(mistralEstimateCost(null), null);
+    assert.equal(mistralEstimateCost({}), null);
+  });
+
+  // ── Test 11: quotaStatus ──────────────────────────────────────────────
+  it('quotaStatus returns null at D8 (Le Chat Pro budget not exposed via API)', async () => {
+    const result = await mistralQuotaStatus({});
+    assert.equal(result, null);
+  });
+
+  // ── Test 12: auth object shape ────────────────────────────────────────
+  it('mistral.auth has correct shape', () => {
+    // Authority: DOCS-2 § auth type is api-key, path is ~/.vibe/.env
+    assert.equal(mistral.auth.type, 'api-key');
+    assert.equal(mistral.auth.storage, 'file');
+    assert.equal(typeof mistral.auth.path, 'string');
+    assert.ok(mistral.auth.path.includes('.vibe'), 'auth.path should reference .vibe directory');
+    assert.ok(mistral.auth.path.includes('.env'), 'auth.path should reference .env file');
+    // Portability check: path must start with homedir() (no hardcoded literal)
+    assert.ok(
+      mistral.auth.path.startsWith(homedir()),
+      `auth.path "${mistral.auth.path}" should start with homedir() "${homedir()}"`,
+    );
+  });
+
+  // ── Test 13: hints shape ──────────────────────────────────────────────
+  it('mistral.hints has correct shape', () => {
+    assert.equal(typeof mistral.hints.requiresTTY, 'boolean');
+    assert.equal(typeof mistral.hints.concurrentSpawnSafe, 'boolean');
+    assert.ok(Number.isInteger(mistral.hints.maxConcurrent) && mistral.hints.maxConcurrent > 0);
+    assert.equal(mistral.hints.requiresTTY, false);
+    assert.equal(mistral.hints.concurrentSpawnSafe, true);
+  });
+
+  // ── Test 14: STATIC_REGISTRY length after D8 ─────────────────────────
+  it('STATIC_REGISTRY.length === 3 after D8 (anthropic + openai + mistral)', () => {
+    assert.equal(listAllProviderNames().length, 3);
+    assert.ok(listAllProviderNames().includes('anthropic'));
+    assert.ok(listAllProviderNames().includes('openai'));
+    assert.ok(listAllProviderNames().includes('mistral'));
+  });
+
+  // ── Test 15: loadProviders with mistral enabled ───────────────────────
+  it('loadProviders with {enabled: {mistral: true}} returns Map of size 1 with mistral', () => {
+    const loaded = loadProviders({ enabled: { mistral: true } });
+    assert.equal(loaded.size, 1);
+    assert.ok(loaded.has('mistral'));
+  });
+
+  it('loadProviders with all 3 providers enabled returns Map of size 3', () => {
+    const loaded = loadProviders({ enabled: { anthropic: true, openai: true, mistral: true } });
+    assert.equal(loaded.size, 3);
+    assert.ok(loaded.has('anthropic'));
+    assert.ok(loaded.has('openai'));
+    assert.ok(loaded.has('mistral'));
+  });
+
+  it('mistral loaded via loadProviders passes contract validation', () => {
+    const loaded = loadProviders({ enabled: { mistral: true } });
+    const p = loaded.get('mistral');
+    const { valid, errors } = validateProvider(p);
+    assert.equal(valid, true, `Contract errors: ${errors.join('; ')}`);
+    assert.ok(p.models.includes('devstral-2'));
+  });
+
+  // ── Test 16: auth artifact reading helpers ────────────────────────────
+  it('readAuthArtifact: MISTRAL_API_KEY env var → returns {apiKey}', () => {
+    const saved = process.env.MISTRAL_API_KEY;
+    process.env.MISTRAL_API_KEY = '<fake-mistral-api-key>';
+    try {
+      const result = mistralReadAuthArtifact();
+      assert.ok(result !== null, 'Expected auth result');
+      assert.equal(result.apiKey, '<fake-mistral-api-key>');
+    } finally {
+      if (saved !== undefined) process.env.MISTRAL_API_KEY = saved;
+      else delete process.env.MISTRAL_API_KEY;
+    }
+  });
+
+  it('readAuthArtifact: MISTRAL_VIBE_AUTH_PATH pointing to nonexistent file → null', () => {
+    const savedApiKey = process.env.MISTRAL_API_KEY;
+    const savedAuthPath = process.env.MISTRAL_VIBE_AUTH_PATH;
+    delete process.env.MISTRAL_API_KEY;
+    process.env.MISTRAL_VIBE_AUTH_PATH = '/definitely/not/a/real/path/.env';
+    try {
+      const result = mistralReadAuthArtifact();
+      assert.equal(result, null);
+    } finally {
+      if (savedApiKey !== undefined) process.env.MISTRAL_API_KEY = savedApiKey;
+      else delete process.env.MISTRAL_API_KEY;
+      if (savedAuthPath !== undefined) process.env.MISTRAL_VIBE_AUTH_PATH = savedAuthPath;
+      else delete process.env.MISTRAL_VIBE_AUTH_PATH;
+    }
+  });
+
+  // ── Test 17: Suite 5 registry test updated for D8 ─────────────────────
+  // (This re-tests the registry length assertion which now expects 3.)
+  it('listAllProviderNames() now returns 3-element array with mistral included', () => {
+    const names = listAllProviderNames();
+    assert.equal(names.length, 3);
+    assert.deepEqual(names, ['anthropic', 'openai', 'mistral']);
+  });
+
 });

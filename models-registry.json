@@ -32,6 +32,55 @@
         "opus": "claude-opus-4-7",
         "haiku": "claude-haiku-4-5"
       }
+    },
+    "openai": {
+      "displayName": "OpenAI Codex",
+      "tier": "D",
+      "candidate": true,
+      "comment": "Model IDs sourced from canonical Codex models doc (https://developers.openai.com/codex/models, retrieved 2026-05-23). Each id is documented as a `codex -m <id>` example on that page. D7 E2E will probe each one.",
+      "models": [
+        {
+          "id": "gpt-5.5",
+          "displayName": "GPT-5.5",
+          "contextWindow": null,
+          "deprecated": false,
+          "note": "Frontier recommended model. Docs example: `codex -m gpt-5.5`."
+        },
+        {
+          "id": "gpt-5.4",
+          "displayName": "GPT-5.4",
+          "contextWindow": null,
+          "deprecated": false,
+          "note": "Docs example: `codex -m gpt-5.4`."
+        },
+        {
+          "id": "gpt-5.4-mini",
+          "displayName": "GPT-5.4 Mini",
+          "contextWindow": null,
+          "deprecated": false,
+          "note": "Lower-cost gpt-5.4 variant. Docs example: `codex -m gpt-5.4-mini`."
+        },
+        {
+          "id": "gpt-5.3-codex",
+          "displayName": "GPT-5.3-Codex",
+          "contextWindow": null,
+          "deprecated": false,
+          "note": "Docs example: `codex -m gpt-5.3-codex`. Distinct from the -spark variant."
+        },
+        {
+          "id": "gpt-5.3-codex-spark",
+          "displayName": "GPT-5.3-Codex Spark",
+          "contextWindow": null,
+          "deprecated": false,
+          "note": "Research preview. Docs example: `codex -m gpt-5.3-codex-spark`."
+        }
+      ],
+      "aliases": {
+        "codex": "gpt-5.3-codex",
+        "codex-spark": "gpt-5.3-codex-spark",
+        "gpt5": "gpt-5.5",
+        "gpt5-mini": "gpt-5.4-mini"
+      }
     }
   }
 }

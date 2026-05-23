@@ -40,6 +40,16 @@ import anthropic, {
   __setSpawnImpl,
   __resetSpawnImpl,
 } from './lib/providers/anthropic.mjs';
+import codex, {
+  irToCodex,
+  codexChunkToIR,
+  readAuthArtifact as codexReadAuthArtifact,
+  estimateCost as codexEstimateCost,
+  quotaStatus as codexQuotaStatus,
+  healthCheck as codexHealthCheck,
+  __setSpawnImpl as codexSetSpawnImpl,
+  __resetSpawnImpl as codexResetSpawnImpl,
+} from './lib/providers/codex.mjs';
 import modelsRegistry from './models-registry.json' with { type: 'json' };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -478,9 +488,9 @@ describe('Provider contract validation', () => {
 // ── Suite 5: Plugin registry ──────────────────────────────────────────────
 
 describe('Plugin registry', () => {
-  it('STATIC_REGISTRY has 1 entry (anthropic candidate) at D4', () => {
-    // D4: anthropic is in STATIC_REGISTRY but default config has enabled:false
-    assert.equal(listAllProviderNames().length, 1);
+  it('STATIC_REGISTRY has 2 entries (anthropic + openai candidates) at D6', () => {
+    // D4 added anthropic; D6 adds openai. Default config has both enabled:false.
+    assert.equal(listAllProviderNames().length, 2);
   });
 
   it('loadProviders with empty config → empty Map (anthropic not enabled)', () => {
@@ -493,8 +503,9 @@ describe('Plugin registry', () => {
     assert.equal(m.size, 0);
   });
 
-  it('listAllProviderNames returns [anthropic] at D4', () => {
-    assert.deepEqual(listAllProviderNames(), ['anthropic']);
+  it('listAllProviderNames returns [anthropic, openai] at D6', () => {
+    // D4: ['anthropic']. D6 adds openai.
+    assert.deepEqual(listAllProviderNames(), ['anthropic', 'openai']);
   });
 
   it('getProviderForModel returns null when no providers loaded', () => {
@@ -1588,6 +1599,614 @@ describe('Cache layer — HTTP integration (Suite 9 cont.)', () => {
     assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
     assert.equal(r.headers['x-olp-cache'], 'bypass', `Expected bypass header, got: ${r.headers['x-olp-cache']}`);
   });
+});
+
+// ── Suite 11: Codex plugin (D6) ──────────────────────────────────────────
+//
+// All tests are UNIT tests. No real `codex` binary is invoked.
+// Mock spawn is injected via codexSetSpawnImpl / codexResetSpawnImpl.
+//
+// Authority: Codex CLI reference https://developers.openai.com/codex/cli/reference
+//   § "codex exec [flags] PROMPT" — exec subcommand syntax
+//   § "--json" — NDJSON output format
+//   § "--model, -m" — model override
+//   § "$CODEX_HOME/auth.json" — auth artifact location
+//
+// Lossy-translation acknowledgements per ADR 0003 (documented in codex.mjs header):
+//   top_p, temperature, stop, max_tokens, tools[], tool_calls → all dropped.
+
+/**
+ * Creates a fake NDJSON-emitting mock spawn for Codex.
+ * Lines are emitted as they would arrive from `codex exec --json`.
+ *
+ * @param {string[]} ndjsonLines — raw NDJSON lines emitted in order (no trailing \n needed)
+ * @param {number} [exitCode=0]
+ */
+function makeMockCodexSpawn(ndjsonLines, exitCode = 0) {
+  return function mockCodexSpawnImpl(_bin, _args, _opts) {
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.stdin = {
+      write: () => {},
+      end: () => {
+        setImmediate(async () => {
+          for (const line of ndjsonLines) {
+            proc.stdout.emit('data', Buffer.from(line + '\n'));
+          }
+          proc.stdout.emit('end');
+          proc.stderr.emit('end');
+          proc.emit('close', exitCode, null);
+        });
+      },
+    };
+    proc.killed = false;
+    proc.kill = () => {};
+    return proc;
+  };
+}
+
+describe('Codex plugin (D6)', () => {
+
+  // ── Test 1: Contract conformance ─────────────────────────────────────
+  it('codex module satisfies validateProvider() — all 10 fields present', () => {
+    const { valid, errors } = validateProvider(codex);
+    assert.equal(valid, true, `Validation errors: ${errors.join('; ')}`);
+    assert.ok('name' in codex, 'missing: name');
+    assert.ok('displayName' in codex, 'missing: displayName');
+    assert.ok('contractVersion' in codex, 'missing: contractVersion');
+    assert.ok('models' in codex, 'missing: models');
+    assert.ok('auth' in codex, 'missing: auth');
+    assert.ok(typeof codex.spawn === 'function', 'missing: spawn');
+    assert.ok(typeof codex.estimateCost === 'function', 'missing: estimateCost');
+    assert.ok(typeof codex.quotaStatus === 'function', 'missing: quotaStatus');
+    assert.ok(typeof codex.healthCheck === 'function', 'missing: healthCheck');
+    assert.ok('hints' in codex, 'missing: hints');
+  });
+
+  // ── Test 2: contractVersion === '1.0' ────────────────────────────────
+  it('codex declares contractVersion === "1.0"', () => {
+    assert.equal(codex.contractVersion, '1.0');
+  });
+
+  // ── Test 3: name and displayName ─────────────────────────────────────
+  it('codex.name === "openai" and displayName is set', () => {
+    assert.equal(codex.name, 'openai');
+    assert.equal(typeof codex.displayName, 'string');
+    assert.ok(codex.displayName.length > 0);
+  });
+
+  // ── Test 4: models match registry ───────────────────────────────────
+  it('codex.models matches models-registry.json providers.openai.models[].id', () => {
+    const registryIds = modelsRegistry.providers.openai.models.map(m => m.id);
+    assert.deepEqual(codex.models, registryIds);
+  });
+
+  it('codex.models contains all 5 docs-listed model IDs', () => {
+    // Per https://developers.openai.com/codex/models — each id has a
+    // `codex -m <id>` example on that page. D6 review-2 expanded the
+    // registry to include gpt-5.4-mini and gpt-5.3-codex-spark which the
+    // original sonnet draft missed.
+    assert.ok(codex.models.includes('gpt-5.5'), 'missing gpt-5.5');
+    assert.ok(codex.models.includes('gpt-5.4'), 'missing gpt-5.4');
+    assert.ok(codex.models.includes('gpt-5.4-mini'), 'missing gpt-5.4-mini');
+    assert.ok(codex.models.includes('gpt-5.3-codex'), 'missing gpt-5.3-codex');
+    assert.ok(codex.models.includes('gpt-5.3-codex-spark'), 'missing gpt-5.3-codex-spark');
+    assert.equal(codex.models.length, 5, `Expected 5 models, got ${codex.models.length}`);
+  });
+
+  // ── Test 5: getProviderForModel finds codex for each model ──────────
+  it('getProviderForModel finds openai provider for gpt-5.5', () => {
+    const loaded = new Map([['openai', codex]]);
+    const result = getProviderForModel(loaded, 'gpt-5.5');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'openai');
+  });
+
+  it('getProviderForModel finds openai provider for gpt-5.4', () => {
+    const loaded = new Map([['openai', codex]]);
+    const result = getProviderForModel(loaded, 'gpt-5.4');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'openai');
+  });
+
+  it('getProviderForModel finds openai provider for gpt-5.3-codex', () => {
+    const loaded = new Map([['openai', codex]]);
+    const result = getProviderForModel(loaded, 'gpt-5.3-codex');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'openai');
+  });
+
+  // ── Test 6: irToCodex translation ────────────────────────────────────
+  it('irToCodex: user message → args with exec --json --model, prompt as positional', () => {
+    const ir = makeIR({
+      model: 'gpt-5.5',
+      messages: [{ role: 'user', content: 'Hello world' }],
+    });
+    const { args, prompt, useStdin } = irToCodex(ir);
+    // Authority: Codex CLI reference § "codex exec [flags] PROMPT"
+    assert.ok(args.includes('exec'), 'args must include "exec"');
+    assert.ok(args.includes('--json'), 'args must include "--json"');
+    assert.ok(args.includes('--model'), 'args must include "--model"');
+    assert.ok(args.includes('gpt-5.5'), 'args must include model value');
+    assert.ok(typeof prompt === 'string', 'prompt must be a string');
+    assert.ok(prompt.includes('Hello world'), 'prompt must contain user text');
+    assert.equal(useStdin, false, 'single-line prompt should use argv, not stdin');
+  });
+
+  it('irToCodex: system + user → system annotation + user text in prompt', () => {
+    const ir = makeIR({
+      model: 'gpt-5.4',
+      messages: [
+        { role: 'system', content: 'You are a coder.' },
+        { role: 'user', content: 'Write a function.' },
+      ],
+    });
+    const { prompt } = irToCodex(ir);
+    assert.ok(prompt.includes('[System] You are a coder.'));
+    assert.ok(prompt.includes('Write a function.'));
+  });
+
+  it('irToCodex: assistant prior turn → [Assistant] annotation', () => {
+    const ir = makeIR({
+      model: 'gpt-5.5',
+      messages: [
+        { role: 'user', content: 'Hi' },
+        { role: 'assistant', content: 'Hello!' },
+        { role: 'user', content: 'Thanks' },
+      ],
+    });
+    const { prompt } = irToCodex(ir);
+    assert.ok(prompt.includes('[Assistant] Hello!'));
+    assert.ok(prompt.includes('Thanks'));
+  });
+
+  it('irToCodex: tool_calls in assistant message — content preserved, metadata dropped (lossy)', () => {
+    // ADR 0003 § Lossy: structured tool_calls dropped; textual content preserved.
+    const ir = makeIR({
+      model: 'gpt-5.5',
+      messages: [
+        { role: 'user', content: 'Search for X' },
+        {
+          role: 'assistant',
+          content: 'Searching...',
+          tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'search', arguments: '{"q":"X"}' } }],
+        },
+      ],
+    });
+    const { prompt } = irToCodex(ir);
+    // Content preserved
+    assert.ok(prompt.includes('Searching...'), 'assistant text content must be preserved');
+    // tool_calls metadata not directly in prompt (dropped per lossy spec)
+    // (We do NOT assert the metadata IS there — it is documented as dropped.)
+  });
+
+  it('irToCodex: response_format json_object injects system prompt', () => {
+    const ir = makeIR({
+      model: 'gpt-5.5',
+      messages: [{ role: 'user', content: 'Give JSON' }],
+      response_format: { type: 'json_object' },
+    });
+    const { prompt } = irToCodex(ir);
+    assert.ok(prompt.includes('Reply with valid JSON only'));
+  });
+
+  it('irToCodex: multiline prompt uses stdin path (useStdin=true) with `-` positional', () => {
+    const ir = makeIR({
+      model: 'gpt-5.5',
+      messages: [
+        { role: 'system', content: 'Line one.' },
+        { role: 'user', content: 'Line two.' },
+      ],
+    });
+    const { useStdin, args } = irToCodex(ir);
+    // System + user messages join with '\n\n' → contains newline → stdin
+    assert.equal(useStdin, true, 'multi-section prompt should use stdin');
+    // Per Codex CLI reference, stdin requires the literal `-` positional.
+    // (D6 review-2 finding: original draft omitted positional entirely;
+    // docs explicitly state stdin requires `-`.)
+    assert.ok(args.includes('-'), 'stdin path must pass `-` as positional');
+    assert.ok(!args.includes('Line one.'), 'literal prompt must not appear in args when useStdin');
+  });
+
+  it('irToCodex: tool result turn → [Tool Result] annotation', () => {
+    const ir = makeIR({
+      model: 'gpt-5.5',
+      messages: [
+        { role: 'user', content: 'Search for X' },
+        { role: 'tool', content: '{"results":[]}', name: 'search' },
+      ],
+    });
+    const { prompt } = irToCodex(ir);
+    assert.ok(prompt.includes('[Tool Result'));
+    assert.ok(prompt.includes('search'));
+  });
+
+  // ── Test 7: codexChunkToIR translation ────────────────────────────────
+  it('codexChunkToIR: content field → delta chunk', () => {
+    const chunk = codexChunkToIR('{"content":"Hello world"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.content, 'Hello world');
+  });
+
+  it('codexChunkToIR: delta field → delta chunk', () => {
+    const chunk = codexChunkToIR('{"type":"delta","delta":"token text"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.content, 'token text');
+  });
+
+  it('codexChunkToIR: text field → delta chunk', () => {
+    // Possible alternative event shape with "text" field
+    const chunk = codexChunkToIR('{"type":"output_text","text":"output here"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.content, 'output here');
+  });
+
+  it('codexChunkToIR: type === "stop" → stop chunk', () => {
+    const chunk = codexChunkToIR('{"type":"stop"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'stop');
+    assert.equal(chunk.finish_reason, 'stop');
+  });
+
+  it('codexChunkToIR: done === true → stop chunk', () => {
+    const chunk = codexChunkToIR('{"done":true,"id":"run_123"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'stop');
+    assert.equal(chunk.finish_reason, 'stop');
+  });
+
+  it('codexChunkToIR: type === "error" → error chunk', () => {
+    const chunk = codexChunkToIR('{"type":"error","error":"quota exceeded"}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'error');
+    assert.equal(chunk.error, 'quota exceeded');
+  });
+
+  it('codexChunkToIR: error field present → error chunk', () => {
+    const chunk = codexChunkToIR('{"error":"something went wrong","code":500}');
+    assert.ok(chunk !== null);
+    assert.equal(chunk.type, 'error');
+  });
+
+  it('codexChunkToIR: unknown/progress event type → null (silently ignored)', () => {
+    // Events like {"type":"progress","step":1} are ignored per D6 spec
+    const chunk = codexChunkToIR('{"type":"progress","step":1}');
+    assert.equal(chunk, null);
+  });
+
+  it('codexChunkToIR: empty line → null', () => {
+    assert.equal(codexChunkToIR(''), null);
+    assert.equal(codexChunkToIR('   '), null);
+  });
+
+  it('codexChunkToIR: malformed JSON → null (no throw)', () => {
+    assert.doesNotThrow(() => {
+      const result = codexChunkToIR('{bad json');
+      assert.equal(result, null);
+    });
+  });
+
+  // ── Test 8: mock spawn — NDJSON stream yields correct IR chunks ───────
+  it('spawn with mock: NDJSON lines → delta chunks then stop chunk', async () => {
+    const fakeSpawn = makeMockCodexSpawn([
+      '{"content":"Hello"}',
+      '{"content":" world"}',
+      '{"type":"stop"}',
+    ]);
+    codexSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'gpt-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      const authCtx = { accessToken: '<fake-openai-token>' };
+      const chunks = [];
+      for await (const chunk of codex.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const deltas = chunks.filter(c => c.type === 'delta');
+      const stops = chunks.filter(c => c.type === 'stop');
+      assert.ok(deltas.length >= 1, `Expected at least 1 delta, got ${deltas.length}`);
+      assert.equal(stops.length, 1, `Expected 1 stop, got ${stops.length}`);
+      const allContent = deltas.map(c => c.content).join('');
+      assert.equal(allContent, 'Hello world');
+    } finally {
+      codexResetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: first delta chunk has role=assistant', async () => {
+    const fakeSpawn = makeMockCodexSpawn(['{"content":"Test output"}']);
+    codexSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'gpt-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hello' }],
+      });
+      const authCtx = { accessToken: '<fake-openai-token>' };
+      const chunks = [];
+      for await (const chunk of codex.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const firstDelta = chunks.find(c => c.type === 'delta');
+      assert.ok(firstDelta, 'No delta chunk found');
+      assert.equal(firstDelta.role, 'assistant');
+    } finally {
+      codexResetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: NDJSON stop event present → no extra synthetic stop appended', async () => {
+    // If NDJSON stream already contains a stop event, we should NOT double-emit
+    const fakeSpawn = makeMockCodexSpawn([
+      '{"content":"done"}',
+      '{"type":"stop"}',
+    ]);
+    codexSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'gpt-5.5',
+        stream: false,
+        messages: [{ role: 'user', content: 'Hello' }],
+      });
+      const authCtx = { accessToken: '<fake-openai-token>' };
+      const chunks = [];
+      for await (const chunk of codex.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const stops = chunks.filter(c => c.type === 'stop');
+      assert.equal(stops.length, 1, `Expected exactly 1 stop chunk, got ${stops.length}`);
+    } finally {
+      codexResetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: non-zero exit code throws ProviderError(SPAWN_FAILED)', async () => {
+    const fakeSpawn = makeMockCodexSpawn([], 1);
+    codexSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'gpt-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      const authCtx = { accessToken: '<fake-openai-token>' };
+      let caught = null;
+      try {
+        for await (const _chunk of codex.spawn(ir, authCtx)) {
+          // drain
+        }
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught instanceof ProviderError, `Expected ProviderError, got ${caught?.constructor?.name}`);
+      assert.equal(caught.code, 'SPAWN_FAILED');
+    } finally {
+      codexResetSpawnImpl();
+    }
+  });
+
+  it('spawn throws ProviderError(AUTH_MISSING) when no auth context and no auth file', async () => {
+    const fakeSpawn = makeMockCodexSpawn(['{"content":"test"}']);
+    codexSetSpawnImpl(fakeSpawn);
+    // Override auth path to a nonexistent file to guarantee missing auth
+    const savedAuthPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = '/nonexistent/path/auth.json';
+    try {
+      const ir = makeIR({
+        model: 'gpt-5.5',
+        stream: false,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      let caught = null;
+      try {
+        for await (const _chunk of codex.spawn(ir, null)) { // eslint-disable-line no-unused-vars
+          // drain
+        }
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught instanceof ProviderError, `Expected ProviderError, got ${caught?.constructor?.name}`);
+      assert.equal(caught.code, 'AUTH_MISSING');
+    } finally {
+      if (savedAuthPath !== undefined) {
+        process.env.OPENAI_CODEX_AUTH_PATH = savedAuthPath;
+      } else {
+        delete process.env.OPENAI_CODEX_AUTH_PATH;
+      }
+      codexResetSpawnImpl();
+    }
+  });
+
+  // ── Test 9: healthCheck ───────────────────────────────────────────────
+  it('healthCheck returns {ok: false, error: "codex binary not found"} when binary absent', async () => {
+    const result = await codexHealthCheck({
+      _binaryExistsFn: () => false,
+      _authReadFn: () => ({ accessToken: '<fake-token>' }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'codex binary not found');
+    assert.ok(typeof result.latencyMs === 'number');
+  });
+
+  it('healthCheck returns {ok: false, error: "auth artifact missing"} when auth missing', async () => {
+    const result = await codexHealthCheck({
+      _binaryExistsFn: () => true,
+      _authReadFn: () => null,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'auth artifact missing');
+    assert.ok(typeof result.latencyMs === 'number');
+  });
+
+  it('healthCheck returns {ok: true} when binary and auth both present', async () => {
+    const result = await codexHealthCheck({
+      _binaryExistsFn: () => true,
+      _authReadFn: () => ({ accessToken: '<fake-token>' }),
+    });
+    assert.equal(result.ok, true);
+    assert.ok(typeof result.latencyMs === 'number');
+  });
+
+  // ── Test 10: estimateCost ─────────────────────────────────────────────
+  it('estimateCost returns shape with currency USD', () => {
+    const request = makeIR({
+      model: 'gpt-5.5',
+      messages: [
+        { role: 'system', content: 'You are a coding assistant.' },
+        { role: 'user', content: 'Write hello world in Python.' },
+      ],
+    });
+    const result = codexEstimateCost(request);
+    assert.ok(result !== null, 'estimateCost returned null');
+    assert.ok('inputTokens' in result, 'missing inputTokens');
+    assert.ok('outputTokensEstimate' in result, 'missing outputTokensEstimate');
+    assert.ok('currency' in result, 'missing currency');
+    assert.ok('usd' in result, 'missing usd');
+    assert.equal(result.currency, 'USD');
+    assert.equal(result.usd, null); // not pinned at D6
+    assert.ok(result.inputTokens > 0, 'inputTokens should be > 0');
+    assert.ok(result.outputTokensEstimate >= 0);
+  });
+
+  it('estimateCost returns null for null/missing request', () => {
+    assert.equal(codexEstimateCost(null), null);
+    assert.equal(codexEstimateCost({}), null);
+  });
+
+  // ── Test 11: quotaStatus ──────────────────────────────────────────────
+  it('quotaStatus returns null at D6', async () => {
+    const result = await codexQuotaStatus({});
+    assert.equal(result, null);
+  });
+
+  // ── Test 12: auth artifact path uses os.homedir(), not hardcoded ──────
+  it('codex.auth.path uses homedir() and references .codex directory', () => {
+    assert.equal(typeof codex.auth.path, 'string');
+    assert.ok(codex.auth.path.includes('.codex'), 'auth.path should reference .codex directory');
+    // Portability check: path must start with homedir() value at runtime
+    assert.ok(
+      codex.auth.path.startsWith(homedir()),
+      `auth.path "${codex.auth.path}" should start with homedir() "${homedir()}"`,
+    );
+  });
+
+  it('codex.auth.type === "oauth" and storage === "file"', () => {
+    assert.equal(codex.auth.type, 'oauth');
+    assert.equal(codex.auth.storage, 'file');
+  });
+
+  // ── Test 13: readAuthArtifact reads OPENAI_CODEX_AUTH_PATH override ──
+  it('readAuthArtifact: OPENAI_CODEX_AUTH_PATH pointing to nonexistent file → null', () => {
+    const saved = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = '/definitely/not/a/real/path/auth.json';
+    try {
+      const result = codexReadAuthArtifact();
+      assert.equal(result, null);
+    } finally {
+      if (saved !== undefined) process.env.OPENAI_CODEX_AUTH_PATH = saved;
+      else delete process.env.OPENAI_CODEX_AUTH_PATH;
+    }
+  });
+
+  // ── Test 14: hints shape ──────────────────────────────────────────────
+  it('codex.hints has correct shape', () => {
+    assert.equal(typeof codex.hints.requiresTTY, 'boolean');
+    assert.equal(typeof codex.hints.concurrentSpawnSafe, 'boolean');
+    assert.ok(Number.isInteger(codex.hints.maxConcurrent) && codex.hints.maxConcurrent > 0);
+    assert.equal(codex.hints.requiresTTY, false);
+    assert.equal(codex.hints.concurrentSpawnSafe, true);
+  });
+
+  // ── Test 15: STATIC_REGISTRY length after D6 ─────────────────────────
+  it('STATIC_REGISTRY.length === 2 after D6 (anthropic + openai)', () => {
+    assert.equal(listAllProviderNames().length, 2);
+    assert.ok(listAllProviderNames().includes('anthropic'));
+    assert.ok(listAllProviderNames().includes('openai'));
+  });
+
+  // ── Test 16: loadProviders with openai enabled ────────────────────────
+  it('loadProviders with {enabled: {openai: true}} returns Map of size 1 with openai', () => {
+    const loaded = loadProviders({ enabled: { openai: true } });
+    assert.equal(loaded.size, 1);
+    assert.ok(loaded.has('openai'));
+  });
+
+  it('loadProviders with both anthropic and openai enabled returns Map of size 2', () => {
+    const loaded = loadProviders({ enabled: { anthropic: true, openai: true } });
+    assert.equal(loaded.size, 2);
+    assert.ok(loaded.has('anthropic'));
+    assert.ok(loaded.has('openai'));
+  });
+
+  it('openai loaded via loadProviders passes contract validation', () => {
+    const loaded = loadProviders({ enabled: { openai: true } });
+    const p = loaded.get('openai');
+    const { valid, errors } = validateProvider(p);
+    assert.equal(valid, true, `Contract errors: ${errors.join('; ')}`);
+    assert.ok(p.models.includes('gpt-5.5'));
+  });
+
+  // ── Test 17: spawn progress events silently ignored ──────────────────
+  it('spawn with mock: progress events are silently ignored, only content emitted', async () => {
+    const fakeSpawn = makeMockCodexSpawn([
+      '{"type":"progress","step":1}',
+      '{"type":"progress","step":2}',
+      '{"content":"actual response"}',
+      '{"type":"stop"}',
+    ]);
+    codexSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'gpt-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Do something' }],
+      });
+      const authCtx = { accessToken: '<fake-openai-token>' };
+      const chunks = [];
+      for await (const chunk of codex.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const deltas = chunks.filter(c => c.type === 'delta');
+      assert.equal(deltas.length, 1);
+      assert.equal(deltas[0].content, 'actual response');
+    } finally {
+      codexResetSpawnImpl();
+    }
+  });
+
+  // ── Test 18: spawn synthesizes stop when NDJSON stream has no stop event ──
+  it('spawn with mock: synthetic stop emitted when NDJSON has no stop event', async () => {
+    const fakeSpawn = makeMockCodexSpawn([
+      '{"content":"only content, no stop"}',
+      // No stop event in the stream
+    ]);
+    codexSetSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'gpt-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hello' }],
+      });
+      const authCtx = { accessToken: '<fake-openai-token>' };
+      const chunks = [];
+      for await (const chunk of codex.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const stops = chunks.filter(c => c.type === 'stop');
+      assert.equal(stops.length, 1, 'Should have exactly 1 synthetic stop chunk');
+      assert.equal(stops[0].finish_reason, 'stop');
+    } finally {
+      codexResetSpawnImpl();
+    }
+  });
+
 });
 
 // ── Suite 10: Anthropic E2E (GATED) ──────────────────────────────────────

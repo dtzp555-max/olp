@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-features:
+    name: test-features.mjs (smoke)
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: ['20', '24']
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Detect package-lock
+        id: detect_lock
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            DEPS="$(node -p "Object.keys(require('./package.json').dependencies || {}).length")"
+            if [ "$DEPS" -gt 0 ]; then
+              echo "needs_install=true" >> $GITHUB_OUTPUT
+            else
+              echo "needs_install=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "needs_install=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: npm install (if dependencies present)
+        if: steps.detect_lock.outputs.needs_install == 'true'
+        run: npm ci
+
+      - name: Run npm test
+        shell: bash
+        run: |
+          if [ ! -f test-features.mjs ] && ! node -e "process.exit(require('./package.json').scripts && require('./package.json').scripts.test ? 0 : 1)" 2>/dev/null; then
+            echo "::notice::No test-features.mjs or npm test script yet (bootstrap phase). Skipping."
+            exit 0
+          fi
+          npm test

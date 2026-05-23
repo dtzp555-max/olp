@@ -1,0 +1,73 @@
+name: Auto Release on Tag
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Verify package.json version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f package.json ]; then
+            echo "::warning::package.json not found; skipping version-match check."
+            exit 0
+          fi
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${{ steps.ver.outputs.version }}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag v${TAG_VERSION} does not match package.json version ${PKG_VERSION}. Bump package.json before tagging (Iron Rule 5)."
+            exit 1
+          fi
+          echo "Tag v${TAG_VERSION} matches package.json version ${PKG_VERSION}."
+
+      - name: Extract CHANGELOG section
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          if [ ! -f CHANGELOG.md ]; then
+            echo "No CHANGELOG.md found; using minimal release notes"
+            echo "Release v${VERSION}" > /tmp/release-notes.md
+            exit 0
+          fi
+          awk -v ver="v${VERSION}" '
+            $0 ~ "^## " ver { found=1; print; next }
+            found && /^## v/ { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "No matching section in CHANGELOG for v${VERSION}; using minimal notes"
+            echo "Release v${VERSION}" > /tmp/release-notes.md
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "Release v${VERSION} already exists - skipping"
+            exit 0
+          fi
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file /tmp/release-notes.md \
+            --latest

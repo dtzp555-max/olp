@@ -1,0 +1,30 @@
+{
+  "name": "olp",
+  "version": "0.1.0-bootstrap",
+  "description": "Personal multi-provider LLM proxy. Successor to OCP. One HTTP endpoint, multiple subscriptions behind it, automatic routing + fallback + caching.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "test": "node test-features.mjs",
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dtzp555-max/olp.git"
+  },
+  "license": "MIT",
+  "private": true,
+  "keywords": [
+    "llm",
+    "proxy",
+    "multi-provider",
+    "anthropic",
+    "openai",
+    "mistral",
+    "fallback",
+    "cache"
+  ]
+}

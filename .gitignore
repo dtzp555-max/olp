@@ -1,0 +1,25 @@
+node_modules/
+*.log
+.DS_Store
+.env
+.env.local
+.env.*.local
+
+# Local OLP state (config, providers auth, keys, cache, logs) lives under
+# ~/.olp/ on user machines, NOT inside this repo. Block any local copy here.
+.olp/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test outputs / coverage
+coverage/
+*.lcov
+
+# Stage / scratch
+.staging/
+.scratch/

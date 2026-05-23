@@ -1,0 +1,213 @@
+name: Alignment Guardrail
+
+on:
+  pull_request:
+    paths:
+      - 'server.mjs'
+      - 'setup.mjs'
+      - 'lib/**'
+      - 'scripts/**'
+      - 'models-registry.json'
+      - '.github/workflows/alignment.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'server.mjs'
+      - 'setup.mjs'
+      - 'lib/**'
+      - 'scripts/**'
+      - 'models-registry.json'
+      - '.github/workflows/alignment.yml'
+
+jobs:
+  blacklist:
+    name: source blacklist (hard fail)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan source for hallucinated tokens
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Known-hallucinated tokens. Extend only via an ALIGNMENT.md amendment PR.
+          # Each token is matched as a fixed string against the OLP source tree
+          # (excluding docs/, CHANGELOG, README, this workflow, and tests that
+          # may legitimately reference the historical token as a guardrail).
+          #
+          # Inherited transitively from OCP's 2026-04-11 drift:
+          #   - api.anthropic.com/api/oauth/usage : fabricated Anthropic OAuth
+          #     usage endpoint. Does not appear in any shipped @anthropic-ai/
+          #     claude-code cli.js. Carried forward as a transitive guardrail.
+          #
+          # OLP-native entries: added as drift incidents accumulate.
+          BLACKLIST=(
+            "api.anthropic.com/api/oauth/usage"
+          )
+
+          # Provider keys that may appear in source (positive list — present in
+          # ALIGNMENT.md provider inventory). Any provider key in source that
+          # is NOT in this list is suspicious and flagged below.
+          KNOWN_PROVIDERS=(
+            "anthropic"
+            "openai"
+            "mistral"
+            "grok"
+            "kimi"
+            "minimax"
+            "glm"
+            "qwen"
+          )
+
+          # Source files in scope. Exclude docs, CHANGELOG, README, the
+          # workflow itself, and the test file (which may pin historical
+          # strings intentionally).
+          SOURCE_FILES="$(git ls-files \
+            | grep -E '\.(mjs|js|ts|json)$' \
+            | grep -v -E '^(docs/|CHANGELOG\.md|README\.md|test-features\.mjs|\.github/workflows/alignment\.yml)')"
+
+          FAIL=0
+
+          # 1. Blacklist scan
+          for token in "${BLACKLIST[@]}"; do
+            if echo "$SOURCE_FILES" | xargs grep -n -F "$token" 2>/dev/null; then
+              echo "::error::Blacklisted token '$token' detected in OLP source."
+              FAIL=1
+            fi
+          done
+
+          # 2. Excluded-provider scan: Google Antigravity is permanently
+          # excluded per ADR 0006 / ALIGNMENT.md Risk Tier A. Any reference
+          # to a `google-antigravity` plugin file or provider key in source
+          # (outside docs which may discuss the exclusion) is a finding.
+          FORBIDDEN_PROVIDER_TOKENS=(
+            "google-antigravity"
+            "antigravity"
+          )
+          for token in "${FORBIDDEN_PROVIDER_TOKENS[@]}"; do
+            HITS="$(echo "$SOURCE_FILES" | xargs grep -n -F "$token" 2>/dev/null || true)"
+            if [ -n "$HITS" ]; then
+              echo "::error::Tier-A-excluded provider token '$token' detected in OLP source. Per ALIGNMENT.md / ADR 0006, this provider is permanently excluded."
+              echo "$HITS"
+              FAIL=1
+            fi
+          done
+
+          if [ "$FAIL" -ne 0 ]; then
+            cat <<'EOF'
+
+          ============================================================
+          ALIGNMENT GUARDRAIL FAILURE
+          ============================================================
+          OLP source contains a token on the alignment blacklist or
+          references a permanently excluded provider.
+
+          Blacklist tokens were introduced by LLM hallucinations and
+          do not appear in the relevant authority (provider CLI,
+          OpenAI spec, or ADR). See ALIGNMENT.md and (where the
+          token is inherited from OCP) the OCP 2026-04-11 drift
+          record at https://github.com/dtzp555-max/ocp.
+
+          Excluded providers are listed in ALIGNMENT.md § Risk Tier
+          Framework and ADR 0006. Permanent exclusion means not
+          bundled, not pluggable, not added via opt-in.
+
+          Required action:
+            1. Remove the token from source.
+            2. Cite the real authority (provider CLI doc / OpenAI
+               spec section / ADR) for the operation you intended.
+            3. See ALIGNMENT.md Rules 1, 2, and 5.
+
+          Do not add allowlist entries to this workflow without an
+          amendment PR to ALIGNMENT.md (see Amendment Procedure).
+          ============================================================
+EOF
+            exit 1
+          fi
+
+          echo "Blacklist + excluded-provider scan clean."
+
+  models-registry:
+    name: models-registry.json sanity (hard fail)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate models-registry.json
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f models-registry.json ]; then
+            echo "models-registry.json not found yet (bootstrap phase). Skipping."
+            exit 0
+          fi
+
+          # Basic JSON validity.
+          if ! node -e "JSON.parse(require('fs').readFileSync('models-registry.json','utf8'))"; then
+            echo "::error::models-registry.json is not valid JSON."
+            exit 1
+          fi
+
+          # Provider keys in models-registry.json must match the inventory
+          # in ALIGNMENT.md.
+          KNOWN_PROVIDERS='["anthropic","openai","mistral","grok","kimi","minimax","glm","qwen"]'
+          node -e "
+            const fs = require('fs');
+            const known = ${KNOWN_PROVIDERS};
+            const reg = JSON.parse(fs.readFileSync('models-registry.json','utf8'));
+            const providers = reg.providers || {};
+            const bad = Object.keys(providers).filter(p => !known.includes(p));
+            if (bad.length > 0) {
+              console.error('::error::Unknown provider key(s) in models-registry.json: ' + bad.join(', '));
+              console.error('Known providers per ALIGNMENT.md: ' + known.join(', '));
+              process.exit(1);
+            }
+            console.log('models-registry.json provider keys OK: ' + Object.keys(providers).join(', '));
+          "
+
+  commit-citation:
+    name: per-provider commit citation (soft check)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan PR commits for uncited assertions
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
+            echo "No PR context; skipping."
+            exit 0
+          fi
+
+          WARN=0
+          git log --format="%H" "${BASE_SHA}..${HEAD_SHA}" | while read -r sha; do
+            BODY="$(git log -1 --format=%B "$sha")"
+            if echo "$BODY" | grep -E -i -q '(provider|claude|codex|vibe|grok|kimi|minimax|glm|qwen|cli)[[:space:]]+(code[[:space:]]+)?uses'; then
+              if echo "$BODY" | grep -E -i -q '(cli[[:space:]]+v[0-9]+|https?://|ADR[[:space:]]+[0-9]{4})'; then
+                echo "OK  $sha: assertion cited."
+              else
+                echo "::warning::Commit $sha asserts 'Provider X uses ...' or '<provider> CLI uses ...' but does not cite a CLI version, docs URL, or ADR number. See CLAUDE.md -> Commit message conventions."
+                WARN=1
+              fi
+            fi
+          done
+
+          if [ "$WARN" -ne 0 ]; then
+            echo "Soft check raised warnings. Reviewer: please enforce per CLAUDE.md."
+          else
+            echo "Commit citation soft check clean."
+          fi

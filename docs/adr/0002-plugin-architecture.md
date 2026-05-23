@@ -7,7 +7,7 @@
 
 ## Context
 
-OLP supports a curated set of providers — three default-enabled (Anthropic, OpenAI Codex, Mistral Vibe) plus two optional tier-1 (xAI Grok, Moonshot Kimi) and three optional tier-2 (MiniMax, Zhipu GLM, Alibaba Qwen). Each provider has its own CLI binary, its own auth artifact location, its own request shape, its own response shape, its own quota-reporting endpoint (or none), and its own rate-limit posture. The maintainer's strong prior is that this set grows over the project's lifetime — provider economics will continue to shift, and "the right five providers" in 2027 will not be identical to today's five.
+OLP declares a curated set of candidate providers — three anticipated Tier D (Anthropic, OpenAI Codex, Mistral Vibe), two anticipated Tier C (xAI Grok, Moonshot Kimi), and three anticipated Tier B (MiniMax, Zhipu GLM, Alibaba Qwen). Per ALIGNMENT.md § Provider Inventory, all 8 ship as **Candidate** at v0.1 founding; transition to **Enabled** requires authority pin filled + plugin landed + Phase audit passed. Each provider has its own CLI binary, its own auth artifact location, its own request shape, its own response shape, its own quota-reporting endpoint (or none), and its own rate-limit posture. The maintainer's strong prior is that this set grows over the project's lifetime — provider economics will continue to shift, and "the right five providers" in 2027 will not be identical to today's five.
 
 The naive architecture is a monolithic dispatcher inside `server.mjs`:
 
@@ -86,7 +86,7 @@ Every provider plugin exports an object conforming to:
 
 ## Alternatives considered
 
-**(a) Monolithic dispatch inside `server.mjs`.** A single function with `if/else if` per provider, each branch implementing spawn/quota/health inline. Rejected: this is the architectural shape that produced OCP's `server.mjs` length problem at *one* provider, and it does not survive contact with three default + two optional tier-1 + three optional tier-2 providers (eight code paths). Worse, it makes provider-disable a code change, which means fast-quarantine in response to a ToS announcement (spec §9) is a release event rather than a config flip.
+**(a) Monolithic dispatch inside `server.mjs`.** A single function with `if/else if` per provider, each branch implementing spawn/quota/health inline. Rejected: this is the architectural shape that produced OCP's `server.mjs` length problem at *one* provider, and it does not survive contact with 8 candidate providers (anticipated 3 D + 2 C + 3 B, eight code paths once they all transition from Candidate to Enabled). Worse, it makes provider-disable a code change, which means fast-quarantine in response to a ToS announcement (spec §9) is a release event rather than a config flip.
 
 **(b) Full external plugin discovery (npm-installable, runtime-loaded, hot-discoverable).** Plugins are npm packages; OLP scans `node_modules/@olp-providers/*` at startup; users `npm install` to add a provider. Rejected for v1.0 on three grounds: (1) the provider set is curated for ToS-risk reasons (ADR 0006), and "anyone can install any provider" defeats that curation; (2) the discovery layer is itself non-trivial code (manifest validation, version compatibility, security review of third-party plugin code) that does not earn its complexity at three to eight providers; (3) the contract has not stabilized enough — locking it as a stable plugin API before v1.0 ships is premature commitment.
 

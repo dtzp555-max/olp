@@ -46,12 +46,12 @@ jobs:
       - name: Run npm test
         shell: bash
         run: |
-          # Bootstrap tolerance: if test-features.mjs does not exist yet (Phase 0
-          # ships before Phase 1 lands the test harness), skip with a notice.
-          # The `npm test` script is configured in package.json from day one, so
-          # checking script presence is not a useful gate — the file must exist.
-          if [ ! -f test-features.mjs ]; then
-            echo "::notice::test-features.mjs not present yet (Phase 0 bootstrap phase). Skipping. Test harness lands with Phase 1 per docs/adr/0001 / spec §6."
+          # Bootstrap tolerance: skip if either test-features.mjs is absent OR
+          # package.json has no scripts.test entry. v0.1 founding ships
+          # neither — both land with Phase 1 per spec §6. Once one or both
+          # are present, this guard falls through to `npm test`.
+          if [ ! -f test-features.mjs ] || ! node -e "p=require('./package.json');process.exit(p.scripts&&p.scripts.test?0:1)" 2>/dev/null; then
+            echo "::notice::Phase 0 bootstrap: test-features.mjs absent OR scripts.test not declared in package.json. Skipping. Both land with Phase 1 per docs/adr/0001 / spec §6."
             exit 0
           fi
           npm test

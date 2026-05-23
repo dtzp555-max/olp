@@ -1,0 +1,5 @@
+{
+  "version": "0.1.0-bootstrap",
+  "comment": "OLP models registry — SPOT for (provider, model) → metadata per CLAUDE.md release_kit overlay. v0.1 founding ships zero Enabled Providers per ALIGNMENT.md § Provider Inventory, so 'providers' is empty. Each Phase audit that transitions a Candidate to Enabled populates its provider's entry here. Schema validated by .github/workflows/alignment.yml; provider keys must match ALIGNMENT.md inventory.",
+  "providers": {}
+}

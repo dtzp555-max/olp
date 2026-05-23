@@ -19,7 +19,7 @@ New ADRs increment from the highest existing number. Filenames are `NNNN-<short-
 | [0003](0003-intermediate-representation.md) | Intermediate Representation (IR) Design | The OLP-internal canonical request/response shape between the OpenAI-compat entry surface and each provider plugin. v1.0 IR fields, IR-vs-OpenAI-vs-native-provider three-shape model, IR is not exposed externally. |
 | [0004](0004-fallback-engine.md) | Fallback Engine Semantics & Safety | Trigger taxonomy (Hard / Soft / Deterministic-deferred / Cost-aware-deferred), idempotent-failure safety (first-chunk rule), chain advancement one-at-a-time, observability headers. |
 | [0005](0005-cache-cross-provider.md) | Cache Layer Cross-Provider Design | Cache key composition over `(provider, model, messages, …)`, per-model isolation, D1+D2+D3+D4 port from OCP v3.13.0, cross-provider fallback cache behaviour (correct miss). |
-| [0006](0006-provider-inclusion.md) | Provider Inclusion / Exclusion + Risk-Tier Framework | The 4-tier classification (A excluded / B explicit consent / C opt-in / D default-enabled), current v0.1 inventory, Antigravity exclusion rationale (named prohibition + no cost advantage + reinstatement friction), consent UX, future provider addition procedure. |
+| [0006](0006-provider-inclusion.md) | Provider Inclusion / Exclusion + Risk-Tier Framework | The 4-tier classification (A excluded by default / B explicit consent / C opt-in / D eligible-for-default-enabled), Candidate-vs-Enabled distinction, current v0.1 candidate inventory (0 Enabled), Antigravity exclusion rationale (named prohibition + no cost advantage + reinstatement friction; pending primary-source pin), consent UX, future provider addition procedure. |
 
 ## When to write a new ADR
 

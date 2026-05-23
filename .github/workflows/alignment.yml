@@ -89,7 +89,7 @@ jobs:
           for token in "${FORBIDDEN_PROVIDER_TOKENS[@]}"; do
             HITS="$(echo "$SOURCE_FILES" | xargs grep -n -F "$token" 2>/dev/null || true)"
             if [ -n "$HITS" ]; then
-              echo "::error::Tier-A-excluded provider token '$token' detected in OLP source. Per ALIGNMENT.md / ADR 0006, this provider is permanently excluded."
+              echo "::error::Tier-A-excluded provider token '$token' detected in OLP source. Per ALIGNMENT.md / ADR 0006, this provider is excluded by default; re-inclusion requires ADR 0006 supersession/amendment with new primary-source evidence."
               echo "$HITS"
               FAIL=1
             fi
@@ -101,7 +101,7 @@ jobs:
             echo "ALIGNMENT GUARDRAIL FAILURE"
             echo "============================================================"
             echo "OLP source contains a token on the alignment blacklist or"
-            echo "references a permanently excluded provider."
+            echo "references a Tier-A-excluded provider."
             echo ""
             echo "Blacklist tokens were introduced by LLM hallucinations and"
             echo "do not appear in the relevant authority (provider CLI,"
@@ -110,8 +110,10 @@ jobs:
             echo "record at https://github.com/dtzp555-max/ocp."
             echo ""
             echo "Excluded providers are listed in ALIGNMENT.md \xc2\xa7 Risk Tier"
-            echo "Framework and ADR 0006. Permanent exclusion means not"
-            echo "bundled, not pluggable, not added via opt-in."
+            echo "Framework and ADR 0006. Tier-A exclusion means not"
+            echo "bundled, not pluggable, not added via opt-in;"
+            echo "re-inclusion requires ADR 0006 amendment with new"
+            echo "primary-source evidence."
             echo ""
             echo "Required action:"
             echo "  1. Remove the token from source."
@@ -191,8 +193,14 @@ jobs:
             exit 0
           fi
 
+          # Use process substitution `< <(...)` rather than piping into the
+          # while loop. A piped while runs in a subshell, so `WARN=1` would
+          # never propagate back out to this scope — the if-check below would
+          # always report "clean" even when warnings were emitted. Classic
+          # Bash subshell trap; see commit history for the codex review that
+          # caught this.
           WARN=0
-          git log --format="%H" "${BASE_SHA}..${HEAD_SHA}" | while read -r sha; do
+          while read -r sha; do
             BODY="$(git log -1 --format=%B "$sha")"
             if echo "$BODY" | grep -E -i -q '(provider|claude|codex|vibe|grok|kimi|minimax|glm|qwen|cli)[[:space:]]+(code[[:space:]]+)?uses'; then
               if echo "$BODY" | grep -E -i -q '(cli[[:space:]]+v[0-9]+|https?://|ADR[[:space:]]+[0-9]{4})'; then
@@ -202,7 +210,7 @@ jobs:
                 WARN=1
               fi
             fi
-          done
+          done < <(git log --format="%H" "${BASE_SHA}..${HEAD_SHA}")
 
           if [ "$WARN" -ne 0 ]; then
             echo "Soft check raised warnings. Reviewer: please enforce per CLAUDE.md."

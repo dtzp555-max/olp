@@ -23,7 +23,7 @@ Found OLP (Open LLM Proxy) as a new project, separate from OCP, with the followi
 
 **Non-mission (explicit).** Per spec §1, OLP is **not**:
 - A commercial multi-tenant SaaS. Helicone, OpenRouter, LiteLLM, Portkey, Cloudflare AI Gateway already serve that market with funding, SOC2, dashboards, and team features. OLP enters none of those races.
-- A generic enterprise AI gateway competing on provider breadth. The provider set is intentionally narrow (currently 3 default + 2 optional tier-1 + 3 optional tier-2) and curated by subscription economics, not by "more is better."
+- A generic enterprise AI gateway competing on provider breadth. The candidate provider set is intentionally narrow (8 total: 3 anticipated Tier D + 2 anticipated Tier C + 3 anticipated Tier B; v0.1 founding ships 0 Enabled per ALIGNMENT.md § Provider Inventory) and curated by subscription economics, not by "more is better."
 - A model-capability router. OLP does not auto-route to "the smartest model"; the user picks the model explicitly per chain in `config.routing.chains[]`. Capability routing is a separate problem with separate failure modes and is out of scope for v1.0 and beyond.
 - A conversation-state store. Memory and continuity are client-side concerns (Memory Continuity, Hermes equivalents, IDE-side context). OLP is a pure stateless proxy.
 

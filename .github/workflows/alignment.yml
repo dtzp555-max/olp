@@ -96,34 +96,32 @@ jobs:
           done
 
           if [ "$FAIL" -ne 0 ]; then
-            cat <<'EOF'
-
-          ============================================================
-          ALIGNMENT GUARDRAIL FAILURE
-          ============================================================
-          OLP source contains a token on the alignment blacklist or
-          references a permanently excluded provider.
-
-          Blacklist tokens were introduced by LLM hallucinations and
-          do not appear in the relevant authority (provider CLI,
-          OpenAI spec, or ADR). See ALIGNMENT.md and (where the
-          token is inherited from OCP) the OCP 2026-04-11 drift
-          record at https://github.com/dtzp555-max/ocp.
-
-          Excluded providers are listed in ALIGNMENT.md § Risk Tier
-          Framework and ADR 0006. Permanent exclusion means not
-          bundled, not pluggable, not added via opt-in.
-
-          Required action:
-            1. Remove the token from source.
-            2. Cite the real authority (provider CLI doc / OpenAI
-               spec section / ADR) for the operation you intended.
-            3. See ALIGNMENT.md Rules 1, 2, and 5.
-
-          Do not add allowlist entries to this workflow without an
-          amendment PR to ALIGNMENT.md (see Amendment Procedure).
-          ============================================================
-EOF
+            echo ""
+            echo "============================================================"
+            echo "ALIGNMENT GUARDRAIL FAILURE"
+            echo "============================================================"
+            echo "OLP source contains a token on the alignment blacklist or"
+            echo "references a permanently excluded provider."
+            echo ""
+            echo "Blacklist tokens were introduced by LLM hallucinations and"
+            echo "do not appear in the relevant authority (provider CLI,"
+            echo "OpenAI spec, or ADR). See ALIGNMENT.md and (where the"
+            echo "token is inherited from OCP) the OCP 2026-04-11 drift"
+            echo "record at https://github.com/dtzp555-max/ocp."
+            echo ""
+            echo "Excluded providers are listed in ALIGNMENT.md \xc2\xa7 Risk Tier"
+            echo "Framework and ADR 0006. Permanent exclusion means not"
+            echo "bundled, not pluggable, not added via opt-in."
+            echo ""
+            echo "Required action:"
+            echo "  1. Remove the token from source."
+            echo "  2. Cite the real authority (provider CLI doc / OpenAI"
+            echo "     spec section / ADR) for the operation you intended."
+            echo "  3. See ALIGNMENT.md Rules 1, 2, and 5."
+            echo ""
+            echo "Do not add allowlist entries to this workflow without an"
+            echo "amendment PR to ALIGNMENT.md (see Amendment Procedure)."
+            echo "============================================================"
             exit 1
           fi
 

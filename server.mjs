@@ -33,6 +33,12 @@ import { loadProviders, getProviderForModel, listAllProviderNames } from './lib/
 import { ProviderError } from './lib/providers/base.mjs';
 import { computeCacheKey, hasCacheControl, extractCacheControlMarkers } from './lib/cache/keys.mjs';
 import { CacheStore } from './lib/cache/store.mjs';
+import {
+  evaluateHardTriggers,
+  executeWithFallback,
+  buildDefaultChain,
+  loadFallbackConfigSync,
+} from './lib/fallback/engine.mjs';
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -47,6 +53,27 @@ const BODY_LIMIT = 5 * 1024 * 1024; // 5 MB
 // ALIGNMENT.md § Provider Inventory: 0 Enabled Providers at v0.1.
 // Empty config → empty loaded map → all POST /v1/chat/completions → 503.
 const loadedProviders = loadProviders({ enabled: {} });
+
+// ── Fallback config ───────────────────────────────────────────────────────
+// Read ~/.olp/config.json routing.chains at startup. Empty at v0.1.
+// Per ADR 0004 § D9: fallback engine is wired; activates when user populates chains.
+// Tests may inject a synthetic fallbackConfig via __setFallbackConfig().
+let _fallbackConfig = loadFallbackConfigSync();
+
+/** @internal — test seam: inject a synthetic fallback config (no file I/O) */
+export function __setFallbackConfig(config) {
+  _fallbackConfig = config ?? { chains: {}, soft_triggers: {} };
+}
+
+/** @internal — reset to file-based config */
+export function __resetFallbackConfig() {
+  _fallbackConfig = loadFallbackConfigSync();
+}
+
+/** @internal — clear the cache store (for tests that need a fresh cache state) */
+export function __clearCache() {
+  cacheStore.clear();
+}
 
 // ── Cache layer ───────────────────────────────────────────────────────────
 // D1 per-key isolation + D4 singleflight per ADR 0005.
@@ -132,9 +159,10 @@ function sendError(res, status, message, type) {
 
 /**
  * Returns the standard OLP diagnostic headers.
- * Per spec: X-OLP-Provider-Used, X-OLP-Model-Used, X-OLP-Fallback-Hops,
- * X-OLP-Cache, X-OLP-Latency-Ms.
- * Fallback-Hops is always 0 at D5 (no fallback engine yet — ADR 0004).
+ * Per spec §4.7 and ADR 0004 § Observability headers:
+ *   X-OLP-Provider-Used, X-OLP-Model-Used, X-OLP-Fallback-Hops,
+ *   X-OLP-Cache, X-OLP-Latency-Ms.
+ * Fallback-Hops reflects which chain index served the request (0=primary).
  * Cache reflects actual hit/miss/bypass status from the cache layer (ADR 0005).
  *
  * @param {object} opts
@@ -142,13 +170,14 @@ function sendError(res, status, message, type) {
  * @param {string} opts.modelUsed
  * @param {number} opts.startMs
  * @param {'hit'|'miss'|'bypass'} [opts.cacheStatus='miss']
+ * @param {number} [opts.fallbackHops=0] — from executeWithFallback result
  * @returns {Record<string,string>}
  */
-function olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus = 'miss' }) {
+function olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus = 'miss', fallbackHops = 0 }) {
   return {
     'X-OLP-Provider-Used': providerUsed,
     'X-OLP-Model-Used': modelUsed,
-    'X-OLP-Fallback-Hops': '0',
+    'X-OLP-Fallback-Hops': String(fallbackHops),
     'X-OLP-Cache': cacheStatus,
     'X-OLP-Latency-Ms': String(Date.now() - startMs),
   };
@@ -181,7 +210,13 @@ function handleModels(req, res) {
 
 /**
  * POST /v1/chat/completions
- * Core dispatch path: OpenAI request → IR → provider.spawn → OpenAI response.
+ * Core dispatch path: OpenAI request → IR → fallback engine → provider.spawn → OpenAI response.
+ *
+ * D9: Fallback engine (ADR 0004) is wired between IR construction and provider.spawn.
+ * Chain advancement, soft/hard trigger evaluation, and first-chunk safety are all
+ * handled by executeWithFallback(). At v0.1 with empty routing.chains config, this
+ * is a transparent single-hop pass-through. Multi-hop fallback activates when the
+ * user populates ~/.olp/config.json.
  *
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:http').ServerResponse} res
@@ -202,7 +237,7 @@ async function handleChatCompletions(req, res) {
     return sendError(res, e.statusCode ?? 400, e.message, 'invalid_request_error');
   }
 
-  // Translate OpenAI → IR
+  // Translate OpenAI → IR (ADR 0003)
   let ir;
   try {
     ir = openAIToIR(body);
@@ -213,9 +248,23 @@ async function handleChatCompletions(req, res) {
     throw e;
   }
 
-  // Find a provider for the requested model
-  const match = getProviderForModel(loadedProviders, ir.model);
-  if (!match) {
+  // Auth context is null at D5/D9 — providers fall back to their own credential
+  // discovery (env var, keychain, credentials file). Phase 2 multi-key
+  // infrastructure will pass a real authContext carrying the per-key OLP token.
+  const authContext = null;
+
+  // ── Fallback engine: build chain (ADR 0004) ─────────────────────────────
+  // buildDefaultChain returns null if no enabled provider serves this model.
+  // Per ADR 0004 § D9: at v0.1, chain is single-hop (no fallback) unless the
+  // user has populated ~/.olp/config.json routing.chains.
+  const chain = buildDefaultChain(
+    ir.model,
+    loadedProviders,
+    _fallbackConfig.chains,
+    _fallbackConfig.soft_triggers,
+  );
+
+  if (!chain) {
     // ALIGNMENT.md: 0 Enabled Providers at v0.1 → 503 per spec
     return sendError(
       res, 503,
@@ -224,91 +273,148 @@ async function handleChatCompletions(req, res) {
     );
   }
 
-  const { provider, name: providerName } = match;
   const requestId = generateRequestId();
 
-  // Auth context is null at D5 — providers fall back to their own credential
-  // discovery (env var, keychain, credentials file). Phase 2 multi-key
-  // infrastructure will pass a real authContext carrying the per-key OLP token.
-  const authContext = null;
-
   // ── Cache layer (ADR 0005) ──────────────────────────────────────────────
-  // keyId: '__anonymous__' at D5. Phase 2 multi-key infrastructure wires the
+  // keyId: '__anonymous__' at D5/D9. Phase 2 multi-key infrastructure wires the
   // real OLP API key ID here for D1 per-key isolation.
   const keyId = '__anonymous__';
-  const cacheKey = computeCacheKey(providerName, ir.model, ir);
 
   // D2 bypass: if the request contains Anthropic cache_control markers,
-  // skip OLP's response cache entirely (the prompt cache lives at Anthropic's
-  // side; double-caching would shadow Anthropic's TTLs per ADR 0005 § D2).
-  //
-  // Note: hasCacheControl() checks the IR (ADR 0003). Since openAIToIR() does not
-  // preserve cache_control fields from the raw OpenAI message shape (those fields
-  // are Anthropic-specific extensions, not part of the IR schema), we also check
-  // the raw body.messages directly via extractCacheControlMarkers. This ensures
-  // D2 bypass is triggered even though the IR translator strips the field.
+  // skip OLP's response cache (prompt cache lives at Anthropic's side per ADR 0005 § D2).
   const bypassCache = hasCacheControl(ir) || extractCacheControlMarkers(body?.messages ?? []).length > 0;
 
   if (bypassCache) {
-    logEvent('debug', 'cache_bypass', { provider: providerName, model: ir.model, reason: 'cache_control_markers' });
+    logEvent('debug', 'cache_bypass', { model: ir.model, reason: 'cache_control_markers' });
   }
 
-  // ── Collect chunks helper (used by both streaming and non-streaming paths) ──
-  // collectAllChunks wraps provider.spawn() to collect all IR chunks into an
-  // array. Used as the computeFn for getOrCompute (D4 singleflight).
+  // ── executeHopFn: per-hop spawn + cache wrapper ─────────────────────────
+  // This is the function executeWithFallback calls for each chain hop.
+  // Each hop gets its own (provider, model) cache key per ADR 0005 § Per-model isolation.
   //
-  // Error semantics: if the provider emits a `type: 'error'` chunk, we throw
-  // a ProviderError instead of returning the chunk array. This prevents
-  // cache_store.set() from being called on an error-terminated response, per
-  // ADR 0005 § "Cache write conditions" item 1 ("The response completed
-  // successfully (no truncation, no error mid-stream)"). The thrown error
-  // propagates to the catch block at the call site, which returns 502 to
-  // the client without writing to cache.
-  async function collectAllChunks() {
-    const chunks = [];
-    for await (const irChunk of provider.spawn(ir, authContext)) {
-      chunks.push(irChunk);
-      if (irChunk.type === 'error') {
-        throw new ProviderError(
-          irChunk.error ?? 'Provider emitted error chunk',
-          'SPAWN_FAILED',
-        );
-      }
-      if (irChunk.type === 'stop') break;
+  // First-chunk safety (ADR 0004 § Fallback safety):
+  //   collectAllChunks fully buffers the provider response before returning.
+  //   Therefore, if executeHopFn throws, zero bytes have been written to `res`.
+  //   The fallback engine safely advances the chain on hard triggers.
+  //   If executeHopFn returns successfully, the chunks are buffered and we write
+  //   them to `res` only AFTER executeWithFallback returns — ensuring no writes
+  //   occur during chain iteration.
+  async function executeHopFn(hopProvider, hopModel, irReq) {
+    const hopCacheKey = computeCacheKey(hopProvider, hopModel, irReq);
+    const hopProviderPlugin = loadedProviders.get(hopProvider);
+
+    if (!hopProviderPlugin) {
+      // Provider in the chain is not loaded (config references a disabled provider)
+      throw Object.assign(
+        new Error(`Provider ${hopProvider} is not enabled`),
+        { statusCode: 503 },
+      );
     }
-    return chunks;
+
+    // Collect all chunks from this provider, throwing on error chunks.
+    // Error semantics: ProviderError thrown here propagates to executeWithFallback
+    // which decides whether to advance the chain.
+    async function collectAllChunks() {
+      const chunks = [];
+      for await (const irChunk of hopProviderPlugin.spawn(irReq, authContext)) {
+        chunks.push(irChunk);
+        if (irChunk.type === 'error') {
+          throw new ProviderError(
+            irChunk.error ?? 'Provider emitted error chunk',
+            'SPAWN_FAILED',
+          );
+        }
+        if (irChunk.type === 'stop') break;
+      }
+      return chunks;
+    }
+
+    if (bypassCache) {
+      return collectAllChunks();
+    }
+
+    // D4 singleflight + D1 per-key isolation per ADR 0005.
+    // Each hop has its own (provider, model) key — cross-provider contamination
+    // is structurally impossible (ADR 0005 § Per-model isolation).
+    return cacheStore.getOrCompute(keyId, hopCacheKey, collectAllChunks);
   }
 
-  // Pre-check: stats-neutral peek before calling getOrCompute so we can
-  // reliably report hit/miss in the response header. peek() does NOT touch
-  // hit/miss counters (fix for codex-flagged double-count); getOrCompute()
-  // increments at the semantic boundary.
-  const preCheckHit = bypassCache ? false : await cacheStore.peek(keyId, cacheKey);
+  // ── Execute with fallback (ADR 0004) ────────────────────────────────────
+  // Pre-check for cache status reporting uses first hop's key (primary provider).
+  const firstHopCacheKey = computeCacheKey(chain[0].provider, chain[0].model, ir);
+  const preCheckHit = bypassCache ? false : await cacheStore.peek(keyId, firstHopCacheKey);
+
+  let fallbackResult;
+  try {
+    fallbackResult = await executeWithFallback(chain, ir, executeHopFn, {
+      logEvent,
+    });
+  } catch (e) {
+    // executeWithFallback throws only on programming errors (empty chain).
+    logEvent('error', 'fallback_engine_error', { error: e.message });
+    return sendError(res, 500, 'Internal server error', 'internal_error');
+  }
+
+  const {
+    chunks,
+    providerUsed,
+    modelUsed,
+    fallbackHops,
+    originalError,
+    triedProviders,
+  } = fallbackResult;
+
+  // ── Chain exhausted or non-trigger error ─────────────────────────────────
+  if (chunks === null) {
+    logEvent('error', 'spawn_error', {
+      model: ir.model,
+      providerUsed,
+      fallbackHops,
+      triedProviders,
+      error: originalError?.message,
+    });
+
+    // Emit exhausted header if more than one provider was tried
+    const exhaustedHeader = triedProviders.length > 1
+      ? { 'X-OLP-Fallback-Exhausted': triedProviders.join(',') }
+      : {};
+
+    // Determine status: preserve client errors (400/401/403/404/422) as-is.
+    // Otherwise map ProviderError → 502, unknown → 500.
+    let errStatus = 502;
+    if (originalError) {
+      const httpStatus = originalError.statusCode ?? originalError.status ?? null;
+      if (httpStatus !== null) {
+        errStatus = httpStatus;
+      } else if (!(originalError instanceof ProviderError)) {
+        errStatus = 500;
+      }
+    }
+
+    // Send error with exhausted header
+    const payload = JSON.stringify({
+      error: {
+        message: originalError?.message ?? 'Provider error',
+        type: 'provider_error',
+      },
+    });
+    res.writeHead(errStatus, {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+      ...exhaustedHeader,
+    });
+    res.end(payload);
+    return;
+  }
+
+  // ── Success: emit response ─────────────────────────────────────────────
+  // Per ADR 0004 § Observability headers: X-OLP-Fallback-Hops reflects the
+  // chain index of the serving hop; 0 = primary served, 1 = first fallback, etc.
+  const cacheStatus = bypassCache ? 'bypass' : (preCheckHit && fallbackHops === 0 ? 'hit' : 'miss');
+  const headers = olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus, fallbackHops });
 
   if (ir.stream) {
-    // Streaming response path
-    // D5 simplified D3: cache stores full collected chunks, replays them one
-    // at a time without timing fidelity. Full D3 (timing-accurate replay) lands
-    // in a later Phase per ADR 0005 § D3.
-    let chunks;
-    let cacheStatus;
-
-    try {
-      if (bypassCache) {
-        cacheStatus = 'bypass';
-        chunks = await collectAllChunks();
-      } else {
-        // D4 singleflight + D1 per-key isolation
-        chunks = await cacheStore.getOrCompute(keyId, cacheKey, collectAllChunks);
-        cacheStatus = preCheckHit ? 'hit' : 'miss';
-      }
-    } catch (e) {
-      logEvent('error', 'spawn_error', { provider: providerName, model: ir.model, error: e.message });
-      sendError(res, e instanceof ProviderError ? 502 : 500, e.message ?? 'Provider error', 'provider_error');
-      return;
-    }
-
-    const headers = olpHeaders({ providerUsed: providerName, modelUsed: ir.model, startMs, cacheStatus });
+    // Streaming response path (D3 simplified: burst replay, no timing fidelity)
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -317,7 +423,6 @@ async function handleChatCompletions(req, res) {
       ...headers,
     });
 
-    // D3 simplified replay: emit collected chunks sequentially
     for (const irChunk of chunks) {
       res.write(irChunkToOpenAISSE(irChunk, requestId, ir.model));
       if (irChunk.type === 'stop' || irChunk.type === 'error') break;
@@ -326,31 +431,7 @@ async function handleChatCompletions(req, res) {
     res.end();
   } else {
     // Non-streaming response path
-    let cacheStatus;
-    let responseObj;
-
-    try {
-      if (bypassCache) {
-        cacheStatus = 'bypass';
-        const chunks = await collectAllChunks();
-        responseObj = irResponseToOpenAINonStream(chunks, requestId, ir.model);
-      } else {
-        // D4 singleflight: concurrent identical requests share one spawn.
-        // We cache the full IR chunk array and assemble the OpenAI response on
-        // each retrieval so the requestId is fresh per request (per OpenAI spec
-        // each response has a unique id).
-        const chunks = await cacheStore.getOrCompute(keyId, cacheKey, collectAllChunks);
-        cacheStatus = preCheckHit ? 'hit' : 'miss';
-        responseObj = irResponseToOpenAINonStream(chunks, requestId, ir.model);
-      }
-    } catch (e) {
-      logEvent('error', 'spawn_error', { provider: providerName, model: ir.model, error: e.message });
-      const status = e instanceof ProviderError ? 502 : 500;
-      sendError(res, status, e.message ?? 'Provider error', 'provider_error');
-      return;
-    }
-
-    const headers = olpHeaders({ providerUsed: providerName, modelUsed: ir.model, startMs, cacheStatus });
+    const responseObj = irResponseToOpenAINonStream(chunks, requestId, ir.model);
     sendJSON(res, 200, responseObj, headers);
   }
 }

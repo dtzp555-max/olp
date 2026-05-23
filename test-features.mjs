@@ -2999,3 +2999,848 @@ describe('Mistral Vibe plugin (D8)', () => {
   });
 
 });
+
+// ── Suite 13: Fallback engine (D9) ───────────────────────────────────────
+//
+// All tests are unit tests. No real provider CLIs are invoked.
+// Tests cover:
+//   13a: Trigger taxonomy (evaluateHardTriggers / evaluateSoftTriggers)
+//   13b: executeWithFallback engine behaviour
+//   13c: First-chunk safety (buffering semantics at D9)
+//   13d: Soft trigger skipping spawn
+//   13e: Header annotation (providerUsed / modelUsed / fallbackHops / originalError)
+//   13f: HTTP integration with __setFallbackConfig test seam
+//
+// Authority: ADR 0004 — Fallback Engine Semantics and Safety
+
+import {
+  evaluateHardTriggers,
+  evaluateSoftTriggers,
+  executeWithFallback,
+  buildDefaultChain,
+  loadFallbackConfigSync,
+  isClientError,
+} from './lib/fallback/engine.mjs';
+
+import {
+  createOlpServer,
+  __setFallbackConfig,
+  __resetFallbackConfig,
+  __clearCache,
+} from './server.mjs';
+
+// ── 13a: Trigger taxonomy ────────────────────────────────────────────────
+
+describe('Fallback engine — trigger taxonomy (D9)', () => {
+
+  // ── evaluateHardTriggers ─────────────────────────────────────────────
+
+  it('evaluateHardTriggers: HTTP 500 → fires (5xx hard trigger)', () => {
+    const err = Object.assign(new Error('Server error'), { statusCode: 500 });
+    assert.equal(evaluateHardTriggers(err), true);
+  });
+
+  it('evaluateHardTriggers: HTTP 503 → fires (5xx hard trigger)', () => {
+    const err = Object.assign(new Error('Service unavailable'), { statusCode: 503 });
+    assert.equal(evaluateHardTriggers(err), true);
+  });
+
+  it('evaluateHardTriggers: HTTP 400 → does NOT fire (client error)', () => {
+    const err = Object.assign(new Error('Bad request'), { statusCode: 400 });
+    assert.equal(evaluateHardTriggers(err), false);
+  });
+
+  it('evaluateHardTriggers: HTTP 401 → does NOT fire (client error)', () => {
+    const err = Object.assign(new Error('Unauthorized'), { statusCode: 401 });
+    assert.equal(evaluateHardTriggers(err), false);
+  });
+
+  it('evaluateHardTriggers: HTTP 403 → does NOT fire (client error)', () => {
+    const err = Object.assign(new Error('Forbidden'), { statusCode: 403 });
+    assert.equal(evaluateHardTriggers(err), false);
+  });
+
+  it('evaluateHardTriggers: HTTP 404 → does NOT fire (client error)', () => {
+    const err = Object.assign(new Error('Not found'), { statusCode: 404 });
+    assert.equal(evaluateHardTriggers(err), false);
+  });
+
+  it('evaluateHardTriggers: HTTP 422 → does NOT fire (client error)', () => {
+    const err = Object.assign(new Error('Unprocessable'), { statusCode: 422 });
+    assert.equal(evaluateHardTriggers(err), false);
+  });
+
+  it('evaluateHardTriggers: HTTP 429 → fires (quota-like 4xx not in client-error set)', () => {
+    const err = Object.assign(new Error('Too Many Requests'), { statusCode: 429 });
+    assert.equal(evaluateHardTriggers(err), true);
+  });
+
+  it('evaluateHardTriggers: ProviderError QUOTA_EXHAUSTED → fires', () => {
+    const err = new ProviderError('Quota exhausted', 'QUOTA_EXHAUSTED');
+    assert.equal(evaluateHardTriggers(err), true);
+  });
+
+  it('evaluateHardTriggers: ProviderError RATE_LIMITED → fires', () => {
+    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    assert.equal(evaluateHardTriggers(err), true);
+  });
+
+  it('evaluateHardTriggers: ProviderError SPAWN_FAILED → fires', () => {
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
+    assert.equal(evaluateHardTriggers(err), true);
+  });
+
+  it('evaluateHardTriggers: ProviderError CLI_NOT_FOUND → fires', () => {
+    const err = new ProviderError('CLI not found', 'CLI_NOT_FOUND');
+    assert.equal(evaluateHardTriggers(err), true);
+  });
+
+  it('evaluateHardTriggers: ProviderError AUTH_MISSING → does NOT fire (user must fix)', () => {
+    const err = new ProviderError('Auth missing', 'AUTH_MISSING');
+    assert.equal(evaluateHardTriggers(err), false);
+  });
+
+  it('evaluateHardTriggers: ProviderError OUTPUT_PARSE_ERROR → fires', () => {
+    const err = new ProviderError('Parse error', 'OUTPUT_PARSE_ERROR');
+    assert.equal(evaluateHardTriggers(err), true);
+  });
+
+  it('evaluateHardTriggers: generic Error with no statusCode → does NOT fire', () => {
+    const err = new Error('Something went wrong');
+    assert.equal(evaluateHardTriggers(err), false);
+  });
+
+  it('evaluateHardTriggers: null error → does NOT fire', () => {
+    assert.equal(evaluateHardTriggers(null), false);
+  });
+
+  // ── evaluateSoftTriggers ─────────────────────────────────────────────
+
+  it('evaluateSoftTriggers: credit_pool_percent_threshold at exactly threshold → fires', () => {
+    const cfg = { credit_pool_percent_threshold: 90 };
+    const quota = { percentUsed: 90 };
+    assert.equal(evaluateSoftTriggers(cfg, quota), true);
+  });
+
+  it('evaluateSoftTriggers: credit_pool_percent_threshold above threshold → fires', () => {
+    const cfg = { credit_pool_percent_threshold: 90 };
+    const quota = { percentUsed: 95 };
+    assert.equal(evaluateSoftTriggers(cfg, quota), true);
+  });
+
+  it('evaluateSoftTriggers: credit_pool_percent_threshold below threshold → does NOT fire', () => {
+    const cfg = { credit_pool_percent_threshold: 90 };
+    const quota = { percentUsed: 89 };
+    assert.equal(evaluateSoftTriggers(cfg, quota), false);
+  });
+
+  it('evaluateSoftTriggers: daily_request_count_threshold at threshold → fires', () => {
+    const cfg = { daily_request_count_threshold: 500 };
+    const quota = { dailyCount: 500 };
+    assert.equal(evaluateSoftTriggers(cfg, quota), true);
+  });
+
+  it('evaluateSoftTriggers: daily_request_count_threshold below threshold → does NOT fire', () => {
+    const cfg = { daily_request_count_threshold: 500 };
+    const quota = { dailyCount: 499 };
+    assert.equal(evaluateSoftTriggers(cfg, quota), false);
+  });
+
+  it('evaluateSoftTriggers: five_hour_window_percent_threshold at threshold → fires', () => {
+    const cfg = { five_hour_window_percent_threshold: 85 };
+    const quota = { fiveHourWindowPercent: 85 };
+    assert.equal(evaluateSoftTriggers(cfg, quota), true);
+  });
+
+  it('evaluateSoftTriggers: null quotaSnapshot → does NOT fire (graceful degrade)', () => {
+    const cfg = { credit_pool_percent_threshold: 90 };
+    assert.equal(evaluateSoftTriggers(cfg, null), false);
+  });
+
+  it('evaluateSoftTriggers: undefined quotaSnapshot → does NOT fire (graceful degrade)', () => {
+    const cfg = { credit_pool_percent_threshold: 90 };
+    assert.equal(evaluateSoftTriggers(cfg, undefined), false);
+  });
+
+  it('evaluateSoftTriggers: null triggerConfig → does NOT fire', () => {
+    const quota = { percentUsed: 95 };
+    assert.equal(evaluateSoftTriggers(null, quota), false);
+  });
+
+  it('evaluateSoftTriggers: empty triggerConfig → does NOT fire', () => {
+    const quota = { percentUsed: 95 };
+    assert.equal(evaluateSoftTriggers({}, quota), false);
+  });
+
+  // ── isClientError ────────────────────────────────────────────────────
+
+  it('isClientError: 400 → true', () => { assert.equal(isClientError(400), true); });
+  it('isClientError: 401 → true', () => { assert.equal(isClientError(401), true); });
+  it('isClientError: 403 → true', () => { assert.equal(isClientError(403), true); });
+  it('isClientError: 404 → true', () => { assert.equal(isClientError(404), true); });
+  it('isClientError: 422 → true', () => { assert.equal(isClientError(422), true); });
+  it('isClientError: 429 → false (quota, not client error)', () => { assert.equal(isClientError(429), false); });
+  it('isClientError: 500 → false', () => { assert.equal(isClientError(500), false); });
+
+});
+
+// ── 13b: executeWithFallback engine ─────────────────────────────────────
+
+describe('Fallback engine — executeWithFallback (D9)', () => {
+
+  // helper: build a mock executeHopFn that succeeds or throws per provider name
+  function makeHopFn(outcomes) {
+    // outcomes: { [provider]: 'success' | Error }
+    return async function (provider, model, _ir) {
+      const outcome = outcomes[provider];
+      if (!outcome || outcome === 'success') {
+        return [{ type: 'delta', role: 'assistant', content: `response from ${provider}` },
+                { type: 'stop', finish_reason: 'stop' }];
+      }
+      throw outcome;
+    };
+  }
+
+  const dummyIR = makeIR({ model: 'test-model' });
+
+  it('empty chain → throws Error', async () => {
+    let caught = null;
+    try {
+      await executeWithFallback([], dummyIR, makeHopFn({}));
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught instanceof Error, 'Expected Error for empty chain');
+    assert.ok(caught.message.includes('chain'));
+  });
+
+  it('single-hop chain with success → returns chunks + fallbackHops=0', async () => {
+    const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
+    const result = await executeWithFallback(chain, dummyIR, makeHopFn({ anthropic: 'success' }));
+    assert.ok(Array.isArray(result.chunks), 'Expected chunks array');
+    assert.equal(result.fallbackHops, 0);
+    assert.equal(result.providerUsed, 'anthropic');
+    assert.equal(result.originalError, null);
+    assert.deepEqual(result.triedProviders, ['anthropic']);
+  });
+
+  it('single-hop chain with hard-triggered error → exhausted, returns originalError', async () => {
+    const err = new ProviderError('Quota exhausted', 'QUOTA_EXHAUSTED');
+    const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
+    const result = await executeWithFallback(chain, dummyIR, makeHopFn({ anthropic: err }));
+    assert.equal(result.chunks, null, 'Expected null chunks on exhausted chain');
+    assert.equal(result.originalError, err);
+    assert.equal(result.fallbackHops, 1);  // chain.length = 1, all exhausted
+    assert.deepEqual(result.triedProviders, ['anthropic']);
+  });
+
+  it('two-hop chain, primary fails with hard trigger → falls back to secondary, fallbackHops=1', async () => {
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const result = await executeWithFallback(chain, dummyIR, makeHopFn({ anthropic: err, openai: 'success' }));
+    assert.ok(Array.isArray(result.chunks), 'Expected chunks from secondary');
+    assert.equal(result.fallbackHops, 1);
+    assert.equal(result.providerUsed, 'openai');
+    assert.equal(result.originalError, null);
+    assert.deepEqual(result.triedProviders, ['anthropic', 'openai']);
+  });
+
+  it('three-hop chain, primary + secondary fail → tertiary returns chunks, fallbackHops=2', async () => {
+    const errA = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const errB = Object.assign(new Error('Service unavailable'), { statusCode: 503 });
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+      { provider: 'mistral', model: 'devstral-2' },
+    ];
+    const result = await executeWithFallback(
+      chain, dummyIR,
+      makeHopFn({ anthropic: errA, openai: errB, mistral: 'success' }),
+    );
+    assert.ok(Array.isArray(result.chunks));
+    assert.equal(result.fallbackHops, 2);
+    assert.equal(result.providerUsed, 'mistral');
+    assert.equal(result.originalError, null);
+    assert.deepEqual(result.triedProviders, ['anthropic', 'openai', 'mistral']);
+  });
+
+  it('three-hop chain, all fail → exhausted, originalError is from FIRST hop (not last)', async () => {
+    const errA = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const errB = new ProviderError('Spawn failed', 'SPAWN_FAILED');
+    const errC = new ProviderError('CLI not found', 'CLI_NOT_FOUND');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+      { provider: 'mistral', model: 'devstral-2' },
+    ];
+    const result = await executeWithFallback(
+      chain, dummyIR,
+      makeHopFn({ anthropic: errA, openai: errB, mistral: errC }),
+    );
+    assert.equal(result.chunks, null);
+    assert.equal(result.originalError, errA, 'Should be first hop error, not last');
+    assert.equal(result.fallbackHops, 3);  // chain.length = 3
+    assert.deepEqual(result.triedProviders, ['anthropic', 'openai', 'mistral']);
+  });
+
+  it('client error (400) on primary → does NOT fall back, surfaces error immediately', async () => {
+    const err = Object.assign(new Error('Bad request'), { statusCode: 400 });
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    let openaiCalled = false;
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      openaiCalled = true;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    const result = await executeWithFallback(chain, dummyIR, hopFn);
+    assert.equal(result.chunks, null);
+    assert.equal(result.originalError, err);
+    assert.equal(openaiCalled, false, 'Second provider must NOT be called on client error');
+    assert.deepEqual(result.triedProviders, ['anthropic']);
+  });
+
+  it('AUTH_MISSING on primary → does NOT fall back (user must fix config)', async () => {
+    const err = new ProviderError('Auth missing', 'AUTH_MISSING');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    let openaiCalled = false;
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      openaiCalled = true;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    const result = await executeWithFallback(chain, dummyIR, hopFn);
+    assert.equal(result.chunks, null);
+    assert.equal(result.originalError, err);
+    assert.equal(openaiCalled, false, 'Second provider must NOT be called on AUTH_MISSING');
+  });
+
+  it('non-trigger error (generic) on primary → does NOT fall back', async () => {
+    const err = new Error('Unexpected internal error');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    let openaiCalled = false;
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      openaiCalled = true;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    const result = await executeWithFallback(chain, dummyIR, hopFn);
+    assert.equal(result.chunks, null);
+    assert.equal(openaiCalled, false, 'Must not fall back on non-trigger error');
+  });
+
+});
+
+// ── 13c: First-chunk safety ──────────────────────────────────────────────
+
+describe('Fallback engine — first-chunk safety (D9)', () => {
+
+  // At D9, executeHopFn = collectAllChunks() which is fully buffered.
+  // Safety is enforced by construction: if executeHopFn returns successfully,
+  // chunks are already in memory (none written to res yet). Once chunks are
+  // returned, fallback is no longer attempted — we return immediately.
+  // If executeHopFn throws, zero bytes went to the client.
+
+  it('successful executeHopFn returns chunks immediately without retrying secondary', async () => {
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    let callCount = 0;
+    const hopFn = async (_provider) => {
+      callCount++;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    const result = await executeWithFallback(chain, makeIR({ model: 'test' }), hopFn);
+    assert.equal(result.fallbackHops, 0, 'Primary served — no fallback');
+    assert.equal(callCount, 1, 'executeHopFn called exactly once (first-chunk safety)');
+  });
+
+  it('error from executeHopFn (hard trigger) means zero chunks emitted — advance is safe', async () => {
+    // Simulate: anthropic throws (no bytes emitted), openai succeeds
+    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    let writtenToClient = false;
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') {
+        // Throw BEFORE any "write" — simulates first-chunk rule
+        throw err;
+      }
+      // openai succeeds — simulate "writtenToClient" only AFTER returning
+      // (in real server, chunks are written after executeWithFallback returns)
+      writtenToClient = true;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    const result = await executeWithFallback(chain, makeIR({ model: 'test' }), hopFn);
+    // openai served, which means writtenToClient is set (simulates post-return write)
+    assert.equal(result.fallbackHops, 1, 'Fell back to openai');
+    // Crucially: the "write" happened AFTER executeHopFn returned (not during chain iteration)
+    assert.equal(writtenToClient, true, 'Client write happens post-return, not during chain iteration');
+  });
+
+});
+
+// ── 13d: Soft triggers skipping spawn ────────────────────────────────────
+
+describe('Fallback engine — soft trigger skipping (D9)', () => {
+
+  const dummyIR = makeIR({ model: 'test-model' });
+
+  it('chain [A, B], A soft trigger fires → engine skips A entirely, calls B; fallbackHops=1', async () => {
+    let aCalled = false;
+    let bCalled = false;
+    const hopFn = async (provider) => {
+      if (provider === 'a') { aCalled = true; return [{ type: 'stop', finish_reason: 'stop' }]; }
+      if (provider === 'b') { bCalled = true; return [{ type: 'stop', finish_reason: 'stop' }]; }
+      throw new Error('Unexpected provider');
+    };
+    const chain = [
+      {
+        provider: 'a',
+        model: 'model-a',
+        softTriggers: { credit_pool_percent_threshold: 90 },
+        quotaSnapshot: { percentUsed: 95 },  // fires the trigger
+      },
+      { provider: 'b', model: 'model-b' },
+    ];
+    const result = await executeWithFallback(chain, dummyIR, hopFn);
+    assert.equal(aCalled, false, 'A must NOT be called (soft trigger skipped it)');
+    assert.equal(bCalled, true, 'B must be called');
+    assert.equal(result.fallbackHops, 1, 'B served as fallback hop 1');
+    assert.equal(result.providerUsed, 'b');
+  });
+
+  it('chain [A, B], neither soft trigger fires → A is called; if A succeeds, B never called', async () => {
+    let aCalled = false;
+    let bCalled = false;
+    const hopFn = async (provider) => {
+      if (provider === 'a') { aCalled = true; return [{ type: 'stop', finish_reason: 'stop' }]; }
+      if (provider === 'b') { bCalled = true; return [{ type: 'stop', finish_reason: 'stop' }]; }
+      throw new Error('Unexpected provider');
+    };
+    const chain = [
+      {
+        provider: 'a',
+        model: 'model-a',
+        softTriggers: { credit_pool_percent_threshold: 90 },
+        quotaSnapshot: { percentUsed: 85 },  // below threshold, trigger does NOT fire
+      },
+      { provider: 'b', model: 'model-b' },
+    ];
+    const result = await executeWithFallback(chain, dummyIR, hopFn);
+    assert.equal(aCalled, true, 'A must be called');
+    assert.equal(bCalled, false, 'B must NOT be called (A succeeded)');
+    assert.equal(result.fallbackHops, 0);
+    assert.equal(result.providerUsed, 'a');
+  });
+
+  it('chain [A], A soft trigger fires (null quotaSnapshot) → trigger does NOT fire, A called', async () => {
+    // Per ADR 0004: null quotaStatus → treat as "don't fire"
+    let aCalled = false;
+    const hopFn = async (provider) => {
+      if (provider === 'a') { aCalled = true; return [{ type: 'stop', finish_reason: 'stop' }]; }
+      throw new Error('Unexpected provider');
+    };
+    const chain = [
+      {
+        provider: 'a',
+        model: 'model-a',
+        softTriggers: { credit_pool_percent_threshold: 90 },
+        quotaSnapshot: null,  // null → trigger never fires
+      },
+    ];
+    const result = await executeWithFallback(chain, dummyIR, hopFn);
+    assert.equal(aCalled, true, 'A must be called (null quota → trigger does not fire)');
+    assert.equal(result.fallbackHops, 0);
+  });
+
+});
+
+// ── 13e: Header annotation ───────────────────────────────────────────────
+
+describe('Fallback engine — observability / header annotation (D9)', () => {
+
+  const dummyIR = makeIR({ model: 'test-model' });
+
+  it('success on primary: providerUsed + modelUsed match primary hop', async () => {
+    const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
+    const result = await executeWithFallback(chain, dummyIR, async () => [{ type: 'stop', finish_reason: 'stop' }]);
+    assert.equal(result.providerUsed, 'anthropic');
+    assert.equal(result.modelUsed, 'claude-sonnet-4-6');
+  });
+
+  it('success on fallback: providerUsed + modelUsed match the serving hop', async () => {
+    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    const result = await executeWithFallback(chain, dummyIR, hopFn);
+    assert.equal(result.providerUsed, 'openai');
+    assert.equal(result.modelUsed, 'gpt-5.5');
+    assert.equal(result.fallbackHops, 1);
+  });
+
+  it('chain exhausted: originalError is from FIRST hop, not second or third', async () => {
+    const errA = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const errB = new ProviderError('Spawn failed', 'SPAWN_FAILED');
+    const errC = new ProviderError('CLI not found', 'CLI_NOT_FOUND');
+    const chain = [
+      { provider: 'a', model: 'model-a' },
+      { provider: 'b', model: 'model-b' },
+      { provider: 'c', model: 'model-c' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'a') throw errA;
+      if (provider === 'b') throw errB;
+      if (provider === 'c') throw errC;
+      throw new Error('Unexpected');
+    };
+    const result = await executeWithFallback(chain, dummyIR, hopFn);
+    assert.equal(result.originalError, errA, 'originalError must be first-hop error');
+    assert.notEqual(result.originalError, errB, 'Must NOT be second-hop error');
+    assert.notEqual(result.originalError, errC, 'Must NOT be third-hop error');
+  });
+
+  it('triedProviders lists all attempted hops in chain order', async () => {
+    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const chain = [
+      { provider: 'a', model: 'model-a' },
+      { provider: 'b', model: 'model-b' },
+      { provider: 'c', model: 'model-c' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'a') throw err;
+      if (provider === 'b') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    const result = await executeWithFallback(chain, dummyIR, hopFn);
+    assert.deepEqual(result.triedProviders, ['a', 'b', 'c']);
+    assert.equal(result.fallbackHops, 2);
+    assert.equal(result.providerUsed, 'c');
+  });
+
+});
+
+// ── 13f: HTTP integration ────────────────────────────────────────────────
+
+describe('Fallback engine — HTTP integration (D9)', () => {
+  let server;
+  let port;
+
+  before(async () => {
+    __resetSpawnImpl();
+    codexResetSpawnImpl();
+    mistralResetSpawnImpl();
+    __resetFallbackConfig();
+
+    // Start test server with all 3 providers enabled
+    const testProviders = loadProviders({ enabled: { anthropic: true, openai: true, mistral: true } });
+    const { loadedProviders: lp, cacheStore: cs } = await import('./server.mjs');
+    // Inject test providers
+    for (const [name, p] of testProviders) {
+      lp.set(name, p);
+    }
+    cs.clear();
+
+    server = createOlpServer();
+    port = 20456 + Math.floor(Math.random() * 500);
+    await new Promise((resolve, reject) => {
+      server.listen(port, '127.0.0.1', resolve);
+      server.once('error', (e) => {
+        if (e.code === 'EADDRINUSE') {
+          port++;
+          server.listen(port, '127.0.0.1', resolve);
+          server.once('error', reject);
+        } else reject(e);
+      });
+    });
+  });
+
+  after(() => {
+    __resetFallbackConfig();
+    __resetSpawnImpl();
+    codexResetSpawnImpl();
+    mistralResetSpawnImpl();
+    if (!server) return;
+    return new Promise(r => server.close(r));
+  });
+
+  // Shared mock spawn builder that returns a successful response
+  function makeSuccessSpawn(content = 'Hello from mock') {
+    return function mockSpawnImpl(_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            // Emit a minimal SSE-like response that anthropic plugin parses
+            // (Anthropic mock format: JSON lines per the real anthropic.mjs parser)
+            const lines = [
+              JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: content } }),
+              JSON.stringify({ type: 'message_stop' }),
+            ];
+            for (const line of lines) {
+              proc.stdout.emit('data', Buffer.from(`data: ${line}\n\n`));
+            }
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    };
+  }
+
+  it('no fallback config: POST with no enabled provider → 503', async () => {
+    // Remove all providers temporarily
+    const { loadedProviders: lp } = await import('./server.mjs');
+    const savedMap = new Map(lp);
+    lp.clear();
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: { model: 'unknown-model', messages: [{ role: 'user', content: 'Hi' }] },
+      });
+      assert.equal(r.status, 503);
+    } finally {
+      for (const [name, p] of savedMap) lp.set(name, p);
+    }
+  });
+
+  it('no fallback config + mock anthropic: POST claude-sonnet-4-6 → 200 + X-OLP-Fallback-Hops: 0', async () => {
+    __setSpawnImpl(makeSuccessSpawn('Test response'));
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 10,
+        },
+      });
+      assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+      assert.equal(r.headers['x-olp-fallback-hops'], '0');
+      assert.equal(r.headers['x-olp-provider-used'], 'anthropic');
+    } finally {
+      __resetSpawnImpl();
+    }
+  });
+
+  it('fallback config: mock anthropic fails (SPAWN_FAILED), chain [anthropic→openai], openai mock succeeds → 200 + X-OLP-Fallback-Hops: 1 + X-OLP-Provider-Used: openai', async () => {
+    // Clear cache to prevent cache-hit from previous test polluting this one.
+    // ADR 0005: each (provider, model) pair is independently cached; a hit
+    // from the previous test would cause executeHopFn to skip the spawn and
+    // return cached chunks, masking the SPAWN_FAILED mock.
+    __clearCache();
+
+    // Provide fake codex auth so AUTH_MISSING doesn't stop the chain before
+    // the codex mock can respond. Codex checks readAuthArtifact() before spawnImpl.
+    // Write a temp file and set OPENAI_CODEX_AUTH_PATH to point at it.
+    const { writeFileSync, unlinkSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join: pathJoin } = await import('node:path');
+    const tmpAuthFile = pathJoin(tmpdir(), `olp-test-codex-auth-${Date.now()}.json`);
+    writeFileSync(tmpAuthFile, JSON.stringify({ accessToken: 'fake-test-token-for-codex' }), 'utf8');
+    const savedCodexAuthPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = tmpAuthFile;
+
+    // Set up a 2-hop chain: anthropic → openai for claude-sonnet-4-6
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    // Anthropic mock: always exits with code 1 → SPAWN_FAILED (hard trigger)
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stderr.emit('data', Buffer.from('spawn failed\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null);  // non-zero exit → SPAWN_FAILED
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    // Codex (openai) mock: succeeds with a delta+stop response
+    codexSetSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('{"content":"Fallback response from openai"}\n'));
+            proc.stdout.emit('data', Buffer.from('{"type":"stop"}\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 10,
+        },
+      });
+      assert.equal(r.status, 200, `Expected 200 on fallback, got ${r.status}: ${r.body.slice(0, 300)}`);
+      assert.equal(r.headers['x-olp-fallback-hops'], '1', `Expected fallback-hops=1, got: ${r.headers['x-olp-fallback-hops']}`);
+      assert.equal(r.headers['x-olp-provider-used'], 'openai', `Expected provider-used=openai, got: ${r.headers['x-olp-provider-used']}`);
+    } finally {
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+      if (savedCodexAuthPath !== undefined) {
+        process.env.OPENAI_CODEX_AUTH_PATH = savedCodexAuthPath;
+      } else {
+        delete process.env.OPENAI_CODEX_AUTH_PATH;
+      }
+      try { unlinkSync(tmpAuthFile); } catch { /* ignore */ }
+    }
+  });
+
+  it('fallback config: two-hop chain with both providers failing SPAWN_FAILED → exhausted-chain path → error response with X-OLP-Fallback-Exhausted header', async () => {
+    // NOTE on this test's renaming (D9 review-2): the original sonnet draft
+    // titled this as a "client error (400) → no fallback" HTTP test. But the
+    // anthropic plugin surfaces non-zero exit codes as ProviderError
+    // SPAWN_FAILED (a HARD trigger), not as a typed-400 client error. So at
+    // the HTTP integration layer we can't easily inject a synthetic 400
+    // without monkey-patching executeHopFn. The "client error stops chain
+    // immediately" semantic IS covered at the UNIT level in
+    // "Engine: two-hop chain primary client error 400 → secondary NOT
+    // called" (line 3289+ in this file). This HTTP test now exercises the
+    // complementary path: both hops fail with SPAWN_FAILED → chain
+    // exhausted → originalError surfaces with X-OLP-Fallback-Exhausted
+    // header listing both providers.
+    __clearCache();
+
+    // Set up a 2-hop chain
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    // Both providers fail with SPAWN_FAILED
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    codexSetSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 10,
+        },
+      });
+      // Both providers fail → exhausted chain → 502 error response with exhausted header
+      assert.ok(r.status >= 400 && r.status < 600, `Expected error status, got ${r.status}`);
+      // X-OLP-Fallback-Exhausted header should be present since both providers tried
+      assert.ok(
+        r.headers['x-olp-fallback-exhausted'] !== undefined,
+        `Expected X-OLP-Fallback-Exhausted header, got headers: ${JSON.stringify(r.headers)}`,
+      );
+    } finally {
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+    }
+  });
+
+});

@@ -49,16 +49,27 @@ const VERSION = pkg.version;
 const PORT = parseInt(process.env.OLP_PORT ?? '3456', 10);
 const BODY_LIMIT = 5 * 1024 * 1024; // 5 MB
 
+// ── Startup config ────────────────────────────────────────────────────────
+// Read ~/.olp/config.json once at startup. Provides:
+//   - providers.enabled   → which providers are loaded (ADR 0002 § Disable model)
+//   - routing.chains      → fallback chain config (ADR 0004 § D9)
+//   - routing.soft_triggers → soft trigger thresholds (ADR 0004)
+// If the file is absent or malformed, defaults are safe:
+//   empty providersEnabled → all 503 (ALIGNMENT.md § v0.1 zero-Enabled-Providers posture)
+//   empty chains/soft_triggers → single-hop mode
+const _startupConfig = loadFallbackConfigSync();
+
 // ── Provider registry ─────────────────────────────────────────────────────
-// ALIGNMENT.md § Provider Inventory: 0 Enabled Providers at v0.1.
-// Empty config → empty loaded map → all POST /v1/chat/completions → 503.
-const loadedProviders = loadProviders({ enabled: {} });
+// ALIGNMENT.md § Provider Inventory: 0 Enabled Providers at v0.1 unless
+// ~/.olp/config.json has providers.enabled.X = true.
+// ADR 0002 § Disable model: enabled toggle in config.json transitions Candidate → Enabled.
+const loadedProviders = loadProviders({ enabled: _startupConfig.providersEnabled ?? {} });
 
 // ── Fallback config ───────────────────────────────────────────────────────
 // Read ~/.olp/config.json routing.chains at startup. Empty at v0.1.
 // Per ADR 0004 § D9: fallback engine is wired; activates when user populates chains.
 // Tests may inject a synthetic fallbackConfig via __setFallbackConfig().
-let _fallbackConfig = loadFallbackConfigSync();
+let _fallbackConfig = _startupConfig;
 
 /** @internal — test seam: inject a synthetic fallback config (no file I/O) */
 export function __setFallbackConfig(config) {
@@ -68,6 +79,35 @@ export function __setFallbackConfig(config) {
 /** @internal — reset to file-based config */
 export function __resetFallbackConfig() {
   _fallbackConfig = loadFallbackConfigSync();
+}
+
+/**
+ * @internal — test seam: reload loadedProviders to match a given enabledMap.
+ * Mirrors __setFallbackConfig. Allows tests to exercise the production
+ * loadProviders() code path without touching the config file.
+ *
+ * Usage: __setProvidersEnabled({ anthropic: true }) before creating a server.
+ * Reset: __resetProvidersEnabled() or __setProvidersEnabled({}) to clear all.
+ *
+ * @param {Record<string, boolean>} enabledMap
+ */
+export function __setProvidersEnabled(enabledMap) {
+  const next = loadProviders({ enabled: enabledMap ?? {} });
+  // Mutate the shared map in-place so existing references see the update.
+  loadedProviders.clear();
+  for (const [name, p] of next) {
+    loadedProviders.set(name, p);
+  }
+}
+
+/** @internal — reset loadedProviders to the startup-config state */
+export function __resetProvidersEnabled() {
+  const startup = loadFallbackConfigSync();
+  const next = loadProviders({ enabled: startup.providersEnabled ?? {} });
+  loadedProviders.clear();
+  for (const [name, p] of next) {
+    loadedProviders.set(name, p);
+  }
 }
 
 /** @internal — clear the cache store (for tests that need a fresh cache state) */
@@ -344,6 +384,117 @@ async function handleChatCompletions(req, res) {
   const firstHopCacheKey = computeCacheKey(chain[0].provider, chain[0].model, ir);
   const preCheckHit = bypassCache ? false : await cacheStore.peek(keyId, firstHopCacheKey);
 
+  // ── P1.2: Real SSE streaming path (single-hop cache-miss) ──────────────
+  // ADR 0003 entry adapter pattern: for await irChunk → res.write(irChunkToOpenAISSE).
+  // Condition: streaming + single-hop + no bypass + no pre-check cache hit.
+  //   - stream===true  → caller wants SSE
+  //   - chain.length===1  → no fallback needed; first-chunk rule allows streaming
+  //   - !bypassCache + !preCheckHit → genuine cache miss (not hit/bypass)
+  //
+  // If any chunk has been written (firstChunkEmitted), fallback is impossible
+  // per ADR 0004 § Fallback safety first-chunk rule. On error after first chunk:
+  // truncate the response (end with no [DONE]). On error before any chunk:
+  // throw so the outer handler can surface a clean error (no bytes written).
+  //
+  // On success: write chunks to res AND cache so subsequent identical requests
+  // hit the burst-replay path.
+  if (ir.stream && chain.length === 1 && !bypassCache && !preCheckHit) {
+    const streamProvider = chain[0].provider;
+    const streamModel = chain[0].model;
+    const streamCacheKey = computeCacheKey(streamProvider, streamModel, ir);
+    const streamPlugin = loadedProviders.get(streamProvider);
+
+    if (!streamPlugin) {
+      // Provider disappeared between chain build and here (edge case).
+      return sendError(res, 503, `Provider ${streamProvider} is not enabled`, 'no_enabled_provider');
+    }
+
+    const streamHeaders = olpHeaders({
+      providerUsed: streamProvider,
+      modelUsed: streamModel,
+      startMs,
+      cacheStatus: 'miss',
+      fallbackHops: 0,
+    });
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+      ...streamHeaders,
+    });
+
+    const streamedChunks = [];
+    let firstChunkEmitted = false;
+    try {
+      for await (const irChunk of streamPlugin.spawn(ir, authContext)) {
+        if (irChunk.type === 'error') {
+          // Error chunk from provider
+          if (firstChunkEmitted) {
+            // Past first-chunk boundary — can't fallback; truncate stream.
+            logEvent('warn', 'streaming_error_after_first_chunk', {
+              provider: streamProvider,
+              model: streamModel,
+              error: irChunk.error,
+            });
+            res.end();
+            return;
+          }
+          // No bytes written yet — throw to surface a clean error.
+          throw new ProviderError(irChunk.error ?? 'Provider emitted error chunk', 'SPAWN_FAILED');
+        }
+
+        streamedChunks.push(irChunk);
+        res.write(irChunkToOpenAISSE(irChunk, requestId, ir.model));
+        firstChunkEmitted = true;
+
+        if (irChunk.type === 'stop') {
+          res.write(SSE_DONE);
+          res.end();
+          // Cache the buffered chunks for burst-replay on subsequent identical requests.
+          await cacheStore.set(keyId, streamCacheKey, streamedChunks);
+          logEvent('info', 'streaming_response_cached', {
+            provider: streamProvider,
+            model: streamModel,
+            chunks: streamedChunks.length,
+          });
+          return;
+        }
+      }
+
+      // Generator exhausted without a stop chunk — emit [DONE] and cache.
+      res.write(SSE_DONE);
+      res.end();
+      if (streamedChunks.length > 0) {
+        await cacheStore.set(keyId, streamCacheKey, streamedChunks);
+      }
+    } catch (e) {
+      if (firstChunkEmitted) {
+        // Past first-chunk boundary — truncate silently.
+        logEvent('warn', 'streaming_error_after_first_chunk', {
+          provider: streamProvider,
+          model: streamModel,
+          error: e.message,
+        });
+        res.end();
+      } else {
+        // No bytes written — surface a clean JSON error.
+        logEvent('error', 'streaming_error_before_first_chunk', {
+          provider: streamProvider,
+          model: streamModel,
+          error: e.message,
+        });
+        if (!res.headersSent) {
+          sendError(res, 502, e.message ?? 'Provider error', 'provider_error');
+        } else {
+          res.end();
+        }
+      }
+    }
+    return;
+  }
+
   let fallbackResult;
   try {
     fallbackResult = await executeWithFallback(chain, ir, executeHopFn, {
@@ -414,7 +565,9 @@ async function handleChatCompletions(req, res) {
   const headers = olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus, fallbackHops });
 
   if (ir.stream) {
-    // Streaming response path (D3 simplified: burst replay, no timing fidelity)
+    // Streaming response path: burst replay from buffered chunks.
+    // Reaches here only when: bypassCache=true OR preCheckHit=true OR chain.length>1.
+    // (Single-hop cache-miss streaming is handled by the real-streaming path above.)
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',

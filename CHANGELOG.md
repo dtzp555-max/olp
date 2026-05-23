@@ -2,6 +2,16 @@
 
 All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this file is the source of truth for GitHub release notes.
 
+## Unreleased
+
+### Phase 1 — Provider plugins + cache + fallback engine + P1 hardening
+
+- **D10 (P1 round-3 hardening from external Codex review).** Three production-blocking defects from the Phase 1 round-3 review folded in:
+  - **`providers.enabled` config wired through `loadProviders()`** (ADR 0002 § Disable model). `loadFallbackConfigSync()` now returns a tri-field shape `{ chains, soft_triggers, providersEnabled }`; `server.mjs` reads `_startupConfig.providersEnabled` at startup and passes it to `loadProviders()`. Empty / missing config → 0 enabled providers → `503 no_enabled_provider`, matching the v0.1 0-Enabled posture. `__setProvidersEnabled` / `__resetProvidersEnabled` test seams added.
+  - **Real SSE streaming on single-hop cache-miss** (ADR 0003 entry adapter pattern). New `handleChatCompletions` branch when `ir.stream === true && chain.length === 1 && !bypassCache && !preCheckHit`: `for await (const irChunk of provider.spawn(...))` writes SSE per chunk via `res.write(irChunkToOpenAISSE(...))`, accumulates chunks for `cacheStore.set` on completion. First-chunk rule preserved (error-before-first-chunk → `sendError(502)`; error-after-first-chunk → truncated `res.end()`). Multi-hop chains still buffer (`executeWithFallback` path) to maintain fallback safety.
+  - **Spawn timeout hard trigger** (ADR 0004 § Trigger taxonomy bullet 4). `SPAWN_TIMEOUT` added to `PROVIDER_ERROR_CODES` and `HARD_TRIGGER_CODES`. All three provider plugins (`anthropic.mjs` / `codex.mjs` / `mistral.mjs`) wrap their spawn drain loop with `setTimeout` (default 600_000ms, configurable via `hints.maxSpawnTimeMs`); on fire, `proc.kill('SIGTERM')` + reject pending drain promise with `ProviderError(..., 'SPAWN_TIMEOUT')`. Timer cleared in `finally` block; `resolveNext` / `rejectNext` atomically nulled to prevent late-fire double-settle.
+- **Test suite: 277 → 288 (+11).** New Suite 14 (providers.enabled wiring, 4 tests), Suite 15 (streaming cache-miss real-time, 3 tests including arrival-count assertion proving real streaming architecturally), Suite 16 (spawn timeout, 4 tests including full 2-hop chain advancement from timed-out primary).
+
 ## v0.1.0-bootstrap — 2026-05-23
 
 ### Phase 0 — Repo bootstrap (founding + post-codex-review hardening)

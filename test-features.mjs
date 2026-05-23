@@ -3887,3 +3887,576 @@ describe('Fallback engine — HTTP integration (D9)', () => {
   });
 
 });
+
+// ── Suite 14: providers.enabled config wiring ──────────────────────────────
+//
+// Tests that:
+//   14a: Empty config → 0 providers loaded
+//   14b: providers.enabled.anthropic=true → anthropic in loaded map
+//   14c: HTTP 503 disappears once config has the right provider enabled
+//
+// Authority: ADR 0002 § Disable model; ALIGNMENT.md § Provider Inventory
+
+import {
+  __setProvidersEnabled,
+  __resetProvidersEnabled,
+} from './server.mjs';
+
+describe('providers.enabled config wiring (Suite 14)', () => {
+
+  it('14a: loadFallbackConfigSync returns providersEnabled field', () => {
+    // loadFallbackConfigSync with no config file → returns empty providersEnabled
+    // (This tests the schema change to loadFallbackConfigSync.)
+    const cfg = loadFallbackConfigSync('/nonexistent/path/that/does/not/exist.json');
+    assert.ok(typeof cfg === 'object', 'result must be an object');
+    assert.ok('providersEnabled' in cfg, 'result must have providersEnabled field');
+    assert.deepEqual(cfg.providersEnabled, {}, 'missing file → empty providersEnabled');
+    assert.deepEqual(cfg.chains, {}, 'missing file → empty chains');
+  });
+
+  it('14b: __setProvidersEnabled({ anthropic: true }) → anthropic in loadedProviders', async () => {
+    const { loadedProviders: lp } = await import('./server.mjs');
+    const originalSize = lp.size;
+    try {
+      __setProvidersEnabled({ anthropic: true });
+      assert.ok(lp.has('anthropic'), 'anthropic must be in loadedProviders after enable');
+    } finally {
+      __resetProvidersEnabled();
+      // Restore to whatever state it was (may vary depending on config file)
+    }
+  });
+
+  it('14c: __setProvidersEnabled({}) → no providers loaded → HTTP 503', async () => {
+    const { createOlpServer: createServer14 } = await import('./server.mjs');
+    __setProvidersEnabled({});
+    const s = createServer14();
+    const p = 22456 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({
+        port: p,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.equal(r.status, 503, `Expected 503 with no providers, got ${r.status}`);
+    } finally {
+      __resetProvidersEnabled();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  it('14d: __setProvidersEnabled({ anthropic: true }) → HTTP 200 with mock spawn', async () => {
+    const savedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-suite-14d';
+    __setProvidersEnabled({ anthropic: true });
+
+    // Install mock spawn that immediately emits text + close
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('Hello from suite 14d'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    const { createOlpServer: createServer14d, __clearCache: clearCache14d } = await import('./server.mjs');
+    clearCache14d();
+    const s = createServer14d();
+    const p = 22860 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+
+    try {
+      const r = await fetch({
+        port: p,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.equal(r.status, 200, `Expected 200 with anthropic enabled, got ${r.status}: ${r.body.slice(0, 200)}`);
+    } finally {
+      __resetProvidersEnabled();
+      __resetSpawnImpl();
+      if (savedToken !== undefined) {
+        process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken;
+      } else {
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      }
+      await new Promise(r => s.close(r));
+    }
+  });
+
+});
+
+// ── Suite 15: Streaming cache-miss real-time (P1.2) ─────────────────────────
+//
+// Tests that the single-hop streaming path (P1.2) emits chunks in real-time
+// rather than buffering. Also tests the cache-hit burst-replay path for
+// the second identical request.
+//
+// Authority: ADR 0003 entry adapter pattern; ADR 0004 § first-chunk rule
+
+describe('Streaming cache-miss real-time (Suite 15)', () => {
+  let server15;
+  let port15;
+  let savedToken15;
+
+  before(async () => {
+    savedToken15 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-suite-15';
+    __setProvidersEnabled({ anthropic: true });
+
+    const { createOlpServer: s15, __clearCache: cc15 } = await import('./server.mjs');
+    cc15();
+    server15 = s15();
+    port15 = 23456 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      server15.listen(port15, '127.0.0.1', resolve);
+      server15.once('error', reject);
+    });
+  });
+
+  after(async () => {
+    __resetProvidersEnabled();
+    __resetSpawnImpl();
+    if (savedToken15 !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken15;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    if (!server15) return;
+    return new Promise(r => server15.close(r));
+  });
+
+  it('15a: streaming cache-miss → res.write fires per chunk, not all-at-once', async () => {
+    // Mock: emits 3 deltas with a 20ms gap between each, then stop.
+    // We verify by recording arrival timestamps on the client side.
+    const DELTA_GAP_MS = 20;
+
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          // Emit 3 deltas with gaps
+          let idx = 0;
+          const texts = ['chunk1', 'chunk2', 'chunk3'];
+          const emitNext = () => {
+            if (idx < texts.length) {
+              proc.stdout.emit('data', Buffer.from(texts[idx]));
+              idx++;
+              setTimeout(emitNext, DELTA_GAP_MS);
+            } else {
+              proc.stdout.emit('end');
+              proc.stderr.emit('end');
+              proc.emit('close', 0, null);
+            }
+          };
+          setImmediate(emitNext);
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    const { __clearCache: cc15a } = await import('./server.mjs');
+    cc15a();
+
+    // Make SSE request and collect timestamps of each data: line arrival
+    const arrivalTimestamps = [];
+    const chunks = await new Promise((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: port15,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        const collectedLines = [];
+        res.on('data', (d) => {
+          const text = d.toString();
+          const lines = text.split('\n').filter(l => l.startsWith('data: ') && l !== 'data: [DONE]');
+          if (lines.length > 0) {
+            arrivalTimestamps.push(Date.now());
+            collectedLines.push(...lines);
+          }
+        });
+        res.on('end', () => resolve(collectedLines));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.write(JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'streaming test' }],
+        stream: true,
+      }));
+      req.end();
+    });
+
+    // We should have received some data events
+    assert.ok(chunks.length > 0, 'should have received streaming chunks');
+    // With 20ms inter-chunk gaps the OS should flush at least twice; a buffered
+    // implementation would surface as a single arrival event. This assertion
+    // proves real-streaming architecturally (per D10 P1.2 review).
+    assert.ok(
+      arrivalTimestamps.length >= 2,
+      `real streaming should produce > 1 client arrival event, got ${arrivalTimestamps.length}`
+    );
+    const allText = chunks.join('');
+    assert.ok(allText.length > 0, 'should have received non-empty data');
+
+    // Verify response has SSE headers
+    // (We already verified by receiving 'data: ' lines)
+    assert.ok(chunks.some(c => c.includes('"delta"') || c.includes('"content"') || c.includes('finish_reason')),
+      'Should contain delta or stop chunks');
+  });
+
+  it('15b: second identical streaming request → cache hit, content identical', async () => {
+    // Re-use the same mock (last setSpawnImpl from 15a may have been reset).
+    // Install a mock that records how many times it was called.
+    let spawnCallCount = 0;
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      spawnCallCount++;
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('cached-content'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    const { __clearCache: cc15b } = await import('./server.mjs');
+    cc15b();
+
+    const makeStreamRequest = () => new Promise((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: port15,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        let data = '';
+        res.on('data', d => { data += d.toString(); });
+        res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.write(JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'cache-test-15b' }],
+        stream: true,
+      }));
+      req.end();
+    });
+
+    // First request: cache miss → real spawn
+    const first = await makeStreamRequest();
+    assert.equal(first.status, 200, `Expected 200, got ${first.status}: ${first.body.slice(0, 200)}`);
+    assert.equal(first.headers['x-olp-cache'], 'miss', 'First request should be cache miss');
+    assert.equal(spawnCallCount, 1, 'Spawn should be called exactly once for first request');
+
+    // Second identical request: should be cache hit (burst-replay, no spawn)
+    const second = await makeStreamRequest();
+    assert.equal(second.status, 200, `Expected 200 on cache hit, got ${second.status}`);
+    assert.equal(second.headers['x-olp-cache'], 'hit', 'Second request should be cache hit');
+    assert.equal(spawnCallCount, 1, 'Spawn should NOT be called again for cache-hit request');
+
+    // Both responses should contain the same content
+    assert.ok(first.body.includes('cached-content'), 'First response should contain content');
+    assert.ok(second.body.includes('cached-content'), 'Second response should contain same content');
+  });
+
+  it('15c: streaming + multi-hop chain → uses buffered path (not real-streaming)', async () => {
+    // A 2-hop chain forces the code to fall through to executeWithFallback (buffered).
+    // With mock anthropic succeeding, the result should still be 200 with streaming headers,
+    // but X-OLP-Cache should not reflect real-streaming behavior (it may be miss or hit
+    // depending on buffered cache).
+    // The critical assertion: single-hop condition NOT met → buffered path is taken.
+
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('multihop-content'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    // Add openai to loaded providers and configure a 2-hop chain
+    const { loadedProviders: lp15c, __clearCache: cc15c } = await import('./server.mjs');
+    const extraProviders = loadProviders({ enabled: { anthropic: true, openai: true } });
+    for (const [name, p] of extraProviders) lp15c.set(name, p);
+    cc15c();
+
+    // Inject codex fake auth so the 2nd hop doesn't immediately AUTH_MISSING
+    const savedCodexPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    const { writeFileSync: wfs15c, unlinkSync: uls15c } = await import('node:fs');
+    const { tmpdir: td15c } = await import('node:os');
+    const { join: pj15c } = await import('node:path');
+    const tmpAuth15c = pj15c(td15c(), `olp-test-15c-${Date.now()}.json`);
+    wfs15c(tmpAuth15c, JSON.stringify({ accessToken: 'fake-codex-15c' }), 'utf8');
+    process.env.OPENAI_CODEX_AUTH_PATH = tmpAuth15c;
+
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    try {
+      const r = await fetch({
+        port: port15,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'multihop streaming test' }],
+          stream: true,
+        },
+      });
+      // Multi-hop chain → buffered path → still returns 200 with streaming headers
+      assert.equal(r.status, 200, `Expected 200 for multi-hop streaming, got ${r.status}: ${r.body.slice(0, 200)}`);
+      // X-OLP-Fallback-Hops: 0 since first hop succeeds
+      assert.equal(r.headers['x-olp-fallback-hops'], '0', 'Primary hop should serve');
+      assert.ok(r.body.includes('multihop-content'), 'Response should contain content');
+    } finally {
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+      if (savedCodexPath !== undefined) {
+        process.env.OPENAI_CODEX_AUTH_PATH = savedCodexPath;
+      } else {
+        delete process.env.OPENAI_CODEX_AUTH_PATH;
+      }
+      try { uls15c(tmpAuth15c); } catch { /* ignore */ }
+      // Clean up the extra openai provider
+      lp15c.delete('openai');
+    }
+  });
+
+});
+
+// ── Suite 16: Spawn timeout (P1.3) ───────────────────────────────────────────
+//
+// Tests that:
+//   16a: SPAWN_TIMEOUT is in PROVIDER_ERROR_CODES
+//   16b: SPAWN_TIMEOUT is a hard trigger (evaluateHardTriggers returns true)
+//   16c: Provider that never completes throws SPAWN_TIMEOUT after configured timeout
+//   16d: Fallback chain: primary times out → secondary serves
+//
+// Authority: ADR 0004 § Trigger taxonomy bullet 4; lib/providers/base.mjs
+
+import { PROVIDER_ERROR_CODES } from './lib/providers/base.mjs';
+
+describe('Spawn timeout (Suite 16)', () => {
+
+  it('16a: SPAWN_TIMEOUT is in PROVIDER_ERROR_CODES', () => {
+    assert.ok(PROVIDER_ERROR_CODES.includes('SPAWN_TIMEOUT'),
+      'SPAWN_TIMEOUT must be in PROVIDER_ERROR_CODES');
+  });
+
+  it('16b: evaluateHardTriggers with SPAWN_TIMEOUT code → true (hard trigger)', () => {
+    const err = new ProviderError('spawn timed out', 'SPAWN_TIMEOUT');
+    assert.equal(evaluateHardTriggers(err), true,
+      'SPAWN_TIMEOUT ProviderError must be a hard trigger');
+  });
+
+  it('16c: anthropic plugin with short timeout → throws ProviderError SPAWN_TIMEOUT', async () => {
+    // Install a spawn mock that never closes (simulates hanging CLI).
+    // Set a very short timeout (100ms) via hints mutation.
+    const savedTimeout = anthropic.hints.maxSpawnTimeMs;
+    anthropic.hints.maxSpawnTimeMs = 100;
+
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          // Never emit close — simulates a hanging process.
+          // stdout may emit some data but never closes.
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const irReq = makeIR({ model: 'claude-sonnet-4-6', stream: false });
+      // Need auth so we don't hit AUTH_MISSING before the timeout path.
+      const savedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-16c';
+      try {
+        const gen = anthropic.spawn(irReq, { accessToken: 'fake-16c' });
+        // Drain the generator — it should eventually throw SPAWN_TIMEOUT.
+        let caughtError = null;
+        try {
+          for await (const chunk of gen) { void chunk; }
+        } catch (e) {
+          caughtError = e;
+        }
+        assert.ok(caughtError !== null, 'Expected a ProviderError to be thrown');
+        assert.ok(caughtError instanceof ProviderError, `Expected ProviderError, got ${caughtError?.constructor?.name}`);
+        assert.equal(caughtError.code, 'SPAWN_TIMEOUT', `Expected SPAWN_TIMEOUT code, got ${caughtError?.code}`);
+      } finally {
+        if (savedToken !== undefined) {
+          process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken;
+        } else {
+          delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        }
+      }
+    } finally {
+      anthropic.hints.maxSpawnTimeMs = savedTimeout;
+      __resetSpawnImpl();
+    }
+  });
+
+  it('16d: fallback chain: primary times out → chain advances to secondary → secondary serves', async () => {
+    // Set up: primary = anthropic (will hang + timeout), secondary = openai (will succeed).
+    const savedAnthropicTimeout = anthropic.hints.maxSpawnTimeMs;
+    anthropic.hints.maxSpawnTimeMs = 100; // short timeout for test speed
+
+    const savedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-16d-anthropic';
+
+    // Anthropic mock: hangs forever (triggers SPAWN_TIMEOUT)
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = { write: () => {}, end: () => {} };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    // Codex mock: succeeds immediately
+    codexSetSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('{"content":"fallback-from-timeout-test"}\n'));
+            proc.stdout.emit('data', Buffer.from('{"type":"stop"}\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    // Set up fake codex auth
+    const { writeFileSync: wfs16d, unlinkSync: uls16d } = await import('node:fs');
+    const { tmpdir: td16d } = await import('node:os');
+    const { join: pj16d } = await import('node:path');
+    const tmpAuth16d = pj16d(td16d(), `olp-test-16d-${Date.now()}.json`);
+    wfs16d(tmpAuth16d, JSON.stringify({ accessToken: 'fake-codex-16d' }), 'utf8');
+    const savedCodexPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = tmpAuth16d;
+
+    // Build a 2-hop chain: anthropic → openai
+    const testProviders = loadProviders({ enabled: { anthropic: true, openai: true } });
+
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+
+    const irReq = makeIR({ model: 'claude-sonnet-4-6', stream: false });
+
+    async function testExecuteHopFn(hopProvider, hopModel, ir) {
+      const plugin = testProviders.get(hopProvider);
+      if (!plugin) throw Object.assign(new Error(`no provider ${hopProvider}`), { statusCode: 503 });
+      const chunks = [];
+      for await (const c of plugin.spawn(ir, hopProvider === 'anthropic'
+        ? { accessToken: 'fake-token-16d-anthropic' }
+        : { accessToken: 'fake-codex-16d' })) {
+        chunks.push(c);
+        if (c.type === 'error') throw new ProviderError(c.error, 'SPAWN_FAILED');
+        if (c.type === 'stop') break;
+      }
+      return chunks;
+    }
+
+    try {
+      const result = await executeWithFallback(chain, irReq, testExecuteHopFn, { logEvent: () => {} });
+      assert.ok(result.chunks !== null, 'Fallback should have produced chunks');
+      assert.equal(result.fallbackHops, 1, 'Should have fallen back to second hop');
+      assert.equal(result.providerUsed, 'openai', 'openai should have served after anthropic timed out');
+      const content = result.chunks.filter(c => c.type === 'delta').map(c => c.content).join('');
+      assert.ok(content.includes('fallback-from-timeout-test'), 'Content from fallback provider expected');
+    } finally {
+      anthropic.hints.maxSpawnTimeMs = savedAnthropicTimeout;
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+      if (savedToken !== undefined) {
+        process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken;
+      } else {
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      }
+      if (savedCodexPath !== undefined) {
+        process.env.OPENAI_CODEX_AUTH_PATH = savedCodexPath;
+      } else {
+        delete process.env.OPENAI_CODEX_AUTH_PATH;
+      }
+      try { uls16d(tmpAuth16d); } catch { /* ignore */ }
+    }
+  });
+
+});

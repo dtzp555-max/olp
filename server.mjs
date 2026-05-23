@@ -6,6 +6,7 @@
  *   https://platform.openai.com/docs/api-reference/chat/create
  * Authority (IR): ADR 0003
  * Authority (provider dispatch): ADR 0002
+ * Authority (cache layer): ADR 0005
  *
  * Design principles (OCP precedent, ESM/.mjs, http built-ins, no external deps):
  * - Node ESM, no build step, no bundler
@@ -30,6 +31,8 @@ import {
 } from './lib/ir/ir-to-openai.mjs';
 import { loadProviders, getProviderForModel, listAllProviderNames } from './lib/providers/index.mjs';
 import { ProviderError } from './lib/providers/base.mjs';
+import { computeCacheKey, hasCacheControl, extractCacheControlMarkers } from './lib/cache/keys.mjs';
+import { CacheStore } from './lib/cache/store.mjs';
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -44,6 +47,12 @@ const BODY_LIMIT = 5 * 1024 * 1024; // 5 MB
 // ALIGNMENT.md § Provider Inventory: 0 Enabled Providers at v0.1.
 // Empty config → empty loaded map → all POST /v1/chat/completions → 503.
 const loadedProviders = loadProviders({ enabled: {} });
+
+// ── Cache layer ───────────────────────────────────────────────────────────
+// D1 per-key isolation + D4 singleflight per ADR 0005.
+// keyId: '__anonymous__' at D5 — Phase 2 multi-key infrastructure wires in
+// the real OLP API key ID here.
+export const cacheStore = new CacheStore();
 
 // ── Logging ───────────────────────────────────────────────────────────────
 
@@ -125,21 +134,22 @@ function sendError(res, status, message, type) {
  * Returns the standard OLP diagnostic headers.
  * Per spec: X-OLP-Provider-Used, X-OLP-Model-Used, X-OLP-Fallback-Hops,
  * X-OLP-Cache, X-OLP-Latency-Ms.
- * Fallback-Hops is always 0 at D3 (no fallback engine yet — ADR 0004).
- * Cache is always 'miss' at D3 (no cache layer yet — ADR 0005).
+ * Fallback-Hops is always 0 at D5 (no fallback engine yet — ADR 0004).
+ * Cache reflects actual hit/miss/bypass status from the cache layer (ADR 0005).
  *
  * @param {object} opts
  * @param {string} opts.providerUsed
  * @param {string} opts.modelUsed
  * @param {number} opts.startMs
+ * @param {'hit'|'miss'|'bypass'} [opts.cacheStatus='miss']
  * @returns {Record<string,string>}
  */
-function olpHeaders({ providerUsed, modelUsed, startMs }) {
+function olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus = 'miss' }) {
   return {
     'X-OLP-Provider-Used': providerUsed,
     'X-OLP-Model-Used': modelUsed,
     'X-OLP-Fallback-Hops': '0',
-    'X-OLP-Cache': 'miss',
+    'X-OLP-Cache': cacheStatus,
     'X-OLP-Latency-Ms': String(Date.now() - startMs),
   };
 }
@@ -217,13 +227,88 @@ async function handleChatCompletions(req, res) {
   const { provider, name: providerName } = match;
   const requestId = generateRequestId();
 
-  // Auth context is a stub at D3 — providers will populate this in Phase 1 Day 2+
-  const authContext = {};
+  // Auth context is null at D5 — providers fall back to their own credential
+  // discovery (env var, keychain, credentials file). Phase 2 multi-key
+  // infrastructure will pass a real authContext carrying the per-key OLP token.
+  const authContext = null;
 
-  const headers = olpHeaders({ providerUsed: providerName, modelUsed: ir.model, startMs });
+  // ── Cache layer (ADR 0005) ──────────────────────────────────────────────
+  // keyId: '__anonymous__' at D5. Phase 2 multi-key infrastructure wires the
+  // real OLP API key ID here for D1 per-key isolation.
+  const keyId = '__anonymous__';
+  const cacheKey = computeCacheKey(providerName, ir.model, ir);
+
+  // D2 bypass: if the request contains Anthropic cache_control markers,
+  // skip OLP's response cache entirely (the prompt cache lives at Anthropic's
+  // side; double-caching would shadow Anthropic's TTLs per ADR 0005 § D2).
+  //
+  // Note: hasCacheControl() checks the IR (ADR 0003). Since openAIToIR() does not
+  // preserve cache_control fields from the raw OpenAI message shape (those fields
+  // are Anthropic-specific extensions, not part of the IR schema), we also check
+  // the raw body.messages directly via extractCacheControlMarkers. This ensures
+  // D2 bypass is triggered even though the IR translator strips the field.
+  const bypassCache = hasCacheControl(ir) || extractCacheControlMarkers(body?.messages ?? []).length > 0;
+
+  if (bypassCache) {
+    logEvent('debug', 'cache_bypass', { provider: providerName, model: ir.model, reason: 'cache_control_markers' });
+  }
+
+  // ── Collect chunks helper (used by both streaming and non-streaming paths) ──
+  // collectAllChunks wraps provider.spawn() to collect all IR chunks into an
+  // array. Used as the computeFn for getOrCompute (D4 singleflight).
+  //
+  // Error semantics: if the provider emits a `type: 'error'` chunk, we throw
+  // a ProviderError instead of returning the chunk array. This prevents
+  // cache_store.set() from being called on an error-terminated response, per
+  // ADR 0005 § "Cache write conditions" item 1 ("The response completed
+  // successfully (no truncation, no error mid-stream)"). The thrown error
+  // propagates to the catch block at the call site, which returns 502 to
+  // the client without writing to cache.
+  async function collectAllChunks() {
+    const chunks = [];
+    for await (const irChunk of provider.spawn(ir, authContext)) {
+      chunks.push(irChunk);
+      if (irChunk.type === 'error') {
+        throw new ProviderError(
+          irChunk.error ?? 'Provider emitted error chunk',
+          'SPAWN_FAILED',
+        );
+      }
+      if (irChunk.type === 'stop') break;
+    }
+    return chunks;
+  }
+
+  // Pre-check: stats-neutral peek before calling getOrCompute so we can
+  // reliably report hit/miss in the response header. peek() does NOT touch
+  // hit/miss counters (fix for codex-flagged double-count); getOrCompute()
+  // increments at the semantic boundary.
+  const preCheckHit = bypassCache ? false : await cacheStore.peek(keyId, cacheKey);
 
   if (ir.stream) {
     // Streaming response path
+    // D5 simplified D3: cache stores full collected chunks, replays them one
+    // at a time without timing fidelity. Full D3 (timing-accurate replay) lands
+    // in a later Phase per ADR 0005 § D3.
+    let chunks;
+    let cacheStatus;
+
+    try {
+      if (bypassCache) {
+        cacheStatus = 'bypass';
+        chunks = await collectAllChunks();
+      } else {
+        // D4 singleflight + D1 per-key isolation
+        chunks = await cacheStore.getOrCompute(keyId, cacheKey, collectAllChunks);
+        cacheStatus = preCheckHit ? 'hit' : 'miss';
+      }
+    } catch (e) {
+      logEvent('error', 'spawn_error', { provider: providerName, model: ir.model, error: e.message });
+      sendError(res, e instanceof ProviderError ? 502 : 500, e.message ?? 'Provider error', 'provider_error');
+      return;
+    }
+
+    const headers = olpHeaders({ providerUsed: providerName, modelUsed: ir.model, startMs, cacheStatus });
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -232,35 +317,41 @@ async function handleChatCompletions(req, res) {
       ...headers,
     });
 
-    try {
-      for await (const irChunk of provider.spawn(ir, authContext)) {
-        res.write(irChunkToOpenAISSE(irChunk, requestId, ir.model));
-        if (irChunk.type === 'stop' || irChunk.type === 'error') break;
-      }
-      res.write(SSE_DONE);
-    } catch (e) {
-      // Best-effort error reporting in the stream
-      const errChunk = { type: 'error', error: e.message ?? 'Provider spawn failed' };
-      res.write(irChunkToOpenAISSE(errChunk, requestId, ir.model));
-      res.write(SSE_DONE);
-      logEvent('error', 'spawn_error', { provider: providerName, model: ir.model, error: e.message });
+    // D3 simplified replay: emit collected chunks sequentially
+    for (const irChunk of chunks) {
+      res.write(irChunkToOpenAISSE(irChunk, requestId, ir.model));
+      if (irChunk.type === 'stop' || irChunk.type === 'error') break;
     }
+    res.write(SSE_DONE);
     res.end();
   } else {
     // Non-streaming response path
+    let cacheStatus;
+    let responseObj;
+
     try {
-      const chunks = [];
-      for await (const irChunk of provider.spawn(ir, authContext)) {
-        chunks.push(irChunk);
-        if (irChunk.type === 'stop' || irChunk.type === 'error') break;
+      if (bypassCache) {
+        cacheStatus = 'bypass';
+        const chunks = await collectAllChunks();
+        responseObj = irResponseToOpenAINonStream(chunks, requestId, ir.model);
+      } else {
+        // D4 singleflight: concurrent identical requests share one spawn.
+        // We cache the full IR chunk array and assemble the OpenAI response on
+        // each retrieval so the requestId is fresh per request (per OpenAI spec
+        // each response has a unique id).
+        const chunks = await cacheStore.getOrCompute(keyId, cacheKey, collectAllChunks);
+        cacheStatus = preCheckHit ? 'hit' : 'miss';
+        responseObj = irResponseToOpenAINonStream(chunks, requestId, ir.model);
       }
-      const response = irResponseToOpenAINonStream(chunks, requestId, ir.model);
-      sendJSON(res, 200, response, headers);
     } catch (e) {
       logEvent('error', 'spawn_error', { provider: providerName, model: ir.model, error: e.message });
       const status = e instanceof ProviderError ? 502 : 500;
       sendError(res, status, e.message ?? 'Provider error', 'provider_error');
+      return;
     }
+
+    const headers = olpHeaders({ providerUsed: providerName, modelUsed: ir.model, startMs, cacheStatus });
+    sendJSON(res, 200, responseObj, headers);
   }
 }
 

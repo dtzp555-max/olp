@@ -1,11 +1,12 @@
 /**
- * test-features.mjs — OLP D4 test suite (extends D3)
+ * test-features.mjs — OLP D5 test suite (extends D4)
  *
  * Uses Node's built-in node:test runner. No external dependencies.
  * Run: node test-features.mjs  (or: npm test)
  *
- * Authority: ADR 0002 (provider contract), ADR 0003 (IR v1.0)
+ * Authority: ADR 0002 (provider contract), ADR 0003 (IR v1.0), ADR 0005 (cache layer)
  *   D4 adds: Anthropic plugin conformance, IR translation, mock-spawn behaviour.
+ *   D5 adds: Suite 9 (cache layer unit + HTTP integration), Suite 10 (Anthropic E2E gated)
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -13,6 +14,8 @@ import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
 import { EventEmitter } from 'node:events';
 import { homedir } from 'node:os';
+import { computeCacheKey, extractCacheControlMarkers, hasCacheControl } from './lib/cache/keys.mjs';
+import { CacheStore } from './lib/cache/store.mjs';
 
 // ── Modules under test ────────────────────────────────────────────────────
 
@@ -1089,5 +1092,612 @@ describe('HTTP integration', () => {
       req.end();
     });
     assert.equal(result.status, 415);
+  });
+});
+
+// ── Suite 8: Suite 8 formerly counted as D3/D4 base; suites renumber here ──
+// (No new Suite 8 — the numbering skips from 7 to 9 to match D5 spec.)
+
+// ── Suite 9: Cache layer ──────────────────────────────────────────────────
+//
+// Unit tests + HTTP integration tests for ADR 0005 (D1 + D4).
+// No real `claude` binary invoked. Mock spawn injected via __setSpawnImpl.
+// Authority: ADR 0005 § Cache key composition, D1 per-key isolation, D4 singleflight.
+
+describe('Cache layer — computeCacheKey (Suite 9)', () => {
+
+  // ── Test 1: Determinism ───────────────────────────────────────────────
+  it('computeCacheKey is deterministic: same inputs → same key', () => {
+    const ir = makeIR({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello' }] });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir);
+    assert.equal(k1, k2);
+    assert.equal(typeof k1, 'string');
+    assert.equal(k1.length, 64); // SHA-256 hex
+  });
+
+  // ── Test 2: Provider distinguishes ───────────────────────────────────
+  it('computeCacheKey distinguishes different providers', () => {
+    const ir = makeIR({ model: 'model-x', messages: [{ role: 'user', content: 'hi' }] });
+    const k1 = computeCacheKey('anthropic', 'model-x', ir);
+    const k2 = computeCacheKey('openai', 'model-x', ir);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 3: Model distinguishes ───────────────────────────────────────
+  it('computeCacheKey distinguishes different models', () => {
+    const ir = makeIR({ messages: [{ role: 'user', content: 'hi' }] });
+    const k1 = computeCacheKey('anthropic', 'claude-sonnet-4-6', ir);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 4: Messages distinguishes ───────────────────────────────────
+  it('computeCacheKey distinguishes different messages', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'hello' }] });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'world' }] });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir1);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 5: Tools distinguishes ───────────────────────────────────────
+  it('computeCacheKey distinguishes requests with vs without tools', () => {
+    const base = makeIR({ messages: [{ role: 'user', content: 'search' }] });
+    const withTools = makeIR({
+      messages: [{ role: 'user', content: 'search' }],
+      tools: [{ type: 'function', function: { name: 'search', description: 'web search', parameters: {} } }],
+    });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', base);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', withTools);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 6: Temperature distinguishes ────────────────────────────────
+  it('computeCacheKey distinguishes different temperature values', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'x' }], temperature: 0.0 });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'x' }], temperature: 1.0 });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir1);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 7: response_format distinguishes ────────────────────────────
+  it('computeCacheKey distinguishes different response_format values', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'x' }] });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'x' }], response_format: { type: 'json_object' } });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir1);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 8: Content array property order stability ───────────────────
+  it('computeCacheKey is stable for content arrays with same properties in different insertion order', () => {
+    const ir1 = makeIR({
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', extra: 1 }] }],
+    });
+    const ir2 = makeIR({
+      messages: [{ role: 'user', content: [{ extra: 1, text: 'hi', type: 'text' }] }],
+    });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir1);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
+    assert.equal(k1, k2);
+  });
+});
+
+describe('Cache layer — extractCacheControlMarkers + hasCacheControl (Suite 9 cont.)', () => {
+
+  // ── Test 9: extractCacheControlMarkers — top-level ───────────────────
+  it('extractCacheControlMarkers finds cache_control at message top level', () => {
+    const messages = [
+      { role: 'user', content: 'hi', cache_control: { type: 'ephemeral' } },
+    ];
+    const markers = extractCacheControlMarkers(messages);
+    assert.equal(markers.length, 1);
+    assert.deepEqual(markers[0], { type: 'ephemeral' });
+  });
+
+  // ── Test 10: extractCacheControlMarkers — nested in content array ─────
+  it('extractCacheControlMarkers finds cache_control nested in content array', () => {
+    const messages = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: 'world' },
+        ],
+      },
+    ];
+    const markers = extractCacheControlMarkers(messages);
+    assert.equal(markers.length, 1);
+    assert.deepEqual(markers[0], { type: 'ephemeral' });
+  });
+
+  // ── Test 11: extractCacheControlMarkers — no markers ─────────────────
+  it('extractCacheControlMarkers returns [] when no cache_control markers present', () => {
+    const messages = [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'world' },
+    ];
+    assert.deepEqual(extractCacheControlMarkers(messages), []);
+  });
+
+  // ── Test 12: hasCacheControl — true ──────────────────────────────────
+  it('hasCacheControl returns true when cache_control markers present', () => {
+    const ir = makeIR({
+      messages: [{ role: 'user', content: 'hi', cache_control: { type: 'ephemeral' } }],
+    });
+    assert.equal(hasCacheControl(ir), true);
+  });
+
+  // ── Test 13: hasCacheControl — false ─────────────────────────────────
+  it('hasCacheControl returns false when no cache_control markers', () => {
+    const ir = makeIR({ messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(hasCacheControl(ir), false);
+  });
+
+  // ── Test 14: hasCacheControl — null/undefined safety ─────────────────
+  it('hasCacheControl returns false for null/undefined ir', () => {
+    assert.equal(hasCacheControl(null), false);
+    assert.equal(hasCacheControl(undefined), false);
+    assert.equal(hasCacheControl({}), false);
+  });
+});
+
+describe('Cache layer — CacheStore unit tests (Suite 9 cont.)', () => {
+
+  // ── Test 15: set/get round-trip ───────────────────────────────────────
+  it('CacheStore.set/get round-trips a value', async () => {
+    const store = new CacheStore();
+    await store.set('keyA', 'hash1', [{ type: 'stop', finish_reason: 'stop' }]);
+    const entry = await store.get('keyA', 'hash1');
+    assert.ok(entry !== null);
+    assert.deepEqual(entry.value, [{ type: 'stop', finish_reason: 'stop' }]);
+  });
+
+  // ── Test 16: get returns null for missing key ─────────────────────────
+  it('CacheStore.get returns null for missing (keyId, cacheKey)', async () => {
+    const store = new CacheStore();
+    const entry = await store.get('keyA', 'nonexistent-hash');
+    assert.equal(entry, null);
+  });
+
+  // ── Test 17: Per-key isolation ────────────────────────────────────────
+  it('CacheStore per-key isolation: keyId1 entries invisible to keyId2', async () => {
+    const store = new CacheStore();
+    await store.set('keyA', 'hash1', 'value-for-keyA');
+    const fromKeyA = await store.get('keyA', 'hash1');
+    const fromKeyB = await store.get('keyB', 'hash1');
+    assert.ok(fromKeyA !== null);
+    assert.equal(fromKeyA.value, 'value-for-keyA');
+    assert.equal(fromKeyB, null);
+  });
+
+  // ── Test 18: has ─────────────────────────────────────────────────────
+  it('CacheStore.has returns true for existing entry, false for missing', async () => {
+    const store = new CacheStore();
+    await store.set('keyA', 'hash1', 'val');
+    assert.equal(await store.has('keyA', 'hash1'), true);
+    assert.equal(await store.has('keyA', 'hash-missing'), false);
+    assert.equal(await store.has('keyB', 'hash1'), false);
+  });
+
+  // ── Test 19: TTL expiry ───────────────────────────────────────────────
+  it('CacheStore respects TTL: expired entries return null', async () => {
+    // Inject a _nowFn to control time without sleeping.
+    // First call: "now" = 0 (entry creation time).
+    // Second call: "now" = 2000 (2 seconds later; entry has 1s TTL → expired).
+    let fakeNow = 0;
+    const store = new CacheStore({ _nowFn: () => fakeNow });
+    await store.set('keyA', 'hash1', 'val', 1000); // 1000ms TTL
+    // Entry should be alive at t=0
+    const entry1 = await store.get('keyA', 'hash1');
+    assert.ok(entry1 !== null, 'Expected entry to be alive at t=0');
+    // Advance time past TTL
+    fakeNow = 2000;
+    const entry2 = await store.get('keyA', 'hash1');
+    assert.equal(entry2, null, 'Expected entry to be expired at t=2000');
+  });
+
+  // ── Test 20: stats reports hits/misses ────────────────────────────────
+  it('CacheStore.stats reports hits and misses', async () => {
+    const store = new CacheStore();
+    await store.set('keyA', 'hash1', 'val');
+    await store.get('keyA', 'hash1'); // hit
+    await store.get('keyA', 'hash1'); // hit
+    await store.get('keyA', 'missing'); // miss
+    const s = store.stats('keyA');
+    assert.ok(s.hits >= 2, `Expected hits >= 2, got ${s.hits}`);
+    assert.ok(s.misses >= 1, `Expected misses >= 1, got ${s.misses}`);
+    assert.ok(typeof s.size === 'number');
+    assert.ok(typeof s.inflightCount === 'number');
+  });
+
+  // ── Test 21: getOrCompute returns computed value on miss ──────────────
+  it('getOrCompute returns computed value on miss and caches it', async () => {
+    const store = new CacheStore();
+    let callCount = 0;
+    const computeFn = async () => { callCount++; return [{ type: 'delta', content: 'hello' }]; };
+    const v1 = await store.getOrCompute('keyA', 'hash1', computeFn);
+    assert.deepEqual(v1, [{ type: 'delta', content: 'hello' }]);
+    assert.equal(callCount, 1);
+  });
+
+  // ── Test 22: getOrCompute returns cached value on hit (no recomputation) ──
+  it('getOrCompute returns cached value on hit — computeFn not called again', async () => {
+    const store = new CacheStore();
+    let callCount = 0;
+    const computeFn = async () => { callCount++; return 'computed-value'; };
+    await store.getOrCompute('keyA', 'hash1', computeFn);
+    const v2 = await store.getOrCompute('keyA', 'hash1', computeFn);
+    assert.equal(v2, 'computed-value');
+    assert.equal(callCount, 1, 'computeFn should only be called once on cache hit');
+  });
+
+  // ── Test 23: Singleflight — the key D4 test ───────────────────────────
+  // 5 concurrent getOrCompute calls with same key + slow computeFn (50ms).
+  // Verifies: computeFn called exactly once; all 5 callers receive same value;
+  // all 5 return within a tight time window (singleflight working).
+  it('getOrCompute singleflight: 5 concurrent callers → computeFn called exactly once', async () => {
+    const store = new CacheStore();
+    let callCount = 0;
+
+    const slowCompute = async () => {
+      callCount++;
+      // Simulate a slow provider spawn (50ms)
+      await new Promise(r => setTimeout(r, 50));
+      return [{ type: 'delta', content: 'singleflight-result' }, { type: 'stop', finish_reason: 'stop' }];
+    };
+
+    const t0 = Date.now();
+    // Launch 5 concurrent callers simultaneously
+    const results = await Promise.all([
+      store.getOrCompute('keyA', 'sf-hash', slowCompute),
+      store.getOrCompute('keyA', 'sf-hash', slowCompute),
+      store.getOrCompute('keyA', 'sf-hash', slowCompute),
+      store.getOrCompute('keyA', 'sf-hash', slowCompute),
+      store.getOrCompute('keyA', 'sf-hash', slowCompute),
+    ]);
+    const elapsed = Date.now() - t0;
+
+    // Singleflight invariant: computeFn called exactly once
+    assert.equal(callCount, 1, `Expected computeFn called 1 time, got ${callCount}`);
+
+    // All 5 callers receive the same result
+    for (const result of results) {
+      assert.deepEqual(result, [{ type: 'delta', content: 'singleflight-result' }, { type: 'stop', finish_reason: 'stop' }]);
+    }
+
+    // All 5 callers return within a tight window (not 5 * 50ms = 250ms).
+    // Allow generous margin (3x the slow compute time) for CI variance.
+    assert.ok(elapsed < 250, `Expected singleflight to complete in < 250ms, took ${elapsed}ms`);
+  });
+
+  // ── Test 24: getOrCompute releases inflight on completion ────────────
+  it('getOrCompute: subsequent calls after completion hit cache (no re-compute)', async () => {
+    const store = new CacheStore();
+    let callCount = 0;
+    const computeFn = async () => { callCount++; return 'done'; };
+    // First call — computes and caches
+    await store.getOrCompute('keyA', 'hash1', computeFn);
+    assert.equal(callCount, 1);
+    // Verify inflight is released: calling again should hit cache
+    await store.getOrCompute('keyA', 'hash1', computeFn);
+    assert.equal(callCount, 1, 'computeFn should not be called again after completion');
+    assert.equal(store.stats('keyA').inflightCount, 0, 'No inflight entries after completion');
+  });
+
+  // ── Test 25: getOrCompute releases inflight on error ─────────────────
+  it('getOrCompute: inflight released when computeFn throws; subsequent calls retry', async () => {
+    const store = new CacheStore();
+    let callCount = 0;
+    let shouldFail = true;
+    const computeFn = async () => {
+      callCount++;
+      if (shouldFail) throw new Error('provider error');
+      return 'success';
+    };
+
+    // First call — throws
+    await assert.rejects(() => store.getOrCompute('keyA', 'hash1', computeFn), /provider error/);
+    assert.equal(callCount, 1);
+    // Inflight must be released even after error
+    assert.equal(store.stats('keyA').inflightCount, 0, 'Inflight must be released after error');
+
+    // Second call — now succeeds (verify re-try works)
+    shouldFail = false;
+    const v = await store.getOrCompute('keyA', 'hash1', computeFn);
+    assert.equal(v, 'success');
+    assert.equal(callCount, 2, 'computeFn should be retried after error');
+  });
+
+  // ── Test 26: clear(keyId) clears only that namespace ─────────────────
+  it('CacheStore.clear(keyId) clears only that namespace', async () => {
+    const store = new CacheStore();
+    await store.set('keyA', 'hash1', 'val-a');
+    await store.set('keyB', 'hash1', 'val-b');
+    store.clear('keyA');
+    assert.equal(await store.has('keyA', 'hash1'), false, 'keyA should be cleared');
+    assert.equal(await store.has('keyB', 'hash1'), true, 'keyB should remain');
+  });
+
+  // ── Test 27: clear() with no args clears all ──────────────────────────
+  it('CacheStore.clear() with no argument clears all namespaces', async () => {
+    const store = new CacheStore();
+    await store.set('keyA', 'hash1', 'val-a');
+    await store.set('keyB', 'hash1', 'val-b');
+    store.clear();
+    assert.equal(await store.has('keyA', 'hash1'), false, 'keyA should be cleared');
+    assert.equal(await store.has('keyB', 'hash1'), false, 'keyB should be cleared');
+    assert.equal(store.stats().size, 0);
+  });
+});
+
+// ── Suite 9 (HTTP integration — cache) ───────────────────────────────────
+//
+// Tests cache miss / hit / bypass paths via HTTP integration with a mock
+// provider. Anthropic provider is enabled with:
+//   1. CLAUDE_CODE_OAUTH_TOKEN set to a fake value to bypass auth check
+//      (the mock spawn never actually uses the token)
+//   2. Mock spawn injected via __setSpawnImpl so no real claude binary runs
+//
+// This tests the full HTTP → server.mjs → cache layer → provider dispatch
+// path end-to-end, with the spawn binary call itself mocked out.
+
+describe('Cache layer — HTTP integration (Suite 9 cont.)', () => {
+  let serverInstance9;
+  let port9;
+  let savedOAuthToken;
+  let serverMod9;
+
+  before(async () => {
+    // Inject a fake OAuth token so auth check passes without a real token.
+    // The mock spawn ignores this value entirely.
+    savedOAuthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-fake-oauth-token-for-cache-tests';
+
+    // Set mock spawn that returns a proper response (delta + stop chunks via
+    // raw text output — anthropic.mjs treats each stdout data chunk as raw text).
+    __setSpawnImpl(makeMockSpawn(['mock-cache-content']));
+
+    // Import the server module (already cached by Node module system — same instance
+    // as Suite 7). Mutate the loadedProviders map to add anthropic.
+    serverMod9 = await import('./server.mjs');
+    const { createOlpServer, loadedProviders: lp } = serverMod9;
+
+    // Wire anthropic into the loaded providers map
+    const testProviders = loadProviders({ enabled: { anthropic: true } });
+    for (const [name, p] of testProviders) {
+      lp.set(name, p);
+    }
+
+    port9 = parseInt(
+      process.env.OLP_TEST_PORT
+        ? String(parseInt(process.env.OLP_TEST_PORT) + 5000)
+        : String(18456 + Math.floor(Math.random() * 1000)),
+      10,
+    );
+
+    serverInstance9 = createOlpServer();
+    await new Promise((resolve, reject) => {
+      serverInstance9.listen(port9, '127.0.0.1', resolve);
+      serverInstance9.once('error', async (e) => {
+        if (e.code === 'EADDRINUSE') {
+          port9++;
+          serverInstance9.listen(port9, '127.0.0.1', resolve);
+          serverInstance9.once('error', reject);
+        } else reject(e);
+      });
+    });
+  });
+
+  after(() => {
+    // Restore OAuth token
+    if (savedOAuthToken !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOAuthToken;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    __resetSpawnImpl();
+    return new Promise(r => serverInstance9.close(r));
+  });
+
+  // ── Test 28: cache miss path ──────────────────────────────────────────
+  // First request with a unique message → cache miss (not yet in cache).
+  it('HTTP: first request returns X-OLP-Cache: miss', async () => {
+    // Unique content ensures this test doesn't collide with other tests' cached entries
+    const testMsg = `http-cache-miss-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    __setSpawnImpl(makeMockSpawn([`response-for-${testMsg}`]));
+
+    const r = await fetch({
+      port: port9,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      body: {
+        model: 'claude-haiku-4-5',
+        messages: [{ role: 'user', content: testMsg }],
+      },
+    });
+
+    assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+    assert.equal(r.headers['x-olp-cache'], 'miss', `Expected miss, got: ${r.headers['x-olp-cache']}`);
+    assert.equal(r.headers['x-olp-provider-used'], 'anthropic');
+    assert.equal(r.headers['x-olp-model-used'], 'claude-haiku-4-5');
+  });
+
+  // ── Test 29: cache hit path ───────────────────────────────────────────
+  // Two identical requests: first → miss, second → hit (same content served from cache).
+  it('HTTP: second identical request returns X-OLP-Cache: hit with same content', async () => {
+    const testMsg = `http-cache-hit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const mockResponse = `hit-response-${testMsg}`;
+    __setSpawnImpl(makeMockSpawn([mockResponse]));
+
+    const reqParams = {
+      port: port9,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      body: {
+        model: 'claude-haiku-4-5',
+        messages: [{ role: 'user', content: testMsg }],
+      },
+    };
+
+    // First request — miss, spawns real (mock) provider
+    const r1 = await fetch(reqParams);
+    assert.equal(r1.status, 200, `First request failed: ${r1.status} ${r1.body.slice(0, 200)}`);
+    assert.equal(r1.headers['x-olp-cache'], 'miss', `First request should be miss`);
+    const body1 = JSON.parse(r1.body);
+    const content1 = body1?.choices?.[0]?.message?.content ?? '';
+
+    // Second request — replace spawn with a failing mock to prove spawn is NOT called
+    // (if spawn were called, this would produce a 502 error)
+    __setSpawnImpl(makeMockSpawn([], 1)); // exit code 1 = ProviderError on spawn
+
+    const r2 = await fetch(reqParams);
+    assert.equal(r2.status, 200, `Second request (cache hit) should be 200, got ${r2.status}: ${r2.body.slice(0, 200)}`);
+    assert.equal(r2.headers['x-olp-cache'], 'hit', `Second request should be cache hit`);
+
+    // Content should be identical (replayed from cache)
+    const body2 = JSON.parse(r2.body);
+    const content2 = body2?.choices?.[0]?.message?.content ?? '';
+    assert.equal(content2, content1, `Cache hit content should match original`);
+  });
+
+  // ── Test 30: cache bypass path (cache_control marker) ────────────────
+  // Request with cache_control marker → X-OLP-Cache: bypass (no OLP caching).
+  it('HTTP: request with cache_control marker returns X-OLP-Cache: bypass', async () => {
+    const testMsg = `http-cache-bypass-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    __setSpawnImpl(makeMockSpawn([`bypass-response-${testMsg}`]));
+
+    const r = await fetch({
+      port: port9,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      body: {
+        model: 'claude-haiku-4-5',
+        messages: [
+          {
+            role: 'user',
+            content: testMsg,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+    });
+
+    assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+    assert.equal(r.headers['x-olp-cache'], 'bypass', `Expected bypass header, got: ${r.headers['x-olp-cache']}`);
+  });
+});
+
+// ── Suite 10: Anthropic E2E (GATED) ──────────────────────────────────────
+//
+// Run with: OLP_RUN_E2E=1 npm test
+// Skipped by default; consumes real Anthropic tokens (~200 tokens per run,
+// est. <$0.001 at haiku rates). Requires `claude` binary + keychain OAuth
+// token. The orchestrator runs this once per D5 verification.
+//
+// This suite is NOT run in CI (CI does not set OLP_RUN_E2E). The skip notice
+// is emitted as a console message so CI logs show the gated test exists.
+//
+// Tests:
+//   1. Start OLP server with anthropic enabled.
+//   2. POST minimal request to claude-haiku-4-5.
+//   3. Assert 200, response contains "OK", correct provider/model headers.
+//   4. Send same request again → assert X-OLP-Cache: hit, identical content.
+//   5. Assert X-OLP-Fallback-Hops: 0.
+//
+// Model: claude-haiku-4-5 (cheapest). Prompt: "Reply with exactly the word OK
+// and nothing else." max_tokens: 10. Target: < 200 tokens per run.
+//
+// Do NOT include any real OAuth tokens or API keys in this test. Auth is read
+// from keychain / CLAUDE_CODE_OAUTH_TOKEN env / ~/.claude/.credentials.json
+// by readAuthArtifact() inside the anthropic plugin at spawn time.
+
+const RUN_E2E = process.env.OLP_RUN_E2E === '1';
+
+if (!RUN_E2E) {
+  // Emit a skip notice to CI logs without failing the suite
+  process.stdout.write('::notice::Suite 10 (Anthropic E2E) skipped — set OLP_RUN_E2E=1 to run. Requires claude binary + keychain OAuth token. ~200 tokens per run.\n');
+}
+
+describe('Anthropic E2E — real claude spawn (Suite 10)', { skip: !RUN_E2E }, () => {
+  let e2eServer;
+  let e2ePort;
+  let e2eLoadedProviders;
+  let e2eCacheStore;
+
+  before(async () => {
+    if (!RUN_E2E) return;
+
+    __resetSpawnImpl(); // ensure real spawn is active
+
+    const { createOlpServer, loadedProviders: lp, cacheStore: cs } = await import('./server.mjs');
+    e2eLoadedProviders = lp;
+    e2eCacheStore = cs;
+
+    // Enable anthropic provider for E2E
+    const testProviders = loadProviders({ enabled: { anthropic: true } });
+    for (const [name, p] of testProviders) {
+      lp.set(name, p);
+    }
+
+    e2ePort = parseInt(process.env.OLP_E2E_PORT ?? String(19456 + Math.floor(Math.random() * 500)), 10);
+    e2eServer = createOlpServer();
+    await new Promise((resolve, reject) => {
+      e2eServer.listen(e2ePort, '127.0.0.1', resolve);
+      e2eServer.once('error', async (e) => {
+        if (e.code === 'EADDRINUSE') {
+          e2ePort++;
+          e2eServer.listen(e2ePort, '127.0.0.1', resolve);
+          e2eServer.once('error', reject);
+        } else reject(e);
+      });
+    });
+  });
+
+  after(() => {
+    if (!e2eServer) return;
+    return new Promise(r => e2eServer.close(r));
+  });
+
+  it('E2E: POST claude-haiku-4-5 with minimal prompt → 200 + "OK" content + correct headers', async () => {
+    const body = {
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'Reply with exactly the word OK and nothing else.' }],
+      max_tokens: 10,
+    };
+
+    const r = await fetch({ port: e2ePort, method: 'POST', path: '/v1/chat/completions', body });
+    assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body}`);
+
+    const respBody = JSON.parse(r.body);
+    const content = respBody?.choices?.[0]?.message?.content ?? '';
+    assert.ok(
+      content.toLowerCase().includes('ok'),
+      `Expected response to contain "OK", got: ${content}`,
+    );
+
+    // Provider/model headers
+    assert.equal(r.headers['x-olp-provider-used'], 'anthropic', `Expected anthropic provider`);
+    assert.equal(r.headers['x-olp-model-used'], 'claude-haiku-4-5', `Expected haiku model`);
+
+    // First request is always a miss
+    assert.equal(r.headers['x-olp-cache'], 'miss', `First request should be cache miss`);
+
+    // Fallback hops
+    assert.equal(r.headers['x-olp-fallback-hops'], '0', `Expected 0 fallback hops`);
+
+    // Second request — should hit cache, content identical
+    const r2 = await fetch({ port: e2ePort, method: 'POST', path: '/v1/chat/completions', body });
+    assert.equal(r2.status, 200, `Cache hit request should be 200`);
+    assert.equal(r2.headers['x-olp-cache'], 'hit', `Second request should be cache hit`);
+
+    const resp2Body = JSON.parse(r2.body);
+    const content2 = resp2Body?.choices?.[0]?.message?.content ?? '';
+    assert.ok(
+      content2.toLowerCase().includes('ok'),
+      `Cache hit response should also contain "OK", got: ${content2}`,
+    );
   });
 });

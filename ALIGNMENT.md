@@ -81,29 +81,46 @@ Provider inclusion / exclusion is governed by a four-tier risk model. The full r
 
 | Tier | Meaning | OLP treatment |
 |---|---|---|
-| **A** — vendor AI-platform-wide ban + explicit named prohibition + poor cost/benefit | **Permanently excluded.** Not bundled, not pluggable, not added via opt-in. |
+| **A** — vendor AI-platform-wide enforcement + explicit named prohibition + poor cost/benefit | **Excluded by default.** Not bundled, not pluggable, not added via opt-in. Cannot be re-included unless ADR 0006 is superseded/amended with new primary-source evidence. |
 | **B** — service-level key revocation; vendor may extend across AI services | **Optional tier 2.** Default-disabled. Requires one-time explicit consent prompt on enable. README documents the policy clause and realistic revocation outcome. |
 | **C** — tightening signal; no documented enforcement history | **Optional tier 1.** Default-disabled. Opt-in via config without consent prompt. |
-| **D** — permissive / safe | **Default-enabled.** Bundled in default config. |
+| **D** — permissive / safe | **Eligible for default-enabled** once the provider transitions from Candidate to Enabled (see Provider Inventory below). |
 
-A vendor's documented ToS, FAQ language naming third-party proxy tools, observable enforcement history, and subscription cost/benefit jointly determine tier. Re-classification requires an ADR 0006 amendment.
+A vendor's documented ToS, FAQ language naming third-party proxy tools, observable enforcement history, and subscription cost/benefit jointly determine tier. Re-classification requires an ADR 0006 amendment. **Tier classification alone does not auto-enable a provider** — see the Candidate/Enabled split in Provider Inventory.
 
 ---
 
 ## Provider Inventory (v1.0)
 
-| Provider key | Tier | Default state | Inclusion source |
-|---|---|---|---|
-| `anthropic` | D (re-eval post-2026-06-15) | Enabled | ADR 0001 § Mission inheritance; ADR 0006 |
-| `openai` | D | Enabled | ADR 0006 |
-| `mistral` | D | Enabled | ADR 0006 |
-| `grok` | C | Disabled (opt-in) | ADR 0006 |
-| `kimi` | C | Disabled (opt-in) | ADR 0006 |
-| `minimax` | B | Disabled (consent required) | ADR 0006 |
-| `glm` | B | Disabled (consent required) | ADR 0006 |
-| `qwen` | B | Disabled (consent required) | ADR 0006 |
+OLP distinguishes **Candidate Providers** (declared in this constitution as intended for inclusion, but **not yet authority-pinned**) from **Enabled Providers** (authority pin filled, plugin landed, Phase audit passed; eligible for default-enabled or opt-in installation).
 
-**Excluded permanently (Tier A):** Google Antigravity. See ADR 0006 for the named-prohibition + no-cost-advantage + reinstatement-friction rationale. Re-inclusion requires an ADR 0006 amendment with new evidence of policy change.
+The v0.1 founding commit ships **zero Enabled Providers**. This is intentional: a constitution that names a provider as "default-enabled" while its CLI version, output shape, auth artifact, and exit-code semantics are still TBD violates Rules 1 (Cite First) and 3 (Match the Implementation). Enablement is a Phase audit deliverable, not a bootstrap claim.
+
+### Enabled Providers
+
+| Provider key | Tier | Default state | Authority pin | Inclusion source |
+|---|---|---|---|---|
+| _(none at v0.1 founding — populated as Phase audits land)_ | — | — | — | — |
+
+A provider transitions from Candidate to Enabled only when **all three** of the following hold:
+1. Its row in the Authority pin table (Authorities § 1 above) is filled with a real CLI version + observed-behaviour transcript or docs URL — no `TBD`.
+2. Its plugin lands in `lib/providers/<name>.mjs` per ADR 0002, conforming to the v1.0 Provider contract.
+3. A Phase audit per spec §6 reports passing E2E for that provider (smoke against `/v1/chat/completions` round-trip + cache hit/miss + fallback chain entry).
+
+### Candidate Providers
+
+| Provider key | Anticipated Tier | Anticipated Phase | Inclusion source |
+|---|---|---|---|
+| `anthropic` | D (re-eval post-2026-06-15) | Phase 1 | ADR 0001 § Mission inheritance; ADR 0006 |
+| `openai` | D | Phase 2 | ADR 0006 |
+| `mistral` | D | Phase 3 | ADR 0006 |
+| `grok` | C | Phase 8+ | ADR 0006 |
+| `kimi` | C | Phase 8+ | ADR 0006 |
+| `minimax` | B | Phase 8+ | ADR 0006 |
+| `glm` | B | Phase 8+ | ADR 0006 |
+| `qwen` | B | Phase 8+ | ADR 0006 |
+
+**Excluded by default (Tier A candidate):** Google Antigravity. See ADR 0006 for the rationale, currently classified as **evidence-backed exclusion pending primary-source pin** — the Google FAQ language reportedly naming OpenClaw / OpenCode / Claude Code as prohibited is cited from secondary reports (VentureBeat, piunikaweb, The Register, OpenClaw issue #14203); a primary-source URL or archival snapshot is a follow-up audit task. Until the primary source is pinned, the Tier A classification rests on secondary evidence — sufficient for default-not-bundled, but not yet sufficient for "permanent" in the constitutional sense. Re-inclusion requires an ADR 0006 amendment with primary-source evidence either confirming or contradicting the current secondary picture.
 
 ---
 
@@ -120,6 +137,16 @@ Unalignable changes are **deleted**, not disabled, not feature-flagged, not depr
 Burden of proof is on the change author. Audit findings that cannot be reconciled trigger an immediate deletion PR. There is no grandfathering for OLP — the project is new and inherits no legacy contracts.
 
 If a user workflow appears to depend on an unalignable behaviour, the correct remediations are: (a) upstream the behaviour into the relevant provider's CLI (engage that vendor), (b) propose an OpenAI-spec extension and wait for adoption, (c) write an ADR authorizing a new IR field, or (d) move the behaviour out of OLP into a separate tool. OLP does not retain it.
+
+---
+
+## One-shot Triggered Audits
+
+In addition to the recurring 14 May audit below, the following one-shot audits are scheduled and must complete on their named trigger:
+
+- **2026-06-16 (or first Anthropic Agent SDK Credit billing-cycle close, whichever is later)** — verify the post-2026-06-15 Anthropic billing-split behaviour matches the spec §2 assumption: programmatic `claude -p` traffic is metered against the separate Agent SDK Credit pool, not Plan limits. Update the Anthropic Authority pin row above with the observed behaviour, update ADR 0006 with the post-effective-date Tier re-evaluation, and append a Decision-log entry to the spec §10. If observed behaviour diverges from the spec assumption (e.g., Plan limits still apply, or credit pool meter differs from `$100/Max5x/month`), file a Risk-Tier reclassification per ADR 0006 amendment procedure.
+
+- **Antigravity primary-source pin (open-ended, no deadline)** — find a primary-source URL or archival snapshot for the Google FAQ language naming OpenClaw / OpenCode / Claude Code as prohibited. Pin the URL + retrieval timestamp into ADR 0006. If the primary source cannot be located within 90 days of this commit and only secondary reports remain, file an ADR 0006 amendment proposing a re-classification (Tier A may need to soften to Tier C "evidence-backed signal only" if the prohibition cannot be primary-sourced).
 
 ---
 

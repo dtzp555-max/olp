@@ -43,20 +43,24 @@ olp start
 
 Source of truth: [`models-registry.json`](./models-registry.json). This table is regenerated from the registry per the [`release_kit`](./CLAUDE.md) overlay; do not edit it out of sync.
 
-| Provider key | CLI | Subscription / auth | Risk Tier (per [ADR 0006](./docs/adr/0006-provider-inclusion.md)) | Default state |
+OLP distinguishes **Candidate Providers** (declared as intended, not yet pinned) from **Enabled Providers** (authority pin filled + plugin landed + Phase audit passed). The v0.1 founding commit ships **zero Enabled Providers** — enablement is a Phase audit deliverable, not a bootstrap claim. See [`ALIGNMENT.md` § Provider Inventory](./ALIGNMENT.md) for the transition gate.
+
+### Candidate Providers
+
+| Provider key | CLI | Subscription / auth | Anticipated Tier | Anticipated Phase |
 |---|---|---|---|---|
-| `anthropic` | `claude -p` | Pro / Max OAuth (pre-2026-06-15); Agent SDK Credit pool after | D (re-eval post-2026-06-15) | Enabled |
-| `openai` | `codex exec --json` | ChatGPT Pro OAuth or API key | D | Enabled |
-| `mistral` | `vibe --prompt --output json` | Le Chat Pro API key | D | Enabled |
-| `grok` | `grok -p --output-format streaming-json` | xAI Build `xai-...` API key | C | Disabled (opt-in) |
-| `kimi` | `kimi -p --output-format stream-json` | Moonshot Kimi API key | C | Disabled (opt-in) |
-| `minimax` | TBD | MiniMax Token Plan (¥29+/mo) | B | Disabled (consent required) |
-| `glm` | TBD | Zhipu Coding Plan ($10+/mo) | B | Disabled (consent required) |
-| `qwen` | TBD | Alibaba Coding Plan ($50/mo) | B | Disabled (consent required) |
+| `anthropic` | `claude -p` | Pro / Max OAuth (pre-2026-06-15); Agent SDK Credit pool after | D (re-eval post-2026-06-15) | Phase 1 |
+| `openai` | `codex exec --json` | ChatGPT Pro OAuth or API key | D | Phase 2 |
+| `mistral` | `vibe --prompt --output json` | Le Chat Pro API key | D | Phase 3 |
+| `grok` | `grok -p --output-format streaming-json` | xAI Build `xai-...` API key | C | Phase 8+ |
+| `kimi` | `kimi -p --output-format stream-json` | Moonshot Kimi API key | C | Phase 8+ |
+| `minimax` | TBD | MiniMax Token Plan (¥29+/mo) | B | Phase 8+ |
+| `glm` | TBD | Zhipu Coding Plan ($10+/mo) | B | Phase 8+ |
+| `qwen` | TBD | Alibaba Coding Plan ($50/mo) | B | Phase 8+ |
 
-**Risk tier guide.** D = permissive / safe; C = tightening signal, no enforcement history; B = service-level key revocation risk, vendor may extend across that vendor's AI services; A = permanently excluded. Tier B providers prompt for explicit consent on first enable and record consent in `~/.olp/config.json`. See [`ALIGNMENT.md` § Risk Tier Framework](./ALIGNMENT.md#risk-tier-framework).
+**Risk tier guide.** D = permissive / safe (eligible for default-enabled); C = tightening signal, no enforcement history (opt-in); B = service-level key revocation risk (opt-in + consent); A = excluded by default (cannot be opt-in enabled). Tier B providers prompt for explicit consent on first enable and record consent in `~/.olp/config.json`. See [`ALIGNMENT.md` § Risk Tier Framework](./ALIGNMENT.md#risk-tier-framework).
 
-**Excluded permanently (Tier A).** Google Antigravity. See [ADR 0006](./docs/adr/0006-provider-inclusion.md) for the named-prohibition + no-cost-advantage + reinstatement-friction rationale.
+**Excluded by default (Tier A — evidence-backed, pending primary-source pin).** Google Antigravity. See [ADR 0006](./docs/adr/0006-provider-inclusion.md) for the named-prohibition + no-cost-advantage + reinstatement-friction rationale, and for the primary-source pinning follow-up that may force a Tier reconsideration if the Google FAQ language cannot be sourced within 90 days of 2026-05-23.
 
 ---
 

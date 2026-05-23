@@ -27,12 +27,22 @@ Found OLP (Open LLM Proxy) as a new project, separate from OCP, with the followi
 - A model-capability router. OLP does not auto-route to "the smartest model"; the user picks the model explicitly per chain in `config.routing.chains[]`. Capability routing is a separate problem with separate failure modes and is out of scope for v1.0 and beyond.
 - A conversation-state store. Memory and continuity are client-side concerns (Memory Continuity, Hermes equivalents, IDE-side context). OLP is a pure stateless proxy.
 
-**Supersession of OCP ADR 0005.** OCP ADR 0005 ("No Multi-Provider Refactor") is explicitly superseded by OLP's existence. Specifically:
-- ADR 0005's premise that *single-provider sufficiency* was the right scope for the maintainer's LLM proxy was correct on 2026-05-06 and is wrong on 2026-05-23, because Anthropic changed the underlying contract.
-- ADR 0005's recommendation that "commercial work, if pursued, starts elsewhere" pointed correctly toward "a separate repository, separate name, BYOK from day one, no `cli.js` spawn." OLP is not the commercial work ADR 0005 contemplated, but it is the structural shape ADR 0005 endorsed: a separate repo with multi-provider design baked in from day one.
-- OCP itself is not deleted. Per spec §7, OCP enters maintenance mode when OLP v0.1 ships. The two projects do not parallel-run in production (port-3456 conflict, single launchd service slot, one set of credentials per machine).
+**Supersession of OCP ADR 0005.** OCP ADR 0005 ("No Multi-Provider Refactor") is explicitly superseded by OLP's existence. The supersession is **narrow** and **does not adopt all of ADR 0005's alternative-path suggestions**:
 
-OCP ADR 0005 receives a header amendment on merge of this ADR: *"Superseded by OLP — see [OLP repo URL] ADR 0001."* The body of ADR 0005 is otherwise untouched. Future readers should see the original reasoning intact and the supersession marker explicit.
+What OLP genuinely inherits from ADR 0005:
+1. **Structural separation:** the judgment that if multi-provider becomes needed, the right move is to start a separate project, not retrofit OCP. ✓
+2. **Multi-provider design baked in from day one** (rather than retrofitted onto a single-provider core). ✓
+
+What OLP supersedes in ADR 0005:
+- ADR 0005's premise that *single-provider sufficiency* was the right scope for the maintainer's LLM proxy was correct on 2026-05-06 and is wrong on 2026-05-23, because Anthropic changed the underlying contract. This is the load-bearing supersession.
+
+What OLP **does NOT inherit** from ADR 0005 (and where ADR 0005's reasoning does not apply to OLP):
+- ADR 0005's separate-project recommendation came with two qualifiers that OLP rejects: "BYOK from day one" and "no `cli.js` spawn." Both qualifiers were appropriate for the *commercial* path ADR 0005 was contemplating. OLP is not commercial — it is personal- and family-scale, shares the maintainer's own subscription quota across family clients, and explicitly spawns provider CLIs (it is precisely the spawn-binary architecture that delivers the "subscription quota maximization" value proposition spec §1 names).
+- OLP is therefore not the commercial pivot ADR 0005 endorsed. It is a personal-use re-architecture of the proxy-CLI pattern, which ADR 0005 did not contemplate. The supersession is honest about this gap.
+
+OCP itself is not deleted. Per spec §7, OCP enters maintenance mode when OLP v0.1 ships. The two projects do not parallel-run in production (port-3456 conflict, single launchd service slot, one set of credentials per machine).
+
+OCP ADR 0005 receives a header amendment on merge of this ADR: *"Superseded in part by OLP — see https://github.com/dtzp555-max/olp ADR 0001 for the narrow scope of the supersession (single-provider-sufficiency premise only; ADR 0005's commercial / BYOK / no-spawn recommendations are not adopted)."* The body of ADR 0005 is otherwise untouched. Future readers should see the original reasoning intact and the supersession marker scoped explicitly.
 
 ## Consequences
 

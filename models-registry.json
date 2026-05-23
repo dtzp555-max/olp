@@ -1,5 +1,37 @@
 {
   "version": "0.1.0-bootstrap",
-  "comment": "OLP models registry — SPOT for (provider, model) → metadata per CLAUDE.md release_kit overlay. v0.1 founding ships zero Enabled Providers per ALIGNMENT.md § Provider Inventory, so 'providers' is empty. Each Phase audit that transitions a Candidate to Enabled populates its provider's entry here. Schema validated by .github/workflows/alignment.yml; provider keys must match ALIGNMENT.md inventory.",
-  "providers": {}
+  "comment": "OLP models registry — SPOT for (provider, model) → metadata per CLAUDE.md release_kit overlay. v0.1 founding shipped zero Enabled Providers per ALIGNMENT.md § Provider Inventory. D4 populates providers.anthropic as Candidate; D5 transitions to Enabled pending E2E audit. Schema validated by .github/workflows/alignment.yml; provider keys must match ALIGNMENT.md inventory.",
+  "providers": {
+    "anthropic": {
+      "displayName": "Anthropic Claude",
+      "tier": "D",
+      "candidate": true,
+      "models": [
+        {
+          "id": "claude-opus-4-7",
+          "displayName": "Claude Opus 4.7",
+          "contextWindow": 200000,
+          "deprecated": false
+        },
+        {
+          "id": "claude-sonnet-4-6",
+          "displayName": "Claude Sonnet 4.6",
+          "contextWindow": 200000,
+          "deprecated": false
+        },
+        {
+          "id": "claude-haiku-4-5",
+          "displayName": "Claude Haiku 4.5",
+          "contextWindow": 200000,
+          "deprecated": false
+        }
+      ],
+      "aliases": {
+        "claude": "claude-sonnet-4-6",
+        "sonnet": "claude-sonnet-4-6",
+        "opus": "claude-opus-4-7",
+        "haiku": "claude-haiku-4-5"
+      }
+    }
+  }
 }

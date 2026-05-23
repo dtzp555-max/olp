@@ -1,15 +1,18 @@
 /**
- * test-features.mjs — OLP D3 test suite
+ * test-features.mjs — OLP D4 test suite (extends D3)
  *
  * Uses Node's built-in node:test runner. No external dependencies.
  * Run: node test-features.mjs  (or: npm test)
  *
  * Authority: ADR 0002 (provider contract), ADR 0003 (IR v1.0)
+ *   D4 adds: Anthropic plugin conformance, IR translation, mock-spawn behaviour.
  */
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
+import { EventEmitter } from 'node:events';
+import { homedir } from 'node:os';
 
 // ── Modules under test ────────────────────────────────────────────────────
 
@@ -22,7 +25,19 @@ import {
   SSE_DONE,
 } from './lib/ir/ir-to-openai.mjs';
 import { validateProvider, ProviderError, withTimeout } from './lib/providers/base.mjs';
-import { loadProviders, getProviderForModel, listAllProviderNames } from './lib/providers/index.mjs';
+import { loadProviders, getProviderForModel, getProviderByName, listAllProviderNames } from './lib/providers/index.mjs';
+import anthropic, {
+  irToAnthropic,
+  anthropicChunkToIR,
+  anthropicStopToIR,
+  readAuthArtifact,
+  estimateCost as anthropicEstimateCost,
+  quotaStatus as anthropicQuotaStatus,
+  healthCheck as anthropicHealthCheck,
+  __setSpawnImpl,
+  __resetSpawnImpl,
+} from './lib/providers/anthropic.mjs';
+import modelsRegistry from './models-registry.json' with { type: 'json' };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -37,11 +52,12 @@ function makeIR(overrides = {}) {
   };
 }
 
-/** Minimal valid provider stub that satisfies the v1.0 contract */
+/** Minimal valid provider stub that satisfies the v1.0 contract (including D4 contractVersion) */
 function makeProvider(overrides = {}) {
   return {
     name: 'stub',
     displayName: 'Stub Provider',
+    contractVersion: '1.0',
     models: ['stub-model-v1'],
     auth: { type: 'none', storage: 'none', path: '', refresh: null },
     spawn: async function* () { yield { type: 'stop', finish_reason: 'stop' }; },
@@ -459,7 +475,12 @@ describe('Provider contract validation', () => {
 // ── Suite 5: Plugin registry ──────────────────────────────────────────────
 
 describe('Plugin registry', () => {
-  it('empty STATIC_REGISTRY → loadProviders returns empty Map', () => {
+  it('STATIC_REGISTRY has 1 entry (anthropic candidate) at D4', () => {
+    // D4: anthropic is in STATIC_REGISTRY but default config has enabled:false
+    assert.equal(listAllProviderNames().length, 1);
+  });
+
+  it('loadProviders with empty config → empty Map (anthropic not enabled)', () => {
     const m = loadProviders({});
     assert.equal(m.size, 0);
   });
@@ -469,8 +490,8 @@ describe('Plugin registry', () => {
     assert.equal(m.size, 0);
   });
 
-  it('listAllProviderNames returns empty array at D3', () => {
-    assert.deepEqual(listAllProviderNames(), []);
+  it('listAllProviderNames returns [anthropic] at D4', () => {
+    assert.deepEqual(listAllProviderNames(), ['anthropic']);
   });
 
   it('getProviderForModel returns null when no providers loaded', () => {
@@ -493,9 +514,455 @@ describe('Plugin registry', () => {
     const m = new Map([['alpha', p]]);
     assert.equal(getProviderForModel(m, 'beta-v1'), null);
   });
+
+  it('getProviderByName returns null for empty loaded map', () => {
+    const m = new Map();
+    assert.equal(getProviderByName(m, 'anthropic'), null);
+  });
+
+  it('getProviderByName returns provider when found', () => {
+    const p = makeProvider({ name: 'alpha', models: ['alpha-v1'] });
+    const m = new Map([['alpha', p]]);
+    assert.ok(getProviderByName(m, 'alpha') !== null);
+    assert.equal(getProviderByName(m, 'alpha').name, 'alpha');
+  });
+
+  it('anthropic provider passes contract validation (STATIC_REGISTRY entry)', () => {
+    // Even though anthropic is Candidate (not enabled by default), it must
+    // pass contract validation at module load — loadProviders() validates all
+    // registry entries regardless of enabled flag.
+    const { valid, errors } = validateProvider(anthropic);
+    assert.equal(valid, true, `Validation errors: ${errors.join('; ')}`);
+  });
 });
 
-// ── Suite 6: HTTP integration tests ──────────────────────────────────────
+// ── Suite 6: Anthropic plugin (D4) ───────────────────────────────────────
+//
+// All tests in this suite are UNIT tests. No real `claude` binary is invoked.
+// Mock spawn is injected via __setSpawnImpl / __resetSpawnImpl.
+// Tests verify: contract conformance, contractVersion enforcement, registry
+// consistency, IR translation, mock-spawn stream, healthCheck, estimateCost.
+
+/**
+ * Creates a fake spawn that emits canned stdout chunks then exits cleanly.
+ * Returns a fake ChildProcess-like EventEmitter with stdin, stdout, stderr.
+ * @param {string[]} stdoutChunks — text chunks emitted in order
+ * @param {number} [exitCode=0]
+ */
+function makeMockSpawn(stdoutChunks, exitCode = 0) {
+  return function mockSpawnImpl(_bin, _args, _opts) {
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.stdin = {
+      write: () => {},
+      end: () => {
+        // Emit stdout chunks and close asynchronously
+        setImmediate(async () => {
+          for (const chunk of stdoutChunks) {
+            proc.stdout.emit('data', Buffer.from(chunk));
+          }
+          proc.stdout.emit('end');
+          proc.stderr.emit('end');
+          proc.emit('close', exitCode, null);
+        });
+      },
+    };
+    proc.killed = false;
+    proc.kill = () => {};
+    return proc;
+  };
+}
+
+describe('Anthropic plugin (D4)', () => {
+
+  // ── Test 1: Contract conformance ──────────────────────────────────────
+  it('anthropic module satisfies validateProvider() — all 10 fields present', () => {
+    const { valid, errors } = validateProvider(anthropic);
+    assert.equal(valid, true, `Validation errors: ${errors.join('; ')}`);
+    // Verify all 10 contract fields explicitly
+    assert.ok('name' in anthropic, 'missing: name');
+    assert.ok('displayName' in anthropic, 'missing: displayName');
+    assert.ok('contractVersion' in anthropic, 'missing: contractVersion');
+    assert.ok('models' in anthropic, 'missing: models');
+    assert.ok('auth' in anthropic, 'missing: auth');
+    assert.ok(typeof anthropic.spawn === 'function', 'missing: spawn');
+    assert.ok(typeof anthropic.estimateCost === 'function', 'missing: estimateCost');
+    assert.ok(typeof anthropic.quotaStatus === 'function', 'missing: quotaStatus');
+    assert.ok(typeof anthropic.healthCheck === 'function', 'missing: healthCheck');
+    assert.ok('hints' in anthropic, 'missing: hints');
+  });
+
+  // ── Test 2: contractVersion enforced ─────────────────────────────────
+  it('validateProvider rejects provider missing contractVersion', () => {
+    const p = makeProvider();
+    delete p.contractVersion;
+    const r = validateProvider(p);
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('contractVersion')));
+  });
+
+  it('validateProvider rejects contractVersion: "0.9"', () => {
+    const p = makeProvider({ contractVersion: '0.9' });
+    const r = validateProvider(p);
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('contractVersion')));
+  });
+
+  it('validateProvider accepts contractVersion: "1.0"', () => {
+    const p = makeProvider({ contractVersion: '1.0' });
+    const r = validateProvider(p);
+    assert.equal(r.valid, true);
+  });
+
+  it('validateProvider rejects contractVersion: undefined', () => {
+    const p = makeProvider({ contractVersion: undefined });
+    const r = validateProvider(p);
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('contractVersion')));
+  });
+
+  // ── Test 3: models match registry ────────────────────────────────────
+  it('anthropic.models matches models-registry.json providers.anthropic.models', () => {
+    const registryIds = modelsRegistry.providers.anthropic.models.map(m => m.id);
+    assert.deepEqual(anthropic.models, registryIds);
+  });
+
+  it('anthropic.models contains the three expected model IDs', () => {
+    assert.ok(anthropic.models.includes('claude-opus-4-7'));
+    assert.ok(anthropic.models.includes('claude-sonnet-4-6'));
+    assert.ok(anthropic.models.includes('claude-haiku-4-5'));
+    assert.equal(anthropic.models.length, 3);
+  });
+
+  // ── Test 4: getProviderForModel finds anthropic for each model ────────
+  it('getProviderForModel finds anthropic for claude-sonnet-4-6 when enabled', () => {
+    const loaded = new Map([['anthropic', anthropic]]);
+    const result = getProviderForModel(loaded, 'claude-sonnet-4-6');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'anthropic');
+  });
+
+  it('getProviderForModel finds anthropic for claude-opus-4-7 when enabled', () => {
+    const loaded = new Map([['anthropic', anthropic]]);
+    const result = getProviderForModel(loaded, 'claude-opus-4-7');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'anthropic');
+  });
+
+  it('getProviderForModel finds anthropic for claude-haiku-4-5 when enabled', () => {
+    const loaded = new Map([['anthropic', anthropic]]);
+    const result = getProviderForModel(loaded, 'claude-haiku-4-5');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'anthropic');
+  });
+
+  // ── Test 5: irToAnthropic translation ────────────────────────────────
+  it('irToAnthropic: user message → plain text', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'Hello world' }],
+    });
+    const prompt = irToAnthropic(ir);
+    assert.ok(typeof prompt === 'string');
+    assert.ok(prompt.includes('Hello world'));
+    assert.ok(!prompt.includes('[System]'));
+    assert.ok(!prompt.includes('[Assistant]'));
+  });
+
+  it('irToAnthropic: system + user → system annotation + user text', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'system', content: 'You are a helper.' },
+        { role: 'user', content: 'What is 2+2?' },
+      ],
+    });
+    const prompt = irToAnthropic(ir);
+    assert.ok(prompt.includes('[System] You are a helper.'));
+    assert.ok(prompt.includes('What is 2+2?'));
+  });
+
+  it('irToAnthropic: assistant turn → [Assistant] annotation', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'user', content: 'Hi' },
+        { role: 'assistant', content: 'Hello!' },
+        { role: 'user', content: 'Bye' },
+      ],
+    });
+    const prompt = irToAnthropic(ir);
+    assert.ok(prompt.includes('[Assistant] Hello!'));
+  });
+
+  it('irToAnthropic: response_format json_object injects system prompt', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'Give JSON' }],
+      response_format: { type: 'json_object' },
+    });
+    const prompt = irToAnthropic(ir);
+    assert.ok(prompt.includes('Reply with valid JSON only'));
+  });
+
+  it('irToAnthropic: tool result turn → [Tool Result] annotation', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'user', content: 'Search for something' },
+        { role: 'tool', content: '{"results": []}', name: 'search' },
+      ],
+    });
+    const prompt = irToAnthropic(ir);
+    assert.ok(prompt.includes('[Tool Result'));
+    assert.ok(prompt.includes('search'));
+  });
+
+  it('irToAnthropic: array content is JSON-stringified', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    });
+    const prompt = irToAnthropic(ir);
+    assert.ok(typeof prompt === 'string');
+    assert.ok(prompt.includes('text'));
+  });
+
+  // ── Test 6: anthropicChunkToIR and anthropicStopToIR ─────────────────
+  it('anthropicChunkToIR: produces delta chunk with content', () => {
+    const chunk = anthropicChunkToIR('Hello ', false);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.content, 'Hello ');
+    assert.ok(!('role' in chunk));
+  });
+
+  it('anthropicChunkToIR: first chunk includes role=assistant', () => {
+    const chunk = anthropicChunkToIR('Hello', true);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.role, 'assistant');
+    assert.equal(chunk.content, 'Hello');
+  });
+
+  it('anthropicStopToIR: produces stop chunk with finish_reason', () => {
+    const chunk = anthropicStopToIR('stop');
+    assert.equal(chunk.type, 'stop');
+    assert.equal(chunk.finish_reason, 'stop');
+  });
+
+  // ── Test 7: mock spawn — AsyncIterator yields correct IR chunks ───────
+  it('spawn with mock: yields delta chunks then stop chunk', async () => {
+    const fakeSpawn = makeMockSpawn(['Hello', ' world']);
+    __setSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      const authCtx = { accessToken: '<fake-oauth-token>' };
+      const chunks = [];
+      for await (const chunk of anthropic.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      // Should have 2 delta chunks + 1 stop chunk
+      const deltas = chunks.filter(c => c.type === 'delta');
+      const stops = chunks.filter(c => c.type === 'stop');
+      assert.ok(deltas.length >= 1, `Expected at least 1 delta, got ${deltas.length}`);
+      assert.equal(stops.length, 1, `Expected 1 stop, got ${stops.length}`);
+      const allContent = deltas.map(c => c.content).join('');
+      assert.equal(allContent, 'Hello world');
+    } finally {
+      __resetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: first delta chunk has role=assistant', async () => {
+    const fakeSpawn = makeMockSpawn(['Test output']);
+    __setSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hello' }],
+      });
+      const authCtx = { accessToken: '<fake-oauth-token>' };
+      const chunks = [];
+      for await (const chunk of anthropic.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+      const firstDelta = chunks.find(c => c.type === 'delta');
+      assert.ok(firstDelta, 'No delta chunk found');
+      assert.equal(firstDelta.role, 'assistant');
+    } finally {
+      __resetSpawnImpl();
+    }
+  });
+
+  it('spawn with mock: non-zero exit code throws ProviderError', async () => {
+    const fakeSpawn = makeMockSpawn([], 1);
+    __setSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      const authCtx = { accessToken: '<fake-oauth-token>' };
+      let caught = null;
+      try {
+        // eslint-disable-next-line no-unused-vars
+        for await (const _chunk of anthropic.spawn(ir, authCtx)) {
+          // drain
+        }
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught instanceof ProviderError, `Expected ProviderError, got ${caught?.constructor?.name}`);
+      assert.equal(caught.code, 'SPAWN_FAILED');
+    } finally {
+      __resetSpawnImpl();
+    }
+  });
+
+  it('spawn throws ProviderError(AUTH_MISSING) when no auth context and no env/file', async () => {
+    const fakeSpawn = makeMockSpawn(['output']);
+    __setSpawnImpl(fakeSpawn);
+    // Temporarily clear the env var if set
+    const savedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    try {
+      const ir = makeIR({
+        model: 'claude-sonnet-4-6',
+        stream: false,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      let caught = null;
+      try {
+        // Pass null as authContext to force re-read
+        for await (const _chunk of anthropic.spawn(ir, null)) { // eslint-disable-line no-unused-vars
+          // may or may not throw depending on whether credentials exist on this machine
+        }
+      } catch (e) {
+        caught = e;
+      }
+      // If credentials.json or keychain exists on the test machine, this won't throw.
+      // We only assert that IF it throws, it's AUTH_MISSING.
+      if (caught !== null) {
+        assert.ok(caught instanceof ProviderError, `Expected ProviderError, got ${caught?.constructor?.name}`);
+        assert.equal(caught.code, 'AUTH_MISSING');
+      }
+    } finally {
+      if (savedToken !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken;
+      __resetSpawnImpl();
+    }
+  });
+
+  // ── Test 8: healthCheck — binary not found ────────────────────────────
+  it('healthCheck returns {ok: false, error: "claude binary not found"} when binary absent', async () => {
+    const result = await anthropicHealthCheck({
+      _binaryExistsFn: () => false,
+      _authReadFn: () => ({ accessToken: '<fake-token>' }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'claude binary not found');
+    assert.ok(typeof result.latencyMs === 'number');
+  });
+
+  // ── Test 9: healthCheck — auth artifact missing ───────────────────────
+  it('healthCheck returns {ok: false, error: "auth artifact missing"} when auth missing', async () => {
+    const result = await anthropicHealthCheck({
+      _binaryExistsFn: () => true,
+      _authReadFn: () => null,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'auth artifact missing');
+    assert.ok(typeof result.latencyMs === 'number');
+  });
+
+  it('healthCheck returns {ok: true} when binary and auth present', async () => {
+    const result = await anthropicHealthCheck({
+      _binaryExistsFn: () => true,
+      _authReadFn: () => ({ accessToken: '<fake-token>' }),
+    });
+    assert.equal(result.ok, true);
+    assert.ok(typeof result.latencyMs === 'number');
+  });
+
+  // ── Test 10: estimateCost shape ───────────────────────────────────────
+  it('estimateCost returns object with four fields for a valid request', () => {
+    const request = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'system', content: 'You are a helper.' },
+        { role: 'user', content: 'Count to ten.' },
+      ],
+    });
+    const result = anthropicEstimateCost(request);
+    assert.ok(result !== null, 'estimateCost returned null');
+    assert.ok('inputTokens' in result, 'missing inputTokens');
+    assert.ok('outputTokensEstimate' in result, 'missing outputTokensEstimate');
+    assert.ok('currency' in result, 'missing currency');
+    assert.ok('usd' in result, 'missing usd');
+    assert.equal(result.currency, 'USD');
+    assert.equal(result.usd, null); // not pinned at D4
+    assert.ok(result.inputTokens > 0, 'inputTokens should be > 0');
+    assert.ok(result.outputTokensEstimate >= 0, 'outputTokensEstimate should be >= 0');
+  });
+
+  it('estimateCost returns null for null/missing request', () => {
+    assert.equal(anthropicEstimateCost(null), null);
+    assert.equal(anthropicEstimateCost({}), null);
+  });
+
+  // ── Test 11: quotaStatus ──────────────────────────────────────────────
+  it('quotaStatus returns null at D4', async () => {
+    const result = await anthropicQuotaStatus({});
+    assert.equal(result, null);
+  });
+
+  // ── Test 12: auth object shape ────────────────────────────────────────
+  it('anthropic.auth has correct shape', () => {
+    assert.equal(typeof anthropic.auth.type, 'string');
+    assert.equal(typeof anthropic.auth.storage, 'string');
+    assert.equal(typeof anthropic.auth.path, 'string');
+    assert.ok(anthropic.auth.path.includes('.claude'), 'auth.path should reference .claude directory');
+    // Portability check: path must start with the runtime homedir() value (set at module load)
+    // rather than a hardcoded literal.  Since path.join(homedir(), ...) produces the home dir
+    // as a prefix, we verify it matches what homedir() returns at test time.
+    assert.ok(
+      anthropic.auth.path.startsWith(homedir()),
+      `auth.path "${anthropic.auth.path}" should start with homedir() "${homedir()}"`,
+    );
+    assert.ok(typeof anthropic.auth.refresh === 'string' || anthropic.auth.refresh === null);
+  });
+
+  // ── Test 13: hints shape ──────────────────────────────────────────────
+  it('anthropic.hints has correct shape', () => {
+    assert.equal(typeof anthropic.hints.requiresTTY, 'boolean');
+    assert.equal(typeof anthropic.hints.concurrentSpawnSafe, 'boolean');
+    assert.ok(Number.isInteger(anthropic.hints.maxConcurrent) && anthropic.hints.maxConcurrent > 0);
+    assert.equal(anthropic.hints.requiresTTY, false);
+  });
+
+  // ── Test 14: loadProviders with anthropic enabled ─────────────────────
+  it('loadProviders with {enabled: {anthropic: true}} returns Map of size 1', () => {
+    const loaded = loadProviders({ enabled: { anthropic: true } });
+    assert.equal(loaded.size, 1);
+    assert.ok(loaded.has('anthropic'));
+  });
+
+  it('anthropic loaded via loadProviders passes contract and has correct models', () => {
+    const loaded = loadProviders({ enabled: { anthropic: true } });
+    const p = loaded.get('anthropic');
+    const { valid, errors } = validateProvider(p);
+    assert.equal(valid, true, `Contract errors: ${errors.join('; ')}`);
+    assert.ok(p.models.includes('claude-sonnet-4-6'));
+  });
+
+});
+
+// ── Suite 7: HTTP integration tests ──────────────────────────────────────
 
 describe('HTTP integration', () => {
   let serverInstance;

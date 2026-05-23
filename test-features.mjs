@@ -3545,12 +3545,38 @@ describe('Fallback engine — observability / header annotation (D9)', () => {
 describe('Fallback engine — HTTP integration (D9)', () => {
   let server;
   let port;
+  let savedAnthropicToken;
+  let savedCodexAuthPath;
+  let suiteCodexAuthFile;
 
   before(async () => {
     __resetSpawnImpl();
     codexResetSpawnImpl();
     mistralResetSpawnImpl();
     __resetFallbackConfig();
+
+    // CRITICAL — inject suite-level fake auth tokens for anthropic + codex.
+    // Without this, on hosts that lack the real auth artifacts (CI Linux
+    // runners are the load-bearing case; they have no macOS keychain and no
+    // ~/.claude/.credentials.json), the provider plugins throw
+    // ProviderError(AUTH_MISSING) BEFORE the mock spawn function fires. The
+    // chain then stops at the first hop because AUTH_MISSING is NOT a hard
+    // trigger (per ADR 0004 § Decision § No fallback for client-side
+    // errors), so the fallback path under test never executes. Bug
+    // discovered on D9 CI 2026-05-23: 3 tests in this suite failed on
+    // Node 20 Linux while passing on macOS Node 25 because the macOS
+    // keychain provided real anthropic auth and the test never reached
+    // the fake-auth-required code path.
+    savedAnthropicToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-anthropic-token-for-d9-http-suite';
+
+    const { writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join: pathJoin } = await import('node:path');
+    suiteCodexAuthFile = pathJoin(tmpdir(), `olp-test-d9-codex-auth-${Date.now()}.json`);
+    writeFileSync(suiteCodexAuthFile, JSON.stringify({ accessToken: 'fake-codex-token-for-d9-http-suite' }), 'utf8');
+    savedCodexAuthPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = suiteCodexAuthFile;
 
     // Start test server with all 3 providers enabled
     const testProviders = loadProviders({ enabled: { anthropic: true, openai: true, mistral: true } });
@@ -3575,11 +3601,28 @@ describe('Fallback engine — HTTP integration (D9)', () => {
     });
   });
 
-  after(() => {
+  after(async () => {
     __resetFallbackConfig();
     __resetSpawnImpl();
     codexResetSpawnImpl();
     mistralResetSpawnImpl();
+
+    // Restore env vars injected by before()
+    if (savedAnthropicToken !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedAnthropicToken;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    if (savedCodexAuthPath !== undefined) {
+      process.env.OPENAI_CODEX_AUTH_PATH = savedCodexAuthPath;
+    } else {
+      delete process.env.OPENAI_CODEX_AUTH_PATH;
+    }
+    if (suiteCodexAuthFile) {
+      const { unlinkSync } = await import('node:fs');
+      try { unlinkSync(suiteCodexAuthFile); } catch { /* ignore */ }
+    }
+
     if (!server) return;
     return new Promise(r => server.close(r));
   });

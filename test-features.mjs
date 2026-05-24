@@ -4153,6 +4153,282 @@ describe('Fallback engine — HTTP integration (D9)', () => {
     }
   });
 
+  // ── D16 tests: SPAWN_FAILED partial-response salvage (ADR 0004 Amendment 1) ─
+
+  it('D16/Case-A regression guard: SPAWN_FAILED with no chunks → hard fallback fires → openai serves (2-hop)', async () => {
+    // Case A: provider exits non-zero BEFORE emitting any content.
+    // Fallback engine must still advance the chain — this is the pre-D16 behavior
+    // that must remain unchanged. Emitting zero chunks then exit-1 must still trigger
+    // the hard fallback.
+    __clearCache();
+
+    const { writeFileSync, unlinkSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join: pathJoin } = await import('node:path');
+    const tmpAuthFile = pathJoin(tmpdir(), `olp-test-d16-caseA-auth-${Date.now()}.json`);
+    writeFileSync(tmpAuthFile, JSON.stringify({ accessToken: 'fake-d16-caseA-codex-token' }), 'utf8');
+    const savedCodexAuthPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = tmpAuthFile;
+
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    // Anthropic mock: emits NO stdout, exits with code 1 → SPAWN_FAILED with chunks=[]
+    // This is Case A — hard trigger must fire, chain must advance.
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            // No stdout data emitted before close
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null); // exit 1 → SPAWN_FAILED, no usable chunks
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    // OpenAI (codex) mock: succeeds with a real response
+    codexSetSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('{"content":"D16-caseA-fallback-openai-response"}\n'));
+            proc.stdout.emit('data', Buffer.from('{"type":"stop"}\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 10,
+        },
+      });
+      assert.equal(r.status, 200, `Expected 200 from openai fallback, got ${r.status}: ${r.body.slice(0, 300)}`);
+      // Hard trigger fired → chain advanced → openai served → hops=1
+      assert.equal(r.headers['x-olp-fallback-hops'], '1', `Expected fallback-hops=1 (Case A hard trigger), got: ${r.headers['x-olp-fallback-hops']}`);
+      assert.equal(r.headers['x-olp-provider-used'], 'openai', `Expected openai served, got: ${r.headers['x-olp-provider-used']}`);
+    } finally {
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+      if (savedCodexAuthPath !== undefined) {
+        process.env.OPENAI_CODEX_AUTH_PATH = savedCodexAuthPath;
+      } else {
+        delete process.env.OPENAI_CODEX_AUTH_PATH;
+      }
+      try { unlinkSync(tmpAuthFile); } catch { /* ignore */ }
+    }
+  });
+
+  it('D16/Case-B fix: SPAWN_FAILED after N chunks → fallback does NOT fire → anthropic partial response served (2-hop)', async () => {
+    // Case B (the D16 fix): provider emits content then exits non-zero.
+    // The partial chunks are usable — fallback must NOT advance to openai.
+    // Instead, the partial response is returned with finish_reason='length'.
+    // X-OLP-Fallback-Hops must be 0 (anthropic served, openai not called).
+    __clearCache();
+
+    const { writeFileSync, unlinkSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join: pathJoin } = await import('node:path');
+    const tmpAuthFile = pathJoin(tmpdir(), `olp-test-d16-caseB-auth-${Date.now()}.json`);
+    writeFileSync(tmpAuthFile, JSON.stringify({ accessToken: 'fake-d16-caseB-codex-token' }), 'utf8');
+    const savedCodexAuthPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = tmpAuthFile;
+
+    let openaiMockCalled = false;
+
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    // Anthropic mock: emits 2 raw text chunks then exits non-zero (cleanup error).
+    // The anthropic plugin processes raw stdout as text → IR delta chunks.
+    // exit code 1 after yielding content → Case B: SPAWN_FAILED with chunks.length>0.
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            // Emit 2 content chunks as raw text (anthropic --output-format text)
+            proc.stdout.emit('data', Buffer.from('Hello '));
+            proc.stdout.emit('data', Buffer.from('world'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            // Non-zero exit AFTER emitting content → SPAWN_FAILED, chunks.length=2
+            proc.emit('close', 1, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    // OpenAI mock: should NOT be called (D16 must prevent fallback here)
+    codexSetSpawnImpl(function (_bin, _args, _opts) {
+      openaiMockCalled = true;
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('{"content":"unexpected-openai-response"}\n'));
+            proc.stdout.emit('data', Buffer.from('{"type":"stop"}\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 10,
+        },
+      });
+      // D16: anthropic partial response surfaced instead of falling back
+      assert.equal(r.status, 200, `Expected 200 with partial anthropic response, got ${r.status}: ${r.body.slice(0, 300)}`);
+      // No fallback should have fired — anthropic's partial chunks were usable
+      assert.equal(r.headers['x-olp-fallback-hops'], '0', `Expected fallback-hops=0 (no fallback, Case B), got: ${r.headers['x-olp-fallback-hops']}`);
+      assert.equal(r.headers['x-olp-provider-used'], 'anthropic', `Expected anthropic served, got: ${r.headers['x-olp-provider-used']}`);
+      // OpenAI mock must NOT have been invoked
+      assert.equal(openaiMockCalled, false, 'OpenAI mock should NOT have been called (D16 prevents fallback on Case B)');
+      // Verify finish_reason='length' (synthesized stop from D16 salvage path)
+      const body = JSON.parse(r.body);
+      assert.equal(body.choices?.[0]?.finish_reason, 'length', `Expected finish_reason='length' from D16 salvage, got: ${body.choices?.[0]?.finish_reason}`);
+      // Verify the 2 content chunks are present in the response
+      const content = body.choices?.[0]?.message?.content ?? '';
+      assert.ok(content.includes('Hello'), `Expected 'Hello' in partial content, got: '${content}'`);
+      assert.ok(content.includes('world'), `Expected 'world' in partial content, got: '${content}'`);
+    } finally {
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+      if (savedCodexAuthPath !== undefined) {
+        process.env.OPENAI_CODEX_AUTH_PATH = savedCodexAuthPath;
+      } else {
+        delete process.env.OPENAI_CODEX_AUTH_PATH;
+      }
+      try { unlinkSync(tmpAuthFile); } catch { /* ignore */ }
+    }
+  });
+
+  it('D16/Case-B single-hop: SPAWN_FAILED after 1 chunk → HTTP 200 with partial response + finish_reason=length (no fallback chain)', async () => {
+    // Case B single-hop variant: only one provider in the chain.
+    // Provider emits 1 content chunk then exits non-zero.
+    // D16 must surface the partial response (HTTP 200, not 502).
+    __clearCache();
+
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    // Anthropic mock: emits 1 raw text chunk then exits non-zero
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('Partial answer'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null); // exit 1 after content → Case B
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 10,
+        },
+      });
+      // D16: must be 200 with the partial content, not 502
+      assert.equal(r.status, 200, `Expected 200 with partial response (not 502), got ${r.status}: ${r.body.slice(0, 300)}`);
+      assert.equal(r.headers['x-olp-fallback-hops'], '0', `Expected fallback-hops=0, got: ${r.headers['x-olp-fallback-hops']}`);
+      assert.equal(r.headers['x-olp-provider-used'], 'anthropic', `Expected anthropic served, got: ${r.headers['x-olp-provider-used']}`);
+      const body = JSON.parse(r.body);
+      // finish_reason='length' indicates truncation (D16 synthesized stop)
+      assert.equal(body.choices?.[0]?.finish_reason, 'length', `Expected finish_reason='length', got: ${body.choices?.[0]?.finish_reason}`);
+      // Partial content must be present
+      const content = body.choices?.[0]?.message?.content ?? '';
+      assert.ok(content.includes('Partial answer'), `Expected 'Partial answer' in content, got: '${content}'`);
+    } finally {
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+    }
+  });
+
 });
 
 // ── Suite 14: providers.enabled config wiring ──────────────────────────────

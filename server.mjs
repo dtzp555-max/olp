@@ -368,17 +368,54 @@ async function handleChatCompletions(req, res) {
     // Collect all chunks from this provider, throwing on error chunks.
     // Error semantics: ProviderError thrown here propagates to executeWithFallback
     // which decides whether to advance the chain.
+    //
+    // D16 (ADR 0004 Amendment 1): if the generator throws ProviderError SPAWN_FAILED
+    // after yielding one or more chunks, those chunks are usable content the provider
+    // committed — dropping them and falling back to the next hop is strict waste.
+    // In that case: synthesize a stop chunk with finish_reason='length', return the
+    // partial chunks, and do NOT re-throw (fallback engine sees a success, hops=0).
+    // If chunks.length===0 on SPAWN_FAILED, re-throw as before (hard trigger fires).
+    // Any other error code always re-throws unchanged.
+    //
+    // D16 cache note: truncated responses are NOT cached (ADR 0005 § cache write
+    // conditions item 1 requires no truncation). A non-enumerable __truncated marker
+    // is set on the returned array so executeHopFn can evict the cache entry below.
     async function collectAllChunks() {
       const chunks = [];
-      for await (const irChunk of hopProviderPlugin.spawn(irReq, authContext)) {
-        chunks.push(irChunk);
-        if (irChunk.type === 'error') {
-          throw new ProviderError(
-            irChunk.error ?? 'Provider emitted error chunk',
-            'SPAWN_FAILED',
-          );
+      try {
+        for await (const irChunk of hopProviderPlugin.spawn(irReq, authContext)) {
+          // D16: check error chunks BEFORE pushing — preserves the invariant that
+          // chunks array contains only delta/stop chunks. Without this, the catch
+          // block's `chunks.length > 0` would mistake a single error chunk for
+          // "usable content streamed" (Case B) and synthesize a stop + return,
+          // sending an empty body to the client when the correct behavior is to
+          // re-throw and let the fallback engine advance the chain.
+          if (irChunk.type === 'error') {
+            throw new ProviderError(
+              irChunk.error ?? 'Provider emitted error chunk',
+              'SPAWN_FAILED',
+            );
+          }
+          chunks.push(irChunk);
+          if (irChunk.type === 'stop') break;
         }
-        if (irChunk.type === 'stop') break;
+      } catch (spawnErr) {
+        if (spawnErr instanceof ProviderError && spawnErr.code === 'SPAWN_FAILED' && chunks.length > 0) {
+          // Case B (ADR 0004 Amendment 1): provider emitted usable chunks then exited
+          // non-zero. Synthesize a truncated stop and surface the partial response.
+          chunks.push({ type: 'stop', finish_reason: 'length' });
+          logEvent('warn', 'spawn_failed_after_usable_chunks', {
+            chunks_count: chunks.length - 1, // exclude the synthesized stop
+            provider: hopProvider,
+            model: hopModel,
+          });
+          // Mark as truncated so the caller can evict this entry from cache.
+          Object.defineProperty(chunks, '__truncated', { value: true, enumerable: false });
+          return chunks;
+        }
+        // Case A (SPAWN_FAILED with no chunks) or any other error: re-throw.
+        // Fallback engine fires hard trigger and advances chain as before.
+        throw spawnErr;
       }
       return chunks;
     }
@@ -398,7 +435,21 @@ async function handleChatCompletions(req, res) {
     // D4 singleflight + D1 per-key isolation per ADR 0005.
     // Each hop has its own (provider, model) key — cross-provider contamination
     // is structurally impossible (ADR 0005 § Per-model isolation).
-    return cacheStore.getOrCompute(keyId, hopCacheKey, collectAllChunks);
+    //
+    // D16: after getOrCompute returns, check if collectAllChunks used the salvage
+    // path (chunks.__truncated===true). If so, evict the just-written cache entry
+    // to satisfy ADR 0005 § "Cache write conditions" item 1 (no truncation).
+    // D4 singleflight is preserved: getOrCompute still deduplicates concurrent
+    // requests during the spawn; the eviction only affects persistent caching.
+    const result = await cacheStore.getOrCompute(keyId, hopCacheKey, collectAllChunks);
+    if (result.__truncated) {
+      // Evict the truncated entry so future requests get a fresh spawn.
+      // ADR 0005 § "Cache write conditions" item 1: truncated responses must not
+      // persist in cache. Overwrite with ttlMs=0 so any subsequent get/peek
+      // finds the entry already-expired and deletes it.
+      await cacheStore.set(keyId, hopCacheKey, result, 0);
+    }
+    return result;
   }
 
   // ── Execute with fallback (ADR 0004) ────────────────────────────────────

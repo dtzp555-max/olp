@@ -148,6 +148,8 @@ Atomic write pattern (POSIX):
 4. `rename()` tmpfile → final path (same-filesystem atomic).
 5. Directory mode 0700, file mode 0600 enforced on every write.
 
+POSIX-strict atomic-replace also requires `fsync()` on the containing directory after the rename to guarantee survival of an OS crash mid-flush. Phase 2 deliberately omits the directory fsync: the single-process family-scale deployment model accepts a tiny window where a rename can be lost under abrupt host crash. The trade-off is documented here so a future POSIX-strict deployment knows where to add the step.
+
 Failure semantics:
 - Step 2/3/4 failure → throw; caller handles. Lifecycle commands (`olp keygen` / `olp keys revoke`) report failure to the operator and exit non-zero. Server requests do not trigger lifecycle writes (the `touchLastUsed` path is best-effort — see 6.3).
 
@@ -157,7 +159,7 @@ Per-request audit events append a single newline-terminated JSON object to `~/.o
 
 Append pattern:
 
-1. Serialize event (§ 8 schema) with trailing `\n`.
+1. Serialize event (§ 8 schema) with trailing `\n`. Serialization fires AFTER `status_code` is determined and `latency_ms` is measured (i.e., after the request handler emits the response, around `res.end()` finalization). This pinning is what makes acceptance criterion #2 testable — the 401-on-anonymous case records `status_code: 401` + `latency_ms` in the same audit event.
 2. `fs.appendFile(path, line, { mode: 0o600 })` (Node default opens with append flag).
 3. On EAGAIN / EBUSY / ENOSPC: log warn `audit_append_failed_once` + retry once (synchronous, no backoff at Phase 2 — family-scale write rate makes contention rare).
 4. On second-failure: log warn `audit_append_dropped` with the failure reason + a per-process drop counter; **do not block the request**; **do not buffer** (memory buffer is a forward path in § 13, deliberately not in Phase 2 scope).
@@ -169,6 +171,10 @@ Failure semantics:
 ### 6.3 `last_used_at` lazy update
 
 The `touchLastUsed` write goes through the same atomic-write pattern as 6.1, but is fired async after request response is dispatched. Failure logs warn `last_used_update_failed` and does NOT fail the request.
+
+### 6.3.5 No in-process validation cache (Phase 2)
+
+Token validation MUST hit the manifest on every authenticated request at Phase 2 — implementations MUST NOT introduce an in-process LRU / TTL cache of validation results. Rationale: revocation must take effect on the next request without an invalidation hop; the family-scale request rate makes per-request manifest read O(1) on the OS file-system cache. This is the contract that makes acceptance criterion #6 (post-revoke 401 within the next request) honest. A validation cache is a forward-path consideration if Phase 3+ load profile demands it; a separate ADR amendment ratifies the cache shape + invalidation contract before any cache code lands.
 
 ### 6.4 Locking (single-process Phase 2)
 
@@ -293,6 +299,8 @@ For headless / CI / containerized deployments, the env var `OLP_OWNER_TOKEN` is 
 
 Filesystem-stored owner keys (from § 9.1/9.2) continue to validate independently when `OLP_OWNER_TOKEN` is set; the env-owner is an additive credential, not a replacement.
 
+**Token-collision policy.** Hash-collision between an `OLP_OWNER_TOKEN` plaintext and a filesystem-stored key's plaintext is undefined behaviour at Phase 2 (cache namespacing would diverge silently between `__env_owner__` and the filesystem `<key-id>`, while audit attribution would split). Operators MUST NOT reuse the same plaintext token across both surfaces. A future Phase MAY add a collision-detection startup check; not in Phase 2 scope.
+
 ---
 
 ## 10. Acceptance criteria
@@ -302,7 +310,7 @@ Implementation D-days (D44+) MUST land tests covering:
 1. **Per-key cache isolation** — Two keys A and B with identical request payloads do NOT share cache. `cache_status` is `miss` for both first calls and `hit` for the second call from the SAME key only.
 2. **Anonymous prod-default off** — With `auth.allow_anonymous: false` (no override), a request without a key receives `401 auth_required`; the audit event is recorded with `key_id: "__anonymous__"` and `status_code: 401`.
 3. **Anonymous dev-mode on** — With `auth.allow_anonymous: true`, the same request succeeds with `keyId="__anonymous__"`.
-4. **Owner-vs-guest /health gating** — Owner key sees the full per-provider `providers` map in `/health`; guest key + anonymous see only `{ status, version }`.
+4. **Owner-vs-guest /health gating (with default `auth.owner_only_endpoints` config)** — Owner key sees the full per-provider `providers` map in `/health`; guest key + anonymous see only `{ status, version }`. Test rephrases if the operator's `owner_only_endpoints` config does not include `/health` (test must assert the same gating predicate the config produces, not a hardcoded trimmed payload shape).
 5. **Owner-vs-guest X-OLP-Fallback-Detail gating** — Same response payload for both owner and guest; header present for owner only.
 6. **Key revocation** — After `revoke`, subsequent requests with that token return `401 key_revoked` within the next request (no caching of validation).
 7. **Manifest atomicity** — Concurrent `revoke` + `touchLastUsed` writes do not corrupt the manifest. Test: spawn two writers racing on the same key, assert the final file parses as valid JSON and matches one of the two writers' outcomes (not a partial merge).

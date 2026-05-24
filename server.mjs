@@ -320,12 +320,26 @@ async function handleChatCompletions(req, res) {
   // real OLP API key ID here for D1 per-key isolation.
   const keyId = '__anonymous__';
 
-  // D2 bypass: if the request contains Anthropic cache_control markers,
-  // skip OLP's response cache (prompt cache lives at Anthropic's side per ADR 0005 § D2).
-  const bypassCache = hasCacheControl(ir) || extractCacheControlMarkers(body?.messages ?? []).length > 0;
+  // D2 bypass (per-hop, per ADR 0005 § D2):
+  // cache_control markers bypass OLP's response cache ONLY when the active hop
+  // provider is Anthropic. For non-Anthropic hops the markers are noop'd
+  // (openai-to-ir already strips them from the IR before provider translation,
+  // so they never reach a non-Anthropic plugin — no separate strip needed here).
+  //
+  // Pre-compute whether the raw request carries any cache_control markers at all.
+  // The per-hop decision is: markers present AND hop is Anthropic → bypass.
+  const hasCacheControlMarkers =
+    hasCacheControl(ir) || extractCacheControlMarkers(body?.messages ?? []).length > 0;
 
-  if (bypassCache) {
-    logEvent('debug', 'cache_bypass', { model: ir.model, reason: 'cache_control_markers' });
+  /**
+   * Returns true if OLP's response cache should be bypassed for the given hop.
+   * Per ADR 0005 § D2: bypass only when provider is Anthropic AND markers present.
+   *
+   * @param {string} hopProviderName — e.g. 'anthropic', 'openai', 'mistral'
+   * @returns {boolean}
+   */
+  function shouldBypassCacheForHop(hopProviderName) {
+    return hasCacheControlMarkers && hopProviderName === 'anthropic';
   }
 
   // ── executeHopFn: per-hop spawn + cache wrapper ─────────────────────────
@@ -369,7 +383,15 @@ async function handleChatCompletions(req, res) {
       return chunks;
     }
 
-    if (bypassCache) {
+    // D13: per-hop bypass evaluation (ADR 0005 § D2).
+    // Bypass only when this hop's provider is Anthropic AND markers are present.
+    const bypassCacheForThisHop = shouldBypassCacheForHop(hopProvider);
+    if (bypassCacheForThisHop) {
+      logEvent('debug', 'cache_bypass', {
+        model: hopModel,
+        provider: hopProvider,
+        reason: 'cache_control_markers',
+      });
       return collectAllChunks();
     }
 
@@ -381,15 +403,19 @@ async function handleChatCompletions(req, res) {
 
   // ── Execute with fallback (ADR 0004) ────────────────────────────────────
   // Pre-check for cache status reporting uses first hop's key (primary provider).
+  // D13: preCheckHit is gated on whether the first hop would bypass — if it would
+  // bypass (anthropic + markers), the cache is not consulted (preCheckHit=false).
+  // If the first hop is non-Anthropic (or no markers), the cache peek proceeds normally.
+  const bypassCacheForFirstHop = shouldBypassCacheForHop(chain[0].provider);
   const firstHopCacheKey = computeCacheKey(chain[0].provider, chain[0].model, ir);
-  const preCheckHit = bypassCache ? false : await cacheStore.peek(keyId, firstHopCacheKey);
+  const preCheckHit = bypassCacheForFirstHop ? false : await cacheStore.peek(keyId, firstHopCacheKey);
 
   // ── P1.2: Real SSE streaming path (single-hop cache-miss) ──────────────
   // ADR 0003 entry adapter pattern: for await irChunk → res.write(irChunkToOpenAISSE).
   // Condition: streaming + single-hop + no bypass + no pre-check cache hit.
   //   - stream===true  → caller wants SSE
   //   - chain.length===1  → no fallback needed; first-chunk rule allows streaming
-  //   - !bypassCache + !preCheckHit → genuine cache miss (not hit/bypass)
+  //   - !bypassCacheForFirstHop + !preCheckHit → genuine cache miss (not hit/bypass)
   //
   // If any chunk has been written (firstChunkEmitted), fallback is impossible
   // per ADR 0004 § Fallback safety first-chunk rule. On error after first chunk:
@@ -398,7 +424,7 @@ async function handleChatCompletions(req, res) {
   //
   // On success: write chunks to res AND cache so subsequent identical requests
   // hit the burst-replay path.
-  if (ir.stream && chain.length === 1 && !bypassCache && !preCheckHit) {
+  if (ir.stream && chain.length === 1 && !bypassCacheForFirstHop && !preCheckHit) {
     const streamProvider = chain[0].provider;
     const streamModel = chain[0].model;
     const streamCacheKey = computeCacheKey(streamProvider, streamModel, ir);
@@ -561,12 +587,16 @@ async function handleChatCompletions(req, res) {
   // ── Success: emit response ─────────────────────────────────────────────
   // Per ADR 0004 § Observability headers: X-OLP-Fallback-Hops reflects the
   // chain index of the serving hop; 0 = primary served, 1 = first fallback, etc.
-  const cacheStatus = bypassCache ? 'bypass' : (preCheckHit && fallbackHops === 0 ? 'hit' : 'miss');
+  // D13: bypass status is per the SERVING hop's provider (providerUsed), not a
+  // global flag. If the serving provider was Anthropic and markers were present,
+  // the cache was bypassed; otherwise it was a hit (preCheckHit) or miss.
+  const bypassCacheForServingHop = shouldBypassCacheForHop(providerUsed);
+  const cacheStatus = bypassCacheForServingHop ? 'bypass' : (preCheckHit && fallbackHops === 0 ? 'hit' : 'miss');
   const headers = olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus, fallbackHops });
 
   if (ir.stream) {
     // Streaming response path: burst replay from buffered chunks.
-    // Reaches here only when: bypassCache=true OR preCheckHit=true OR chain.length>1.
+    // Reaches here only when: bypassCacheForFirstHop=true OR preCheckHit=true OR chain.length>1.
     // (Single-hop cache-miss streaming is handled by the real-streaming path above.)
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',

@@ -1613,6 +1613,224 @@ describe('Cache layer — HTTP integration (Suite 9 cont.)', () => {
   });
 });
 
+// ── Suite 9d: D13 cache_control per-hop bypass correctness ───────────────
+//
+// D13 (ADR 0005 § D2): cache_control markers bypass OLP's response cache ONLY
+// when the active hop provider is Anthropic. For non-Anthropic providers the
+// markers are noop'd — the hop IS cached normally.
+//
+// Tests:
+//   Test 31: cache_control + non-Anthropic provider (codex) → X-OLP-Cache: miss
+//            (NOT bypass — fix validates the defect is corrected)
+//   Test 32: cache_control + Anthropic provider → X-OLP-Cache: bypass
+//            (existing behaviour preserved — regression guard)
+//   Test 33: cache_control + 2-hop chain (anthropic→openai):
+//            anthropic hop bypass fires; if anthropic fails, openai hop is NOT bypassed
+
+describe('D13 — cache_control per-hop bypass correctness (Suite 9d)', () => {
+  let serverD13;
+  let portD13;
+  let savedAnthropicTokenD13;
+  let savedCodexAuthPathD13;
+  let suiteCodexAuthFileD13;
+
+  before(async () => {
+    // Inject fake auth for both providers so auth checks pass without real tokens.
+    savedAnthropicTokenD13 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-anthropic-token-for-d13-suite';
+
+    const { writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join: pathJoin } = await import('node:path');
+    suiteCodexAuthFileD13 = pathJoin(tmpdir(), `olp-test-d13-codex-auth-${Date.now()}.json`);
+    writeFileSync(suiteCodexAuthFileD13, JSON.stringify({ accessToken: 'fake-codex-token-for-d13-suite' }), 'utf8');
+    savedCodexAuthPathD13 = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = suiteCodexAuthFileD13;
+
+    // Wire both anthropic and openai providers into the shared loadedProviders map.
+    const testProviders = loadProviders({ enabled: { anthropic: true, openai: true } });
+    const { loadedProviders: lp, cacheStore: cs } = await import('./server.mjs');
+    for (const [name, p] of testProviders) {
+      lp.set(name, p);
+    }
+    cs.clear();
+
+    serverD13 = createOlpServer();
+    portD13 = 21456 + Math.floor(Math.random() * 500);
+    await new Promise((resolve, reject) => {
+      serverD13.listen(portD13, '127.0.0.1', resolve);
+      serverD13.once('error', (e) => {
+        if (e.code === 'EADDRINUSE') {
+          portD13++;
+          serverD13.listen(portD13, '127.0.0.1', resolve);
+          serverD13.once('error', reject);
+        } else reject(e);
+      });
+    });
+  });
+
+  after(async () => {
+    __resetSpawnImpl();
+    codexResetSpawnImpl();
+
+    if (savedAnthropicTokenD13 !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedAnthropicTokenD13;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    if (savedCodexAuthPathD13 !== undefined) {
+      process.env.OPENAI_CODEX_AUTH_PATH = savedCodexAuthPathD13;
+    } else {
+      delete process.env.OPENAI_CODEX_AUTH_PATH;
+    }
+    if (suiteCodexAuthFileD13) {
+      const { unlinkSync } = await import('node:fs');
+      try { unlinkSync(suiteCodexAuthFileD13); } catch { /* ignore */ }
+    }
+
+    if (!serverD13) return;
+    return new Promise(r => serverD13.close(r));
+  });
+
+  // ── Test 31: cache_control + non-Anthropic provider → NOT bypass ──────
+  // D13 fix: a request to codex (openai) that carries cache_control markers
+  // must use OLP's response cache normally. Before D13, it incorrectly bypassed.
+  it('D13: cache_control + openai provider → X-OLP-Cache: miss (NOT bypass)', async () => {
+    const testMsg = `d13-codex-no-bypass-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    // Inject a codex mock that returns a valid NDJSON stop event
+    codexSetSpawnImpl(makeMockCodexSpawn([
+      JSON.stringify({ content: `codex-response-${testMsg}` }),
+      JSON.stringify({ type: 'stop' }),
+    ]));
+
+    const r = await fetch({
+      port: portD13,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      body: {
+        model: 'gpt-5.5',
+        messages: [
+          {
+            role: 'user',
+            content: testMsg,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+    });
+
+    assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+    // Key assertion: non-Anthropic hop with cache_control must be 'miss', NOT 'bypass'
+    assert.equal(
+      r.headers['x-olp-cache'],
+      'miss',
+      `D13: openai hop with cache_control should be cache miss (not bypass), got: ${r.headers['x-olp-cache']}`,
+    );
+    assert.equal(r.headers['x-olp-provider-used'], 'openai',
+      `Expected openai provider, got: ${r.headers['x-olp-provider-used']}`);
+  });
+
+  // ── Test 32: cache_control + Anthropic provider → bypass (regression guard)
+  // Verifies that the D13 per-hop logic still correctly bypasses for Anthropic.
+  it('D13: cache_control + anthropic provider → X-OLP-Cache: bypass (preserved)', async () => {
+    const testMsg = `d13-anthropic-bypass-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    __setSpawnImpl(makeMockSpawn([`anthropic-bypass-response-${testMsg}`]));
+
+    const r = await fetch({
+      port: portD13,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      body: {
+        model: 'claude-haiku-4-5',
+        messages: [
+          {
+            role: 'user',
+            content: testMsg,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+    });
+
+    assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+    assert.equal(
+      r.headers['x-olp-cache'],
+      'bypass',
+      `D13: anthropic hop with cache_control should be bypass, got: ${r.headers['x-olp-cache']}`,
+    );
+    assert.equal(r.headers['x-olp-provider-used'], 'anthropic',
+      `Expected anthropic provider, got: ${r.headers['x-olp-provider-used']}`);
+  });
+
+  // ── Test 33: cache_control + 2-hop chain anthropic→openai ────────────
+  // When anthropic (hop 0) fails and falls over to openai (hop 1):
+  // the openai hop must NOT bypass cache even though cache_control markers
+  // were present in the original request.
+  it('D13: cache_control + fallback anthropic→openai → openai hop is NOT bypass', async () => {
+    const testMsg = `d13-fallback-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    // Wire a 2-hop fallback chain: anthropic → openai for the claude-haiku-4-5 model
+    const { __setFallbackConfig } = await import('./server.mjs');
+    __setFallbackConfig({
+      chains: {
+        'claude-haiku-4-5': [
+          { provider: 'anthropic', model: 'claude-haiku-4-5' },
+          { provider: 'openai',    model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    try {
+      // Anthropic spawn always fails with a hard trigger → chain advances to openai
+      __setSpawnImpl(makeMockSpawn([], 1)); // exit code 1 = SPAWN_FAILED hard trigger
+      // Codex/openai spawn succeeds
+      codexSetSpawnImpl(makeMockCodexSpawn([
+        JSON.stringify({ content: `fallback-codex-response-${testMsg}` }),
+        JSON.stringify({ type: 'stop' }),
+      ]));
+
+      const r = await fetch({
+        port: portD13,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-haiku-4-5',
+          messages: [
+            {
+              role: 'user',
+              content: testMsg,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        },
+      });
+
+      assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+      // The serving provider is openai (fallback hop 1)
+      assert.equal(r.headers['x-olp-provider-used'], 'openai',
+        `Expected openai as fallback provider, got: ${r.headers['x-olp-provider-used']}`);
+      // D13: openai serving hop must NOT be bypass even though cache_control was present
+      assert.notEqual(
+        r.headers['x-olp-cache'],
+        'bypass',
+        `D13: openai fallback hop with cache_control must NOT be bypass, got: ${r.headers['x-olp-cache']}`,
+      );
+      // It should be 'miss' (first time this openai key is seen)
+      assert.equal(
+        r.headers['x-olp-cache'],
+        'miss',
+        `D13: openai fallback hop should be cache miss, got: ${r.headers['x-olp-cache']}`,
+      );
+    } finally {
+      const { __resetFallbackConfig } = await import('./server.mjs');
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+    }
+  });
+});
+
 // ── Suite 11: Codex plugin (D6) ──────────────────────────────────────────
 //
 // All tests are UNIT tests. No real `codex` binary is invoked.

@@ -2,7 +2,7 @@
 
 A personal- and family-scale multi-provider LLM proxy. One HTTP endpoint, many subscriptions behind it, automatic routing, automatic fallback, content-addressed caching — so your IDEs and family clients keep working as long as *any* of your subscriptions has quota left.
 
-> **Status:** v0.1 — bootstrap. Most of this README is a skeleton; sections marked _placeholder_ land alongside the relevant phase of work (see [phase plan](#phase-plan)).
+> **Status:** v0.1.1 shipped (2026-05-25) — Phase 1 multi-provider proxy core + cleanup. Phase 2 (multi-key auth, `lib/keys.mjs`) is currently in progress per ADR 0007. Sections marked _placeholder_ land alongside the relevant phase of work (see [phase plan](#phase-plan)).
 
 ---
 
@@ -165,9 +165,9 @@ If a fallback chain is exhausted, `X-OLP-Fallback-Exhausted` lists the tried pro
 
 ---
 
-## Implementation status (as of 2026-05-24)
+## Implementation status (as of 2026-05-25)
 
-Phase 1 is in progress. This table reflects what is currently shipped vs. what is designed for later phases.
+Phase 1 is closed at v0.1.1 (multi-provider proxy core + pre-Phase-2 cleanup). Phase 2 (multi-key auth, `lib/keys.mjs`) is in progress per ADR 0007. This table reflects what is currently shipped vs. what is designed for later phases.
 
 | File / artifact | Status | Notes |
 |---|---|---|
@@ -182,7 +182,7 @@ Phase 1 is in progress. This table reflects what is currently shipped vs. what i
 | Soft trigger data path (`quotaStatus()` polling) | 📋 Planned (v1.x) | Evaluation logic shipped + tested; data ingestion deferred per ADR 0004 Amendment 2 |
 | `models-registry.json` | ✅ Shipped | SPOT for `(provider, model)` metadata |
 | `test-features.mjs` | ✅ Shipped | Comprehensive test suite covering IR, cache, fallback, and integration paths (CI: `test.yml`) |
-| `lib/keys.mjs` | 📋 Planned (Phase 2) | Multi-key auth, per-key namespacing, audit log |
+| `lib/keys.mjs` | 📋 Phase 2 active | Multi-key auth, per-key namespacing, audit log. ADR 0007 drafting at D43-B; implementation D-days to follow. |
 | `dashboard.html` | 📋 Planned (Phase 6) | Owner-only multi-provider dashboard |
 | `docs/provider-caveats.md` | 📋 Planned (Phase 3+) | Lossy-translation reference; for now documented inline in each plugin header |
 | `docs/openai-spec-pin.md` | ✅ Shipped (D30) | OpenAI spec snapshot for annual audit; v0.1 baseline pinned 2026-05-24 |
@@ -196,7 +196,7 @@ Behaviors that work correctly at personal/family scale but have ratified follow-
 
 - **Streaming-path singleflight not implemented.** The cache layer's D4 singleflight (one spawn per identical concurrent request) is fully wired on the buffered path but NOT on the streaming path. N concurrent identical streaming requests at v0.1 will each spawn their own CLI process. Design ratified in [ADR 0005 Amendment 8](./docs/adr/0005-cache-cross-provider.md); implementation tracked via [issue #16](https://github.com/dtzp555-max/olp/issues/16) and [v1.x roadmap #1](./docs/v1x-roadmap.md). At family scale this is observably fine — every caller still receives the correct response; the cost is N CLI processes instead of one.
 - **Soft triggers configured but inert.** `routing.soft_triggers` in `~/.olp/config.json` is honored by the engine's evaluation logic but `quotaStatus()` polling is not wired (ADR 0004 Amendment 2). A startup warning fires if the field is non-empty so the inert state is visible.
-- **Multi-key auth not yet implemented.** All requests today share the cache namespace `__anonymous__`. The cache data model is keyed by `keyId` and ready to accept real identities when `lib/keys.mjs` lands. Tracked in [v1.x roadmap #2](./docs/v1x-roadmap.md).
+- **Multi-key auth not yet implemented.** All requests today share the cache namespace `__anonymous__`. The cache data model is keyed by `keyId` and ready to accept real identities when `lib/keys.mjs` lands. Phase 2 active: ADR 0007 drafting at D43-B, implementation D-days to follow. Tracked in [v1.x roadmap #2](./docs/v1x-roadmap.md).
 - **Provider-level `cacheKeyFields` mask not implemented.** Cache keys include every IR field including ones individual plugins drop at spawn (e.g., Anthropic plugin drops `temperature`). Spurious cache misses possible (extra spawn cost; never spurious hits). Conservative posture documented in [ADR 0005 Amendment 7](./docs/adr/0005-cache-cross-provider.md). Tracked in [v1.x roadmap #5](./docs/v1x-roadmap.md).
 
 ---
@@ -220,17 +220,16 @@ Read the ADRs in `docs/adr/` in order before proposing structural changes.
 
 OLP lands in phases. Each phase has its own PR series and Iron-Rule-10 reviewer; this README's placeholders are filled per-phase via the [`release_kit`](./CLAUDE.md) overlay.
 
-- Phase 0 — Repo bootstrap, `ALIGNMENT.md`, founding ADRs, CI workflows, PR template. **(current)**
-- Phase 1 — `server.mjs` skeleton, IR, Anthropic plugin, cache D1+D4. Port from OCP.
-- Phase 2 — OpenAI Codex plugin.
-- Phase 3 — Mistral Vibe plugin.
-- Phase 4 — Fallback engine + routing chains config + quota poll worker.
-- Phase 5 — Cache cross-provider hardening (D2+D3).
-- Phase 6 — Dashboard + observability (`/v0/management/quota`).
-- Phase 7 — Release v0.1, OCP enters maintenance.
-- Phase 8+ — Optional Grok / Kimi / tier-2 plugins; provider-native protocol endpoints; deterministic triggers.
+The original v0.1 spec (in `~/.cc-rules/memory/projects/olp_v0_1_spec.md` on the maintainer's workstations) planned one provider plugin per phase. The actual Phase 1 execution bundled the three Tier-D provider plugins + cache layer + fallback engine into a single shipped milestone (v0.1.0) followed by a cleanup batch (v0.1.1). The phase numbering below reflects what was actually shipped, not the original per-plugin partition.
 
-Full spec (decision rationale, open questions, risks): `~/.cc-rules/memory/projects/olp_v0_1_spec.md` on the maintainer's workstations.
+- **Phase 0** — Repo bootstrap, `ALIGNMENT.md`, founding ADRs, CI workflows, PR template. ✅ Shipped (2026-05-23).
+- **Phase 1** — Multi-provider proxy core: `server.mjs`, IR, three Tier-D provider plugins (Anthropic / OpenAI Codex / Mistral Vibe), cache (D1+D4) + cleanup (D2 bypass / D3 chunked replay / D23 size cap), fallback engine with first-chunk safety + hard triggers + per-hop log observability, IR↔OpenAI translation under Rule 2(b). ✅ Shipped — v0.1.0 (2026-05-24) + v0.1.1 cleanup (2026-05-25, D35–D42).
+- **Phase 2** — Multi-key auth (`lib/keys.mjs`) per ADR 0007: opaque OLP API keys, per-key cache namespacing (the data model already supports this — only the `keyId` source is missing), owner-vs-guest tier for header gating, audit ndjson, owner-only gating for `/health` + `X-OLP-Fallback-Detail` (D40 follow-up). **(current — ADR drafting at D43-B)**.
+- **Phase 3** — Dashboard (`dashboard.html`) + audit query layer (deferred from Phase 2). Owner-only multi-provider quota panels, fallback rate, cache hit rate; localhost-bound by default.
+- **Phase 4+** — v1.x roadmap items as triggered. Full deferred-work tracker: [`docs/v1x-roadmap.md`](./docs/v1x-roadmap.md). Includes streaming-path singleflight ([issue #16](https://github.com/dtzp555-max/olp/issues/16) + ADR 0005 Amendment 8 design ratified), soft-trigger reactivation (ADR 0004 Amendment 2), `/health` activeSpawns integration, provider-level `cacheKeyFields` mask, streaming-path SPAWN_FAILED salvage.
+- **Phase N (opt-in)** — Tier-2 / Tier-C provider plugins (Grok / Kimi / MiniMax / GLM / Qwen) per [ADR 0006](./docs/adr/0006-provider-inclusion.md); provider-native protocol endpoints; deterministic triggers. Triggered by tier-2 demand, not on the bootstrap path.
+
+Full spec (decision rationale, open questions, risks): `~/.cc-rules/memory/projects/olp_v0_1_spec.md` on the maintainer's workstations. Phase 2 kickoff handoff: `~/.cc-rules/memory/handoffs/2026-05-25-phase-2-kickoff.md`.
 
 ---
 

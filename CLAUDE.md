@@ -135,7 +135,7 @@ release_kit:
     # This overlay is the authoritative source. If Iron Rule 5 appears to be silently
     # violated (no version bump after many D-day pushes), check this section first
     # before filing a compliance finding.
-    current_phase: Phase 1
-    current_pre_release_identifier: "0.1.0-bootstrap"
+    current_phase: Phase 2
+    current_pre_release_identifier: "0.2.0-phase2"
     phase_close_trigger: explicit maintainer action (not automated)
 ```

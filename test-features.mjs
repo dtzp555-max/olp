@@ -5840,6 +5840,270 @@ describe('Streaming cache-miss real-time (Suite 15)', () => {
 
 });
 
+// ── D35 batch: issues #4 / #9 / #10 / #11 / #12 ─────────────────────────────
+//
+// #4 — Uniform X-OLP-* headers on in-handler error paths (audit confirms D32 complete)
+// #9 — Zero-chunk empty stream → writeHead fires with text/event-stream + X-OLP-* headers
+// #10 — Post-first-chunk error emits truncation marker (finish_reason:'length') + [DONE]
+// #11 — validateIRRequest irVersion enforcement
+// #12 — alignment.yml scripts/** path removed (CI only, no test needed)
+//
+// Authority: ADR 0004 § Observability headers; ADR 0003 IR contract
+
+// ── D35-#11 unit tests (no server needed) ────────────────────────────────────
+
+describe('D35 #11 — validateIRRequest irVersion enforcement', () => {
+
+  it('#11a: undefined irVersion is accepted (omitted field)', () => {
+    const ir = makeIR();
+    delete ir.irVersion;
+    const r = validateIRRequest(ir);
+    assert.equal(r.valid, true, `Expected valid when irVersion is absent, got errors: ${r.errors.join('; ')}`);
+  });
+
+  it("#11b: irVersion '1.0' is accepted (correct version)", () => {
+    const r = validateIRRequest(makeIR({ irVersion: '1.0' }));
+    assert.equal(r.valid, true, `Expected valid for irVersion '1.0'`);
+  });
+
+  it("#11c: irVersion '2.0' is rejected (wrong version string)", () => {
+    const r = validateIRRequest(makeIR({ irVersion: '2.0' }));
+    assert.equal(r.valid, false, "Expected invalid for irVersion '2.0'");
+    assert.ok(
+      r.errors.some(e => e.includes('irVersion')),
+      `Expected an irVersion error, got: ${r.errors.join('; ')}`
+    );
+  });
+
+  it('#11d: irVersion 1.0 (number, not string) is rejected', () => {
+    const r = validateIRRequest(makeIR({ irVersion: 1.0 }));
+    assert.equal(r.valid, false, 'Expected invalid for irVersion as number 1.0');
+    assert.ok(
+      r.errors.some(e => e.includes('irVersion')),
+      `Expected an irVersion error, got: ${r.errors.join('; ')}`
+    );
+  });
+
+});
+
+// ── D35-#4/#9/#10 integration tests ──────────────────────────────────────────
+
+describe('D35 #4/#9/#10 — Streaming error-path header + truncation-marker fixes', () => {
+  let serverD35;
+  let portD35;
+  let savedTokenD35;
+
+  before(async () => {
+    savedTokenD35 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-d35';
+    __setProvidersEnabled({ anthropic: true });
+
+    const { createOlpServer: sD35, __clearCache: ccD35 } = await import('./server.mjs');
+    ccD35();
+    serverD35 = sD35();
+    await new Promise((resolve, reject) => {
+      serverD35.listen(0, '127.0.0.1', resolve);
+      serverD35.once('error', reject);
+    });
+    portD35 = serverD35.address().port;
+  });
+
+  after(async () => {
+    __resetProvidersEnabled();
+    __resetSpawnImpl();
+    if (savedTokenD35 !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedTokenD35;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    if (!serverD35) return;
+    return new Promise(r => serverD35.close(r));
+  });
+
+  it('#4-audit: 503 no_enabled_provider carries all 5 X-OLP-* headers (D32 already correct)', async () => {
+    // Verifies that the 503 path (no chain built) emits the full 5-header set
+    // via olpErrorHeaders — confirming D32 coverage. D35 audit found D32 complete;
+    // this test pins the invariant.
+    __setProvidersEnabled({});
+    const { createOlpServer: s4, __clearCache: cc4 } = await import('./server.mjs');
+    cc4();
+    const tmpServer = s4();
+    await new Promise((resolve, reject) => {
+      tmpServer.listen(0, '127.0.0.1', resolve);
+      tmpServer.once('error', reject);
+    });
+    const tmpPort = tmpServer.address().port;
+    try {
+      const r = await fetch({
+        port: tmpPort,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'test' }],
+          stream: false,
+        },
+      });
+      assert.equal(r.status, 503, `Expected 503, got ${r.status}`);
+      assert.ok(r.headers['x-olp-provider-used'], 'Must have X-OLP-Provider-Used');
+      assert.ok(r.headers['x-olp-model-used'], 'Must have X-OLP-Model-Used');
+      assert.ok(r.headers['x-olp-fallback-hops'] !== undefined, 'Must have X-OLP-Fallback-Hops');
+      assert.ok(r.headers['x-olp-cache'], 'Must have X-OLP-Cache');
+      assert.ok(r.headers['x-olp-latency-ms'] !== undefined, 'Must have X-OLP-Latency-Ms');
+      assert.equal(r.headers['x-olp-provider-used'], 'none', 'X-OLP-Provider-Used must be "none"');
+      assert.equal(r.headers['x-olp-model-used'], 'claude-sonnet-4-6', 'X-OLP-Model-Used must be the requested model');
+    } finally {
+      __setProvidersEnabled({ anthropic: true });
+      await new Promise(r => tmpServer.close(r));
+    }
+  });
+
+  it('#9: zero-chunk clean exit → 200 + text/event-stream + all 5 X-OLP-* headers + [DONE]', async () => {
+    // Provider spawn yields zero chunks and exits cleanly (empty generator).
+    // Before D35 fix: writeHead never fired → Node auto-emitted 200 with default
+    // Content-Type + no X-OLP-* headers.
+    // After D35 fix: writeHead fires before SSE_DONE with text/event-stream + all 5 headers.
+    const { loadedProviders: lpD35_9, __clearCache: ccD35_9 } = await import('./server.mjs');
+    const savedProvider = lpD35_9.get('anthropic');
+    const emptyProvider = {
+      ...savedProvider,
+      spawn: async function* () {
+        // yields nothing — clean generator exit
+      },
+    };
+    lpD35_9.set('anthropic', emptyProvider);
+    ccD35_9();
+
+    try {
+      const r = await fetch({
+        port: portD35,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'empty-stream-test' }],
+          stream: true,
+        },
+      });
+
+      assert.equal(r.status, 200, `Expected 200, got ${r.status}`);
+
+      // Must have text/event-stream Content-Type
+      assert.ok(
+        (r.headers['content-type'] ?? '').includes('text/event-stream'),
+        `Expected text/event-stream, got: ${r.headers['content-type']}`
+      );
+
+      // Must carry all 5 X-OLP-* headers
+      assert.ok(r.headers['x-olp-provider-used'], 'Must have X-OLP-Provider-Used');
+      assert.ok(r.headers['x-olp-model-used'], 'Must have X-OLP-Model-Used');
+      assert.ok(r.headers['x-olp-fallback-hops'] !== undefined, 'Must have X-OLP-Fallback-Hops');
+      assert.ok(r.headers['x-olp-cache'], 'Must have X-OLP-Cache');
+      assert.ok(r.headers['x-olp-latency-ms'] !== undefined, 'Must have X-OLP-Latency-Ms');
+
+      // Body must contain [DONE] terminator
+      assert.ok(r.body.includes('[DONE]'), `Expected [DONE] in body, got: ${r.body.slice(0, 200)}`);
+    } finally {
+      if (savedProvider !== undefined) {
+        lpD35_9.set('anthropic', savedProvider);
+      } else {
+        lpD35_9.delete('anthropic');
+      }
+    }
+  });
+
+  it('#10: post-first-chunk throw → truncation marker (finish_reason:length) + [DONE] in response', async () => {
+    // Provider spawn yields 1 delta chunk then throws.
+    // Before D35 fix: catch block called res.end() silently — no [DONE], no truncation marker.
+    // After D35 fix: emits {type:'stop', finish_reason:'length'} SSE chunk + [DONE] before res.end().
+    const { loadedProviders: lpD35_10, __clearCache: ccD35_10 } = await import('./server.mjs');
+    const savedProvider = lpD35_10.get('anthropic');
+    const oneChunkThenThrow = {
+      ...savedProvider,
+      spawn: async function* () {
+        yield { type: 'delta', role: 'assistant', content: 'partial-content' };
+        throw new Error('post-first-chunk provider error');
+      },
+    };
+    lpD35_10.set('anthropic', oneChunkThenThrow);
+    ccD35_10();
+
+    try {
+      const r = await fetch({
+        port: portD35,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'post-chunk-error-test' }],
+          stream: true,
+        },
+      });
+
+      // Status must be 200 (headers already sent with first chunk)
+      assert.equal(r.status, 200, `Expected 200 (headers sent at first chunk), got ${r.status}`);
+
+      // Body must contain the [DONE] terminator
+      assert.ok(r.body.includes('[DONE]'), `Expected [DONE] in body, got: ${r.body.slice(0, 400)}`);
+
+      // Body must contain the finish_reason:'length' truncation marker
+      assert.ok(
+        r.body.includes('"length"'),
+        `Expected finish_reason:"length" truncation marker in body, got: ${r.body.slice(0, 400)}`
+      );
+    } finally {
+      if (savedProvider !== undefined) {
+        lpD35_10.set('anthropic', savedProvider);
+      } else {
+        lpD35_10.delete('anthropic');
+      }
+    }
+  });
+
+  it('#10b: post-first-chunk error-chunk → truncation marker + [DONE] (error-chunk variant)', async () => {
+    // Provider spawn yields 1 delta then yields an error irChunk (type='error').
+    // The error-chunk branch inside the for-await loop mirrors the catch-block fix.
+    const { loadedProviders: lpD35_10b, __clearCache: ccD35_10b } = await import('./server.mjs');
+    const savedProvider = lpD35_10b.get('anthropic');
+    const oneChunkThenErrorChunk = {
+      ...savedProvider,
+      spawn: async function* () {
+        yield { type: 'delta', role: 'assistant', content: 'partial-content-b' };
+        yield { type: 'error', error: 'provider emitted error chunk after first' };
+      },
+    };
+    lpD35_10b.set('anthropic', oneChunkThenErrorChunk);
+    ccD35_10b();
+
+    try {
+      const r = await fetch({
+        port: portD35,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'error-chunk-after-first-test' }],
+          stream: true,
+        },
+      });
+
+      assert.equal(r.status, 200, `Expected 200, got ${r.status}`);
+      assert.ok(r.body.includes('[DONE]'), `Expected [DONE] in body, got: ${r.body.slice(0, 400)}`);
+      assert.ok(
+        r.body.includes('"length"'),
+        `Expected finish_reason:"length" in body, got: ${r.body.slice(0, 400)}`
+      );
+    } finally {
+      if (savedProvider !== undefined) {
+        lpD35_10b.set('anthropic', savedProvider);
+      } else {
+        lpD35_10b.delete('anthropic');
+      }
+    }
+  });
+
+});
+
 // ── Suite 17: D18 — /v1/models population + X-OLP-* headers on errors ────────
 //
 // Finding 10: /v1/models returned empty data regardless of loaded providers.

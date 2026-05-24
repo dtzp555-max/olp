@@ -637,12 +637,16 @@ async function handleChatCompletions(req, res) {
         if (irChunk.type === 'error') {
           // Error chunk from provider
           if (firstChunkEmitted) {
-            // Past first-chunk boundary — can't fallback; truncate stream.
+            // Past first-chunk boundary — can't fallback; emit truncation marker + [DONE]
+            // so clients can detect the incomplete response in-band (aligns D26 F19
+            // stop-less exhaustion behaviour and the catch-block fix in D35 #10).
             logEvent('warn', 'streaming_error_after_first_chunk', {
               provider: streamProvider,
               model: streamModel,
               error: irChunk.error,
             });
+            res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
+            res.write(SSE_DONE);
             res.end();
             return;
           }
@@ -701,6 +705,23 @@ async function handleChatCompletions(req, res) {
         const truncMarker = { type: 'stop', finish_reason: 'length' };
         res.write(irChunkToOpenAISSE(truncMarker, requestId, ir.model));
       }
+
+      // D35 #9: Zero-chunk empty-stream path — writeHead is still deferred
+      // (firstChunkEmitted===false) when the generator yields no chunks at all and
+      // exits cleanly. Without an explicit writeHead Node auto-emits 200 with the
+      // default Content-Type and none of the X-OLP-* headers.
+      // A provider that yielded nothing still constitutes an attempted call, so we
+      // emit the full olpHeaders (provider WAS attempted, just yielded zero chunks).
+      if (!res.headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+          ...streamHeaders,
+        });
+      }
+
       res.write(SSE_DONE);
       res.end();
       // Loop exhausted without stop chunk = truncation. The stop-chunk completion
@@ -716,12 +737,17 @@ async function handleChatCompletions(req, res) {
       }
     } catch (e) {
       if (firstChunkEmitted) {
-        // Past first-chunk boundary — truncate silently.
+        // Past first-chunk boundary — can't fallback; emit truncation marker + [DONE]
+        // so clients can detect the incomplete response in-band (aligns with D26 F19
+        // stop-less exhaustion behaviour). ADR 0004 § Fallback safety: no fallback
+        // after first-chunk boundary; truncation is the correct recovery.
         logEvent('warn', 'streaming_error_after_first_chunk', {
           provider: streamProvider,
           model: streamModel,
           error: e.message,
         });
+        res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
+        res.write(SSE_DONE);
         res.end();
       } else {
         // No bytes written — surface a clean JSON error.

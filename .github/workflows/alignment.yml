@@ -5,7 +5,6 @@ on:
     paths:
       - 'server.mjs'
       - 'lib/**'
-      - 'scripts/**'
       - 'models-registry.json'
       - '.github/workflows/alignment.yml'
   push:
@@ -13,7 +12,6 @@ on:
     paths:
       - 'server.mjs'
       - 'lib/**'
-      - 'scripts/**'
       - 'models-registry.json'
       - '.github/workflows/alignment.yml'
 

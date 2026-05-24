@@ -5678,4 +5678,113 @@ describe('Spawn timeout (Suite 16)', () => {
     }
   });
 
+
+  it('16e: spawn-timeout fires SPAWN_TIMEOUT even when timer races with queued chunks (D24 race fix)', async () => {
+    // Exercises the race fixed in D24 (cold-audit round-2 F4).
+    //
+    // Race path modelled deterministically:
+    //   1. Mock stdin.end() schedules data1 + data2 + 'close' via setImmediate
+    //      (deferred so event handlers registered in the plugin body are ready).
+    //   2. Timer is 10ms. Drain loop awaits empty queue. setImmediate fires:
+    //      push(data1) wakes the drain loop (rejectNext was set, now cleared),
+    //      push(data2) and push(close) queue up. Drain processes data1, yields it.
+    //      Generator suspends at yield with rejectNext===null.
+    //   3. Consumer (gen.next() resolved) waits 25ms (> 10ms timer).
+    //      Timer fires: spawnTimedOut=true, rejectNext===null → rejectNext branch
+    //      SKIPPED. Race condition reproduced.
+    //   4. Consumer resumes → drain loop processes data2 then 'close' → breaks.
+    //      Post-loop: spawnTimedOut=true.
+    //      Pre-D24: generator returns normally (truncated, silently cacheable).
+    //      Post-D24: unconditional `if (spawnTimedOut) throw` → SPAWN_TIMEOUT.
+    //
+    // The timer starts inside the generator body (not at gen-creation time),
+    // so it only ticks after the first gen.next() call.
+
+    const savedTimeout = anthropic.hints.maxSpawnTimeMs;
+    anthropic.hints.maxSpawnTimeMs = 10; // fires during the 25ms consumer pause
+
+    const savedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-16e';
+
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          // Emit data + close via setImmediate so the event handlers (registered
+          // AFTER stdin.end() in the plugin body) are already attached when
+          // these events fire. All three items land in the same setImmediate
+          // callback, so they're all in chunks[] before the drain loop resumes.
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('partial-chunk-1'));
+            proc.stdout.emit('data', Buffer.from('partial-chunk-2'));
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null); // exitCode=0, done=true
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = (_sig) => { /* already closed */ };
+      return proc;
+    });
+
+    try {
+      const irReq = makeIR({ model: 'claude-sonnet-4-6', stream: false });
+      const gen = anthropic.spawn(irReq, { accessToken: 'fake-16e' });
+
+      // Pull exactly one chunk. Sequence:
+      //   - Generator body starts: spawnImpl(), stdin.end() (schedules setImmediate)
+      //   - Timer armed (10ms)
+      //   - Drain loop: chunks=[], done=false → enters await (rejectNext set)
+      //   - setImmediate fires: push(data1), push(data2), close queued, done=true
+      //   - push(data1) calls resolveNext() → drain resumes
+      //   - Drain processes data1 → yield → generator suspends. rejectNext=null.
+      //   - gen.next() promise resolves with the first chunk.
+      let firstResult;
+      try {
+        firstResult = await gen.next();
+      } catch (e) {
+        throw new Error(`Unexpected throw on first gen.next(): ${e.message}`);
+      }
+      assert.ok(firstResult && !firstResult.done, 'Expected first gen.next() to yield a chunk');
+
+      // Wait > 10ms. During this pause:
+      //   - Timer fires: spawnTimedOut=true, rejectNext===null → branch skipped.
+      //   - Race condition has now occurred (timer fired with no active rejectNext).
+      await new Promise(r => setTimeout(r, 25));
+
+      // Resume draining. Drain loop processes second data + 'close' → breaks.
+      // Post-loop: spawnTimedOut=true.
+      // Pre-D24: generator returns normally (done=true, no throw). FAIL.
+      // Post-D24: `if (spawnTimedOut) throw ProviderError SPAWN_TIMEOUT`. PASS.
+      let caughtError = null;
+      try {
+        while (true) {
+          const { value, done: genDone } = await gen.next();
+          if (genDone) break;
+          void value;
+        }
+      } catch (e) {
+        caughtError = e;
+      }
+
+      assert.ok(caughtError !== null,
+        'Expected ProviderError SPAWN_TIMEOUT (D24 race fix: pre-D24 generator returned normally with partial chunks)');
+      assert.ok(caughtError instanceof ProviderError,
+        `Expected ProviderError, got ${caughtError?.constructor?.name}`);
+      assert.equal(caughtError.code, 'SPAWN_TIMEOUT',
+        `Expected SPAWN_TIMEOUT code, got ${caughtError?.code}`);
+    } finally {
+      anthropic.hints.maxSpawnTimeMs = savedTimeout;
+      __resetSpawnImpl();
+      if (savedToken !== undefined) {
+        process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken;
+      } else {
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      }
+    }
+  });
+
 });

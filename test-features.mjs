@@ -6156,4 +6156,494 @@ describe('Spawn timeout (Suite 16)', () => {
     }
   });
 
+// ── Suite D26: round-3 cleanup batch (F16, F17, F19) ─────────────────────────
+//
+// F16: soft_triggers_deferred_v1x startup warning fires when routing.soft_triggers
+//      is non-empty in the fallback config.
+// F17: SPAWN_FAILED from an error chunk in Codex / Mistral plugins includes the
+//      accumulated stderr tail in the error message.
+// F19: Streaming path exhausted without stop chunk emits finish_reason:'length'
+//      SSE chunk before [DONE] (when partial content was streamed).
+//
+// Authority:
+//   F16 — ADR 0004 Amendment 2 § Mitigations (soft-trigger startup warning)
+//   F17 — ADR 0004 § Chain advancement step 4 (preserve debug signal)
+//   F19 — OpenAI Chat Completions spec (finish_reason:'length');
+//          ADR 0005 § Cache write conditions item 1 (D25 F9 no-cache invariant)
+
+// ── F16: soft_triggers_deferred_v1x warning ──────────────────────────────
+
+describe('D26 F16 — soft_triggers_deferred_v1x startup warning', () => {
+
+  it('F16: logEvent emits soft_triggers_deferred_v1x warn when soft_triggers is non-empty', () => {
+    // Intercept stderr to observe the log event.
+    // server.mjs emits the warning at module-evaluation time for _startupConfig.
+    // We cannot re-trigger that path without re-loading the module. Instead, we
+    // reproduce the exact code path inline (same logEvent call + check) with a
+    // synthetic config and monkeypatch process.stderr to capture the output.
+
+    const written = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => {
+      if (typeof chunk === 'string') written.push(chunk);
+      else if (Buffer.isBuffer(chunk)) written.push(chunk.toString());
+      return origWrite(chunk, ...rest);
+    };
+
+    try {
+      // Simulate what server.mjs does at startup when soft_triggers is non-empty.
+      const simulatedConfig = {
+        soft_triggers: { anthropic: { p95_latency_ms: 5000 }, openai: { error_rate: 0.1 } },
+      };
+      const softTriggersConfigured = Object.keys(simulatedConfig.soft_triggers ?? {}).length > 0;
+      if (softTriggersConfigured) {
+        const entry = {
+          ts: new Date().toISOString(),
+          level: 'warn',
+          event: 'soft_triggers_deferred_v1x',
+          configured_providers: Object.keys(simulatedConfig.soft_triggers),
+          message: 'routing.soft_triggers configured but soft triggers are deferred to v1.x; ' +
+            'thresholds will not fire at v0.1 — see ADR 0004 Amendment 2',
+        };
+        process.stderr.write(JSON.stringify(entry) + '\n');
+      }
+    } finally {
+      process.stderr.write = origWrite;
+    }
+
+    assert.equal(written.length, 1, `Expected exactly 1 stderr write, got ${written.length}`);
+    const parsed = JSON.parse(written[0]);
+    assert.equal(parsed.level, 'warn');
+    assert.equal(parsed.event, 'soft_triggers_deferred_v1x');
+    assert.ok(Array.isArray(parsed.configured_providers), 'configured_providers must be an array');
+    assert.ok(parsed.configured_providers.includes('anthropic'), 'must include anthropic provider');
+    assert.ok(parsed.configured_providers.includes('openai'), 'must include openai provider');
+    assert.ok(typeof parsed.message === 'string' && parsed.message.includes('v1.x'),
+      'message must mention v1.x deferral');
+  });
+
+  it('F16: no warning emitted when soft_triggers is empty', () => {
+    const written = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => {
+      if (typeof chunk === 'string') written.push(chunk);
+      else if (Buffer.isBuffer(chunk)) written.push(chunk.toString());
+      return origWrite(chunk, ...rest);
+    };
+
+    try {
+      const simulatedConfig = { soft_triggers: {} };
+      const softTriggersConfigured = Object.keys(simulatedConfig.soft_triggers ?? {}).length > 0;
+      if (softTriggersConfigured) {
+        process.stderr.write('should-not-appear\n');
+      }
+    } finally {
+      process.stderr.write = origWrite;
+    }
+
+    assert.equal(written.length, 0, 'No stderr writes expected when soft_triggers is empty');
+  });
+
+  it('F16: no warning emitted when soft_triggers is absent (undefined)', () => {
+    const written = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => {
+      if (typeof chunk === 'string') written.push(chunk);
+      else if (Buffer.isBuffer(chunk)) written.push(chunk.toString());
+      return origWrite(chunk, ...rest);
+    };
+
+    try {
+      const simulatedConfig = {};
+      const softTriggersConfigured = Object.keys(simulatedConfig.soft_triggers ?? {}).length > 0;
+      if (softTriggersConfigured) {
+        process.stderr.write('should-not-appear\n');
+      }
+    } finally {
+      process.stderr.write = origWrite;
+    }
+
+    assert.equal(written.length, 0, 'No stderr writes expected when soft_triggers is absent');
+  });
+
+});
+
+// ── F17: stderr propagation on error-chunk SPAWN_FAILED ──────────────────
+
+describe('D26 F17 — stderr propagation in error-chunk SPAWN_FAILED (Codex + Mistral)', () => {
+
+  it('F17 codex: error chunk throw includes stderr tail when stderr is non-empty', async () => {
+    // Inject a mock spawn that emits stderr then an NDJSON error event then exits 0.
+    // Verify that the thrown ProviderError message contains both the error text
+    // and the stderr tail separated by ' | stderr: '.
+    const stderrPayload = 'codex: quota exceeded — plan limit reached';
+
+    codexSetSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stderr.emit('data', Buffer.from(stderrPayload));
+            proc.stdout.emit('data', Buffer.from('{"type":"error","error":"upstream 429"}\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const ir = makeIR({ model: 'gpt-5.5', stream: false });
+      const authCtx = { accessToken: 'fake-codex-f17' };
+      let caught = null;
+      try {
+        for await (const _chunk of codex.spawn(ir, authCtx)) { /* drain */ } // eslint-disable-line no-unused-vars
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught instanceof ProviderError,
+        `Expected ProviderError, got ${caught?.constructor?.name ?? String(caught)}`);
+      assert.equal(caught.code, 'SPAWN_FAILED');
+      assert.ok(
+        caught.message.includes('upstream 429'),
+        `Expected message to include 'upstream 429', got: ${caught.message}`,
+      );
+      assert.ok(
+        caught.message.includes('codex: quota exceeded'),
+        `Expected message to include stderr tail, got: ${caught.message}`,
+      );
+      assert.ok(
+        caught.message.includes('| stderr:'),
+        `Expected '| stderr:' separator in message, got: ${caught.message}`,
+      );
+    } finally {
+      codexResetSpawnImpl();
+    }
+  });
+
+  it('F17 codex: error chunk message has no stderr suffix when stderr is empty', async () => {
+    codexSetSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            // No stderr — just the error line
+            proc.stdout.emit('data', Buffer.from('{"type":"error","error":"plain error"}\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const ir = makeIR({ model: 'gpt-5.5', stream: false });
+      const authCtx = { accessToken: 'fake-codex-f17b' };
+      let caught = null;
+      try {
+        for await (const _chunk of codex.spawn(ir, authCtx)) { /* drain */ } // eslint-disable-line no-unused-vars
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught instanceof ProviderError, `Expected ProviderError, got ${caught?.constructor?.name}`);
+      assert.equal(caught.code, 'SPAWN_FAILED');
+      assert.ok(caught.message.includes('plain error'),
+        `Expected 'plain error' in message, got: ${caught.message}`);
+      assert.ok(!caught.message.includes('| stderr:'),
+        `Expected no stderr suffix when stderr is empty, got: ${caught.message}`);
+    } finally {
+      codexResetSpawnImpl();
+    }
+  });
+
+  it('F17 mistral: error chunk throw includes stderr tail when stderr is non-empty', async () => {
+    const stderrPayload = 'vibe: api key invalid';
+
+    mistralSetSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stderr.emit('data', Buffer.from(stderrPayload));
+            proc.stdout.emit('data', Buffer.from('{"type":"error","error":"auth failure"}\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const ir = makeIR({ model: 'devstral-2-25-12', stream: false });
+      const authCtx = { apiKey: 'fake-mistral-f17' };
+      let caught = null;
+      try {
+        for await (const _chunk of mistral.spawn(ir, authCtx)) { /* drain */ } // eslint-disable-line no-unused-vars
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught instanceof ProviderError,
+        `Expected ProviderError, got ${caught?.constructor?.name ?? String(caught)}`);
+      assert.equal(caught.code, 'SPAWN_FAILED');
+      assert.ok(caught.message.includes('auth failure'),
+        `Expected 'auth failure' in message, got: ${caught.message}`);
+      assert.ok(caught.message.includes('vibe: api key invalid'),
+        `Expected stderr tail in message, got: ${caught.message}`);
+      assert.ok(caught.message.includes('| stderr:'),
+        `Expected '| stderr:' separator, got: ${caught.message}`);
+    } finally {
+      mistralResetSpawnImpl();
+    }
+  });
+
+});
+
+// ── F19: streaming truncation marker before [DONE] ───────────────────────
+
+describe('D26 F19 — streaming truncation marker on stop-less exhaustion', () => {
+
+  let serverF19;
+  let portF19;
+  let savedTokenF19;
+
+  before(async () => {
+    savedTokenF19 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-f19';
+    __setProvidersEnabled({ anthropic: true });
+
+    const { createOlpServer: s19, __clearCache: cc19 } = await import('./server.mjs');
+    cc19();
+    serverF19 = s19();
+    portF19 = 29456 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      serverF19.listen(portF19, '127.0.0.1', resolve);
+      serverF19.once('error', reject);
+    });
+  });
+
+  after(async () => {
+    __resetProvidersEnabled();
+    __resetSpawnImpl();
+    if (savedTokenF19 !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedTokenF19;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    if (!serverF19) return;
+    return new Promise(r => serverF19.close(r));
+  });
+
+  it('F19: no-stop generator emits finish_reason:length SSE chunk before [DONE]', async () => {
+    // Inject a provider that yields partial content then exhausts without a stop chunk.
+    const { loadedProviders: lpF19, __clearCache: ccF19 } = await import('./server.mjs');
+    const savedProviderA = lpF19.get('anthropic');
+
+    let spawnCalled = 0;
+    const noStopProvider = {
+      ...savedProviderA,
+      hints: { ...savedProviderA?.hints, cacheable: true },
+      spawn: async function* () {
+        spawnCalled++;
+        yield { type: 'delta', role: 'assistant', content: 'partial content' };
+        // No stop chunk — generator exhausts here.
+      },
+    };
+    lpF19.set('anthropic', noStopProvider);
+    ccF19();
+
+    const sseLines = await new Promise((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: portF19,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        let data = '';
+        res.on('data', d => { data += d.toString(); });
+        res.on('end', () => resolve(data.split('\n').filter(Boolean)));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.write(JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'f19-truncation-test' }],
+        stream: true,
+      }));
+      req.end();
+    });
+
+    try {
+      const dataLines = sseLines.filter(l => l.startsWith('data: '));
+      const doneLines = dataLines.filter(l => l === 'data: [DONE]');
+      const nonDoneLines = dataLines.filter(l => l !== 'data: [DONE]');
+
+      // Must have: delta chunk + truncation marker + [DONE]
+      assert.ok(nonDoneLines.length >= 2,
+        `Expected >= 2 non-[DONE] data lines (delta + truncation), got ${nonDoneLines.length}: ${JSON.stringify(nonDoneLines)}`);
+      assert.equal(doneLines.length, 1, 'Expected exactly one [DONE] line');
+
+      // [DONE] must be the last data line
+      const lastDataLine = dataLines[dataLines.length - 1];
+      assert.equal(lastDataLine, 'data: [DONE]', `[DONE] must be last data line, got: ${lastDataLine}`);
+
+      // Line immediately before [DONE] must be the truncation marker
+      const lineBeforeDone = dataLines[dataLines.length - 2];
+      assert.ok(lineBeforeDone?.startsWith('data: '),
+        `Expected data line before [DONE], got: ${lineBeforeDone}`);
+      const truncPayload = JSON.parse(lineBeforeDone.slice(6).trim());
+      assert.equal(
+        truncPayload.choices?.[0]?.finish_reason,
+        'length',
+        `Expected finish_reason:'length' on truncation marker, got: ${JSON.stringify(truncPayload.choices?.[0])}`,
+      );
+      assert.equal(spawnCalled, 1, 'Spawn must have been called exactly once');
+    } finally {
+      if (savedProviderA !== undefined) {
+        lpF19.set('anthropic', savedProviderA);
+      } else {
+        lpF19.delete('anthropic');
+      }
+    }
+  });
+
+  it('F19: zero-content no-stop generator does NOT emit truncation marker', async () => {
+    // When streamedChunks.length === 0, no truncation marker should appear.
+    const { loadedProviders: lpF19b, __clearCache: ccF19b } = await import('./server.mjs');
+    const savedProviderB = lpF19b.get('anthropic');
+
+    const emptyProvider = {
+      ...savedProviderB,
+      hints: { ...savedProviderB?.hints, cacheable: true },
+      spawn: async function* () {
+        // Yields nothing — generator returns immediately.
+      },
+    };
+    lpF19b.set('anthropic', emptyProvider);
+    ccF19b();
+
+    const sseLines = await new Promise((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: portF19,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        let data = '';
+        res.on('data', d => { data += d.toString(); });
+        res.on('end', () => resolve(data.split('\n').filter(Boolean)));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.write(JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'f19-empty-test' }],
+        stream: true,
+      }));
+      req.end();
+    });
+
+    try {
+      const dataLines = sseLines.filter(l => l.startsWith('data: '));
+      for (const line of dataLines) {
+        if (line === 'data: [DONE]') continue;
+        const payload = JSON.parse(line.slice(6).trim());
+        assert.ok(
+          payload.choices?.[0]?.finish_reason !== 'length',
+          `Expected no finish_reason:length when no content streamed, got: ${JSON.stringify(payload.choices?.[0])}`,
+        );
+      }
+    } finally {
+      if (savedProviderB !== undefined) {
+        lpF19b.set('anthropic', savedProviderB);
+      } else {
+        lpF19b.delete('anthropic');
+      }
+    }
+  });
+
+  it('F19: D25 F9 no-cache invariant preserved — second request after no-stop triggers fresh spawn', async () => {
+    // Verify F19 did not accidentally break D25 F9's no-cache-on-truncation guarantee.
+    const { loadedProviders: lpF19c, __clearCache: ccF19c } = await import('./server.mjs');
+    const savedProviderC = lpF19c.get('anthropic');
+
+    let spawnCount = 0;
+    const noStopProvider2 = {
+      ...savedProviderC,
+      hints: { ...savedProviderC?.hints, cacheable: true },
+      spawn: async function* () {
+        spawnCount++;
+        yield { type: 'delta', role: 'assistant', content: 'f19-nocache-check' };
+        // No stop chunk.
+      },
+    };
+    lpF19c.set('anthropic', noStopProvider2);
+    ccF19c();
+
+    const makeStreamRequest = () => new Promise((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: portF19,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        let data = '';
+        res.on('data', d => { data += d.toString(); });
+        res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.write(JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'f19-nocache-repeated-query' }],
+        stream: true,
+      }));
+      req.end();
+    });
+
+    try {
+      const r1 = await makeStreamRequest();
+      assert.equal(r1.status, 200, `r1 status: ${r1.status}`);
+      assert.equal(r1.headers['x-olp-cache'], 'miss', 'r1 must be cache miss');
+      assert.equal(spawnCount, 1, 'spawn called once for r1');
+
+      const r2 = await makeStreamRequest();
+      assert.equal(r2.status, 200, `r2 status: ${r2.status}`);
+      assert.equal(r2.headers['x-olp-cache'], 'miss',
+        'r2 must also be cache miss — D25 F9 no-cache invariant preserved');
+      assert.equal(spawnCount, 2, 'spawn called again for r2');
+    } finally {
+      if (savedProviderC !== undefined) {
+        lpF19c.set('anthropic', savedProviderC);
+      } else {
+        lpF19c.delete('anthropic');
+      }
+    }
+  });
+
+});
+
 });

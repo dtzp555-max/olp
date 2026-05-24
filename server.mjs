@@ -49,6 +49,19 @@ const VERSION = pkg.version;
 const PORT = parseInt(process.env.OLP_PORT ?? '3456', 10);
 const BODY_LIMIT = 5 * 1024 * 1024; // 5 MB
 
+// ── Logging ───────────────────────────────────────────────────────────────
+// Defined early so it is available for startup-time warnings (e.g. F16
+// soft-trigger deferred warning) before the provider registry is loaded.
+
+function logEvent(level, event, data = {}) {
+  const entry = { ts: new Date().toISOString(), level, event, ...data };
+  if (level === 'error' || level === 'warn') {
+    process.stderr.write(JSON.stringify(entry) + '\n');
+  } else {
+    process.stdout.write(JSON.stringify(entry) + '\n');
+  }
+}
+
 // ── Startup config ────────────────────────────────────────────────────────
 // Read ~/.olp/config.json once at startup. Provides:
 //   - providers.enabled   → which providers are loaded (ADR 0002 § Disable model)
@@ -58,6 +71,18 @@ const BODY_LIMIT = 5 * 1024 * 1024; // 5 MB
 //   empty providersEnabled → all 503 (ALIGNMENT.md § v0.1 zero-Enabled-Providers posture)
 //   empty chains/soft_triggers → single-hop mode
 const _startupConfig = loadFallbackConfigSync();
+
+// D26 round-3 F16: soft triggers are deferred to v1.x per ADR 0004 Amendment 2.
+// If the user has configured any, emit a startup warning so the inert state is
+// observable rather than silently ignored. ADR 0004 Amendment 2 § Mitigations.
+const _softTriggersConfigured = Object.keys(_startupConfig.soft_triggers ?? {}).length > 0;
+if (_softTriggersConfigured) {
+  logEvent('warn', 'soft_triggers_deferred_v1x', {
+    configured_providers: Object.keys(_startupConfig.soft_triggers),
+    message: 'routing.soft_triggers configured but soft triggers are deferred to v1.x; ' +
+      'thresholds will not fire at v0.1 — see ADR 0004 Amendment 2',
+  });
+}
 
 // ── Provider registry ─────────────────────────────────────────────────────
 // ALIGNMENT.md § Provider Inventory: 0 Enabled Providers at v0.1 unless
@@ -120,17 +145,6 @@ export function __clearCache() {
 // keyId: '__anonymous__' at D5 — Phase 2 multi-key infrastructure wires in
 // the real OLP API key ID here.
 export const cacheStore = new CacheStore();
-
-// ── Logging ───────────────────────────────────────────────────────────────
-
-function logEvent(level, event, data = {}) {
-  const entry = { ts: new Date().toISOString(), level, event, ...data };
-  if (level === 'error' || level === 'warn') {
-    process.stderr.write(JSON.stringify(entry) + '\n');
-  } else {
-    process.stdout.write(JSON.stringify(entry) + '\n');
-  }
-}
 
 // ── Body reader ───────────────────────────────────────────────────────────
 
@@ -602,6 +616,17 @@ async function handleChatCompletions(req, res) {
       // response would serve wrong answers to future identical requests.
       // Compare: D16's buffered-path truncation eviction explicitly avoids
       // persisting truncated entries for the same reason.
+      //
+      // D26 round-3 F19: emit a synthetic truncation marker BEFORE [DONE] so
+      // clients can detect the incomplete response in-band. Only emit when there
+      // is actual partial content (streamedChunks.length > 0) — emitting a
+      // truncation marker on an empty response is misleading.
+      // The buffered D16 path synthesizes {type:'stop', finish_reason:'length'}
+      // before returning; this aligns the streaming branch with that behaviour.
+      if (streamedChunks.length > 0) {
+        const truncMarker = { type: 'stop', finish_reason: 'length' };
+        res.write(irChunkToOpenAISSE(truncMarker, requestId, ir.model));
+      }
       res.write(SSE_DONE);
       res.end();
       if (streamedChunks.length > 0 && cacheableForFirstHop) {

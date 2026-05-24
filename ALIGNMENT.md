@@ -65,7 +65,7 @@ OLP exposes a single external HTTP surface: `/v1/chat/completions` in OpenAI Cha
 
 Citation format for entry-surface PRs: OpenAI spec URL + the specific field, parameter, or behaviour. Example: `OpenAI Chat Completions, response_format parameter (https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format)`.
 
-The spec pin lives in `docs/openai-spec-pin.md` — deferred, not yet authored; will land before the first annual audit (target: v1.0). Not required for v0.1 governance bootstrap.
+The spec pin lives in `docs/openai-spec-pin.md` — ✅ shipped as of D30 (2026-05-24); v0.1 baseline pinning the entry-surface fields OLP currently implements. Re-snapshot annually per § Annual Alignment Audit.
 
 ### Authority 3 — IR contract (internal interop scope)
 
@@ -156,7 +156,7 @@ In addition to the recurring 14 May audit below, the following one-shot audits a
 
 - **Date:** 14 May each year (the anniversary of the Anthropic 2026-05-14 announcement, which is the structural trigger for OLP).
 - **Scope (per-provider plugin):** For each enabled provider, re-audit the provider CLI version against the pin in the Authorities table above. Re-verify that every spawn invocation, flag, and output-parser expectation in `lib/providers/<name>.mjs` still matches that CLI version's actual behaviour. Update the pin row in this file.
-- **Scope (entry surface):** Snapshot OpenAI's `/v1/chat/completions` specification and diff against the pin in `docs/openai-spec-pin.md` (📋 deferred — not yet authored; must be created before the first annual audit). For each field OLP implements, verify the spec still defines it the same way. Update the pin.
+- **Scope (entry surface):** Snapshot OpenAI's `/v1/chat/completions` specification and diff against the pin in `docs/openai-spec-pin.md` (✅ v0.1 baseline shipped D30). For each field OLP implements, verify the spec still defines it the same way. Update the pin.
 - **Scope (IR):** Diff the IR documented in ADR 0003 against the implementation in `lib/ir/`. Any drift triggers an amendment or a deletion PR.
 - **Scope (Risk Tier reclassifications):** For each provider, re-evaluate the risk tier against current ToS, FAQ language, and observed enforcement events from the past year. Reclassifications land as ADR 0006 amendments.
 - **Output:** A signed audit note committed to `docs/alignment-audits/YYYY-05-14.md` (📋 `docs/alignment-audits/` directory does not exist yet; it is created when the first audit is conducted). Inline pin updates go into this file.

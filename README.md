@@ -114,10 +114,15 @@ _placeholder — full table lands per-phase as variables are introduced._
 | Variable | Default | Description |
 |---|---|---|
 | `OLP_PORT` | `3456` | HTTP listener port. |
-| `OLP_HOME` | `~/.olp` | Config, providers, keys, cache, logs root. |
-| `OLP_LOG_LEVEL` | `info` | One of `error`, `warn`, `info`, `debug`. |
+| `OLP_CLAUDE_BIN` | `claude` (from PATH) | Override path to the `claude` binary (Anthropic provider). Useful when multiple `claude` installs are present. |
+| `OLP_CODEX_BIN` | `codex` (from PATH) | Override path to the `codex` binary (OpenAI provider). |
+| `OLP_VIBE_BIN` | `vibe` (from PATH) | Override path to the `vibe` binary (Mistral provider). |
 
-Further variables (per-provider auth path overrides, cache size limits, fallback-engine knobs) land with the relevant phase.
+> **📋 Planned (Phase 2) — not yet read by the codebase:**
+> - `OLP_HOME` (`~/.olp`) — Config, providers, keys, cache, logs root. Currently hardcoded to `~/.olp/config.json` in `loadFallbackConfigSync`; the env override path is a Phase 2 config-layer deliverable.
+> - `OLP_LOG_LEVEL` (`info`) — Log level filter (`error`/`warn`/`info`/`debug`). `logEvent` currently writes unconditionally; level filtering is a Phase 2 observability deliverable.
+
+Further variables (per-provider auth path overrides, cache size limits, fallback-engine knobs) land with the relevant phase. See also the [Implementation status](#implementation-status-as-of-2026-05-24) table.
 
 ---
 
@@ -155,7 +160,7 @@ Phase 1 is in progress. This table reflects what is currently shipped vs. what i
 | `lib/keys.mjs` | 📋 Planned (Phase 2) | Multi-key auth, per-key namespacing, audit log |
 | `dashboard.html` | 📋 Planned (Phase 6) | Owner-only multi-provider dashboard |
 | `docs/provider-caveats.md` | 📋 Planned (Phase 3+) | Lossy-translation reference; for now documented inline in each plugin header |
-| `docs/openai-spec-pin.md` | 📋 Planned (Phase 1 gate) | OpenAI spec snapshot for annual audit; deferred from v0.1 bootstrap |
+| `docs/openai-spec-pin.md` | ✅ Shipped (D30) | OpenAI spec snapshot for annual audit; v0.1 baseline pinned 2026-05-24 |
 | `docs/alignment-audits/` | 📋 Planned | Output directory for annual alignment audits (first audit: 2027-05-14) |
 | `scripts/migrate-from-ocp.mjs` | 📋 Planned (Phase 7) | OCP → OLP migration tool |
 | `setup.mjs` | 📋 Planned | Setup wizard / initial config |

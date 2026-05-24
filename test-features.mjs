@@ -2024,6 +2024,66 @@ describe('Cache layer — CacheStore unit tests (Suite 9 cont.)', () => {
     assert.ok(warnCalls.every(w => w.msg === 'cache_skip_oversize'));
   });
 
+  // ── D39 (issue #3 Part 1): CacheStore.delete API ─────────────────────
+  // Authority: ADR 0005 § "Cache write conditions" item 1; D39 design note in
+  // store.mjs. Replaces the prior `set(..., ttlMs=0)` tombstone pattern with
+  // an explicit immediate-eviction primitive.
+
+  it('D39: CacheStore.delete returns true and removes entry when present', async () => {
+    const store = new CacheStore();
+    await store.set('keyA', 'hash1', [{ type: 'delta', content: 'partial' }]);
+    // Sanity: entry is there.
+    assert.ok(await store.peek('keyA', 'hash1'), 'precondition: entry must be present');
+    // Delete reports true.
+    assert.equal(store.delete('keyA', 'hash1'), true);
+    // Subsequent peek/get return false/null without lazy-purge side-effects.
+    assert.equal(await store.peek('keyA', 'hash1'), false, 'peek must be false after delete');
+    assert.equal(await store.get('keyA', 'hash1'), null, 'get must return null after delete');
+    // getOrCompute on the same key now triggers a FRESH compute (not served from prior entry).
+    let computeCount = 0;
+    const v = await store.getOrCompute('keyA', 'hash1', async () => {
+      computeCount++;
+      return [{ type: 'delta', content: 'fresh' }];
+    });
+    assert.equal(computeCount, 1, 'getOrCompute must invoke computeFn (cache was deleted)');
+    assert.deepEqual(v, [{ type: 'delta', content: 'fresh' }]);
+  });
+
+  it('D39: CacheStore.delete returns false for absent entry (no throw)', () => {
+    const store = new CacheStore();
+    // Namespace does not exist at all.
+    assert.equal(store.delete('keyA', 'hash-missing'), false);
+    // Namespace exists but cacheKey absent — populate then delete one absent key.
+    // (set is async; await via Promise.resolve for the precondition setup.)
+    return store.set('keyA', 'hash1', 'v').then(() => {
+      assert.equal(store.delete('keyA', 'hash-different'), false,
+        'delete on absent cacheKey within existing namespace returns false');
+      // Existing entry untouched.
+      return store.peek('keyA', 'hash1').then((present) => {
+        assert.equal(present, true, 'unrelated entry must remain after a false delete');
+      });
+    });
+  });
+
+  it('D39: CacheStore.delete drops empty namespace Map entry (memory hygiene)', async () => {
+    const store = new CacheStore();
+    await store.set('keyA', 'only-hash', 'val');
+    // The internal namespace Map for keyA must exist after set.
+    assert.ok(store._store.has('keyA'), 'precondition: namespace exists in _store');
+    // Delete the only entry.
+    assert.equal(store.delete('keyA', 'only-hash'), true);
+    // Namespace Map entry must also be removed from the outer _store.
+    assert.equal(store._store.has('keyA'), false,
+      'empty namespace must be removed from _store after deleting last entry');
+    // A namespace with multiple entries must NOT be removed when only one is deleted.
+    await store.set('keyB', 'hash1', 'val1');
+    await store.set('keyB', 'hash2', 'val2');
+    assert.equal(store.delete('keyB', 'hash1'), true);
+    assert.ok(store._store.has('keyB'),
+      'non-empty namespace must remain in _store after partial delete');
+    assert.equal(store._store.get('keyB').size, 1, 'remaining entry count must be 1');
+  });
+
   // ── Test 31: clear(keyId) clears only that namespace (renumbered from old T26) ──
   it('CacheStore.clear(keyId) clears only that namespace', async () => {
     const store = new CacheStore();
@@ -5363,6 +5423,163 @@ describe('Fallback engine — HTTP integration (D9)', () => {
       // Partial content must be present
       const content = body.choices?.[0]?.message?.content ?? '';
       assert.ok(content.includes('Partial answer'), `Expected 'Partial answer' in content, got: '${content}'`);
+    } finally {
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+    }
+  });
+
+  // ── D39 (issue #3 Part 2): cache_evicted_truncated observability log ──
+  // Authority: D39 design — surface salvage frequency to dashboards. The log
+  // event fires in executeHopFn (server.mjs) immediately after the explicit
+  // cacheStore.delete() that replaces the prior set-with-TTL-0 tombstone.
+  // The event is level=info → routed to stdout per logEvent in server.mjs.
+  it('D39: cache_evicted_truncated log event fires on SPAWN_FAILED salvage with correct provider+model', async () => {
+    __clearCache();
+
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    // Reuse the D16 Case-B single-hop mock: emit 1 raw text chunk, then exit-1.
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('D39-evict-log-content'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null); // Case B salvage path
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    // Capture stdout writes to find the JSON log line emitted by logEvent.
+    const stdoutWrites = [];
+    const origStdoutWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk, ...rest) => {
+      const s = typeof chunk === 'string'
+        ? chunk
+        : (Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk));
+      stdoutWrites.push(s);
+      return origStdoutWrite(chunk, ...rest);
+    };
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'D39 cache_evicted_truncated log' }],
+          max_tokens: 10,
+        },
+      });
+      assert.equal(r.status, 200, `Expected 200 from salvage, got ${r.status}`);
+    } finally {
+      process.stdout.write = origStdoutWrite;
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+    }
+
+    // Find the cache_evicted_truncated event in the captured stdout.
+    const evictedLines = [];
+    for (const w of stdoutWrites) {
+      for (const line of w.split('\n')) {
+        if (!line.includes('"event":"cache_evicted_truncated"')) continue;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed?.event === 'cache_evicted_truncated') evictedLines.push(parsed);
+        } catch { /* not JSON — ignore */ }
+      }
+    }
+    assert.equal(evictedLines.length, 1,
+      `Expected exactly one cache_evicted_truncated event, got ${evictedLines.length}: ${JSON.stringify(evictedLines)}`);
+    assert.equal(evictedLines[0].provider, 'anthropic',
+      `Expected provider=anthropic, got ${evictedLines[0].provider}`);
+    assert.equal(evictedLines[0].model, 'claude-sonnet-4-6',
+      `Expected model=claude-sonnet-4-6, got ${evictedLines[0].model}`);
+    assert.equal(evictedLines[0].level, 'info',
+      `Expected level=info, got ${evictedLines[0].level}`);
+  });
+
+  // ── D39 (issue #3 Part 3): truncated response is not sticky-cached ────
+  // Defense-in-depth around the D16 eviction code path. Two consecutive
+  // identical buffered requests that both trigger SPAWN_FAILED-with-chunks
+  // (Case B salvage). The eviction in executeHopFn must ensure the second
+  // request is a FRESH spawn (not served from a sticky cache entry written
+  // by the singleflight populate during the first request's salvage). If the
+  // eviction were ever lost (e.g., the delete were silently dropped or the
+  // condition gate were wrong), this test would catch it: spawnCount would
+  // become 1 instead of 2 and X-OLP-Cache would be `hit` on r2.
+  it('D39: truncated response is not sticky-cached (two identical requests → two spawns)', async () => {
+    __clearCache();
+
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    let spawnCount = 0;
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      spawnCount++;
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            // Case B: emit partial content then exit non-zero on every spawn.
+            proc.stdout.emit('data', Buffer.from('D39-sticky-content'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      // The two requests must be byte-identical so they share a cache key.
+      const reqBody = {
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'D39 sticky-cache regression — identical body' }],
+        max_tokens: 10,
+      };
+
+      const r1 = await fetch({ port, method: 'POST', path: '/v1/chat/completions', body: reqBody });
+      assert.equal(r1.status, 200, `r1 must succeed via salvage, got ${r1.status}`);
+      assert.equal(r1.headers['x-olp-cache'], 'miss', `r1 must be cache miss, got ${r1.headers['x-olp-cache']}`);
+
+      const r2 = await fetch({ port, method: 'POST', path: '/v1/chat/completions', body: reqBody });
+      assert.equal(r2.status, 200, `r2 must succeed via salvage, got ${r2.status}`);
+      // The decisive assertions: a FRESH spawn must have fired for r2.
+      assert.equal(spawnCount, 2,
+        `Expected 2 spawns across two identical truncated requests (sticky-cache regression guard), got ${spawnCount}`);
+      assert.equal(r2.headers['x-olp-cache'], 'miss',
+        `r2 must also be cache miss (truncated salvage must not be sticky), got ${r2.headers['x-olp-cache']}`);
     } finally {
       __resetFallbackConfig();
       __resetSpawnImpl();

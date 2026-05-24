@@ -634,10 +634,26 @@ async function handleChatCompletions(req, res) {
     lastHopWasCached = hopWasCached;
     if (result.__truncated) {
       // Evict the truncated entry so future requests get a fresh spawn.
-      // ADR 0005 § "Cache write conditions" item 1: truncated responses must not
-      // persist in cache. Overwrite with ttlMs=0 so any subsequent get/peek
-      // finds the entry already-expired and deletes it.
-      await cacheStore.set(keyId, hopCacheKey, result, 0);
+      // ADR 0005 § "Cache write conditions" item 1: truncated responses must
+      // not persist in cache.
+      //
+      // D39 (issue #3 Part 1): use explicit cacheStore.delete() rather than
+      // the prior set(..., ttlMs=0) tombstone. delete() removes the entry
+      // from the namespace Map immediately (and removes the empty namespace
+      // entry from the outer Map if applicable), instead of waiting for the
+      // next get/peek to lazily purge a TTL=0 entry.
+      // Capture the boolean — false indicates a race (concurrent eviction or
+      // TTL purge already removed the entry). Surfaces in the log so the
+      // dashboard can distinguish "we evicted" from "we tried but it was gone."
+      const evicted = cacheStore.delete(keyId, hopCacheKey);
+      // D39 (issue #3 Part 2): observability — surface salvage frequency to
+      // dashboards. Provider + model identify which hop's truncated entry was
+      // evicted. cache_eviction_hit distinguishes actual-evict vs already-gone.
+      logEvent('info', 'cache_evicted_truncated', {
+        provider: hopProvider,
+        model: hopModel,
+        cache_eviction_hit: evicted,
+      });
     }
     return result;
   }

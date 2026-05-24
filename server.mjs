@@ -443,13 +443,9 @@ async function handleChatCompletions(req, res) {
       fallbackHops: 0,
     });
 
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-      ...streamHeaders,
-    });
+    // D14: writeHead is deferred until just before the first res.write so that
+    // pre-first-chunk errors can still produce a JSON 502 (matching the buffered
+    // path). Calling writeHead unconditionally here was the D14 defect.
 
     const streamedChunks = [];
     let firstChunkEmitted = false;
@@ -471,6 +467,17 @@ async function handleChatCompletions(req, res) {
           throw new ProviderError(irChunk.error ?? 'Provider emitted error chunk', 'SPAWN_FAILED');
         }
 
+        // Defer writeHead until the moment we are about to emit the first byte.
+        // After this point firstChunkEmitted===true ↔ res.headersSent===true.
+        if (!res.headersSent) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+            ...streamHeaders,
+          });
+        }
         streamedChunks.push(irChunk);
         res.write(irChunkToOpenAISSE(irChunk, requestId, ir.model));
         firstChunkEmitted = true;

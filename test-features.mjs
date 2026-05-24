@@ -4501,6 +4501,72 @@ describe('Streaming cache-miss real-time (Suite 15)', () => {
     }
   });
 
+  it('15d: streaming early error → 502 JSON not 200 empty body (D14 defect fix)', async () => {
+    // Authority: D14 defect fix — deferred writeHead in real-streaming path.
+    // Pre-D14: writeHead(200) fired unconditionally before spawn, so a throw
+    // before first chunk produced HTTP 200 + empty SSE body (silent loss).
+    // Post-D14: writeHead is deferred to just before the first res.write;
+    // a throw before any chunk fires sendError(502, ...) identical to the
+    // buffered path. This test would FAIL on pre-D14 code.
+
+    // Inject a mock anthropic provider whose spawn throws immediately (no yields).
+    const { loadedProviders: lp15d, __clearCache: cc15d } = await import('./server.mjs');
+    const savedAnthropicProvider = lp15d.get('anthropic');
+
+    const earlyErrorMessage = 'Simulated provider failure before first chunk';
+    const throwingProvider = {
+      ...savedAnthropicProvider,
+      spawn: async function* () {
+        throw new ProviderError(earlyErrorMessage, 'SPAWN_FAILED');
+      },
+    };
+    lp15d.set('anthropic', throwingProvider);
+    cc15d();
+
+    try {
+      const r = await fetch({
+        port: port15,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'streaming early error test' }],
+          stream: true,
+        },
+      });
+
+      // Must be 502, NOT 200 (the pre-D14 silent-loss behaviour)
+      assert.equal(r.status, 502, `Expected 502, got ${r.status}. Body: ${r.body.slice(0, 400)}`);
+
+      // Must be JSON error body, NOT SSE
+      assert.ok(
+        (r.headers['content-type'] ?? '').includes('application/json'),
+        `Expected application/json, got: ${r.headers['content-type']}`
+      );
+
+      // Body must be parseable as {error: {message, type}}
+      let parsed;
+      try {
+        parsed = JSON.parse(r.body);
+      } catch {
+        assert.fail(`Response body is not valid JSON: ${r.body.slice(0, 400)}`);
+      }
+      assert.ok(parsed.error, 'Response must have an error field');
+      assert.equal(parsed.error.type, 'provider_error', `Expected type provider_error, got ${parsed.error.type}`);
+      assert.ok(
+        parsed.error.message.includes(earlyErrorMessage),
+        `Expected error message to contain "${earlyErrorMessage}", got: ${parsed.error.message}`
+      );
+    } finally {
+      // Restore the original anthropic provider
+      if (savedAnthropicProvider !== undefined) {
+        lp15d.set('anthropic', savedAnthropicProvider);
+      } else {
+        lp15d.delete('anthropic');
+      }
+    }
+  });
+
 });
 
 // ── Suite 16: Spawn timeout (P1.3) ───────────────────────────────────────────

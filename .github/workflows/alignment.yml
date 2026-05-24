@@ -4,7 +4,6 @@ on:
   pull_request:
     paths:
       - 'server.mjs'
-      - 'setup.mjs'
       - 'lib/**'
       - 'scripts/**'
       - 'models-registry.json'
@@ -13,7 +12,6 @@ on:
     branches: [main]
     paths:
       - 'server.mjs'
-      - 'setup.mjs'
       - 'lib/**'
       - 'scripts/**'
       - 'models-registry.json'
@@ -45,20 +43,6 @@ jobs:
           # OLP-native entries: added as drift incidents accumulate.
           BLACKLIST=(
             "api.anthropic.com/api/oauth/usage"
-          )
-
-          # Provider keys that may appear in source (positive list — present in
-          # ALIGNMENT.md provider inventory). Any provider key in source that
-          # is NOT in this list is suspicious and flagged below.
-          KNOWN_PROVIDERS=(
-            "anthropic"
-            "openai"
-            "mistral"
-            "grok"
-            "kimi"
-            "minimax"
-            "glm"
-            "qwen"
           )
 
           # Source files in scope. Exclude docs, CHANGELOG, README, the

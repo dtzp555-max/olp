@@ -391,6 +391,57 @@ describe('irChunkToOpenAISSE format', () => {
     assert.equal(resp.choices[0].finish_reason, 'stop');
     assert.equal(resp.usage.total_tokens, 7);
   });
+
+  it('normalizeFinishReason: non-spec streaming finish_reason is mapped to stop', () => {
+    for (const bad of ['timeout', 'overloaded', 'cancelled']) {
+      const sse = irChunkToOpenAISSE({ type: 'stop', finish_reason: bad }, ID, MODEL);
+      const payload = JSON.parse(sse.slice(6).trim());
+      assert.equal(payload.choices[0].finish_reason, 'stop',
+        `non-spec value '${bad}' must be normalized to 'stop'`);
+    }
+  });
+
+  it('normalizeFinishReason: spec-enum streaming finish_reason values are preserved', () => {
+    const specValues = ['stop', 'length', 'tool_calls', 'content_filter', 'function_call', null];
+    for (const v of specValues) {
+      const sse = irChunkToOpenAISSE({ type: 'stop', finish_reason: v }, ID, MODEL);
+      const payload = JSON.parse(sse.slice(6).trim());
+      assert.equal(payload.choices[0].finish_reason, v,
+        `spec-enum value ${JSON.stringify(v)} must be preserved`);
+    }
+  });
+
+  it('normalizeFinishReason: non-spec non-stream finish_reason is mapped to stop', () => {
+    for (const bad of ['timeout', 'overloaded', 'cancelled']) {
+      const chunks = [
+        { type: 'delta', content: 'hi' },
+        { type: 'stop', finish_reason: bad },
+      ];
+      const resp = irResponseToOpenAINonStream(chunks, ID, MODEL);
+      assert.equal(resp.choices[0].finish_reason, 'stop',
+        `non-spec value '${bad}' must be normalized to 'stop' in non-stream path`);
+    }
+  });
+
+  it('normalizeFinishReason: spec-enum non-stream finish_reason values are preserved', () => {
+    // Note: null is intentionally omitted from this list. In the non-stream path,
+    // the condition `if (chunk.finish_reason !== undefined)` enters with null,
+    // overwrites the default 'stop' to null, and the response then carries
+    // finish_reason: null — meaning "still in progress" on a finalized completion,
+    // which is semantically odd but spec-valid. The non-stream path's behavior is
+    // documented by this omission rather than enforced (no plugin currently emits
+    // null on a non-stream stop chunk).
+    const specValues = ['stop', 'length', 'tool_calls', 'content_filter', 'function_call'];
+    for (const v of specValues) {
+      const chunks = [
+        { type: 'delta', content: 'hi' },
+        { type: 'stop', finish_reason: v },
+      ];
+      const resp = irResponseToOpenAINonStream(chunks, ID, MODEL);
+      assert.equal(resp.choices[0].finish_reason, v,
+        `spec-enum value '${v}' must be preserved in non-stream path`);
+    }
+  });
 });
 
 // ── Suite 4: Provider contract validation ─────────────────────────────────

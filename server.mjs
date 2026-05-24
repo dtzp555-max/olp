@@ -29,7 +29,7 @@ import {
   generateRequestId,
   SSE_DONE,
 } from './lib/ir/ir-to-openai.mjs';
-import { loadProviders, getProviderForModel, listAllProviderNames } from './lib/providers/index.mjs';
+import { loadProviders, listAllProviderNames } from './lib/providers/index.mjs';
 import { ProviderError } from './lib/providers/base.mjs';
 import { computeCacheKey, hasCacheControl, extractCacheControlMarkers } from './lib/cache/keys.mjs';
 import { CacheStore } from './lib/cache/store.mjs';

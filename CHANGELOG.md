@@ -11,6 +11,7 @@ Phase 1 was closed at v0.1.1; this commit aligns documentation surfaces to the P
 - `CLAUDE.md release_kit.current_phase` Phase 1 → Phase 2; `current_pre_release_identifier` `0.1.0-bootstrap` → `0.2.0-phase2`.
 - `README.md` status header + Implementation Status + Phase plan rewritten to reflect actually-shipped reality (v0.1.0 + v0.1.1 bundled the three Tier-D plugins + cache + fallback into a single Phase 1 milestone, not one phase per plugin as the original v0.1 spec planned). `lib/keys.mjs` row + "Multi-key auth not yet implemented" note updated to "Phase 2 active per ADR 0007 (drafting at D43-B)".
 - `AGENTS.md` § Key files to know — `lib/keys.mjs` 📋 marker updated to "Phase 2 active per ADR 0007 (drafting at D43-B)"; Implementation-status-note paragraph dated 2026-05-25 + reflects Phase 1 close + Phase 2 active scope.
+- `ALIGNMENT.md` § Provider Inventory — added one-paragraph "Note on phase terminology" clarifying that "Phase" in the Provider Inventory tables + § One-shot Triggered Audits "OpenAI Codex ToS formal pin" refers to the original per-plugin enablement plan, orthogonal to the milestone phase numbering in README. Fold-in for D43-A reviewer P2 finding; no governance-text change, no Speculative-Candidate plugin reclassification.
 - **Test count:** 468 → 468 (no test change).
 - **Authority:** `CLAUDE.md release_kit overlay phase_rolling_mode` — under Unreleased; Phase 2 kickoff handoff at `~/.cc-rules/memory/handoffs/2026-05-25-phase-2-kickoff.md`; ADR 0007 forthcoming at D43-B.
 

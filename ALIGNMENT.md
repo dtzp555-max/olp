@@ -124,6 +124,8 @@ OLP distinguishes **Candidate Providers** (declared in this constitution as inte
 
 The v0.1 founding commit ships **zero Enabled Providers**. This is intentional: a constitution that names a provider as "default-enabled" while its CLI version, output shape, auth artifact, and exit-code semantics are still TBD violates Rules 1 (Cite First) and 3 (Match the Implementation). Enablement is a Phase audit deliverable, not a bootstrap claim.
 
+**Note on phase terminology.** "Phase" in the tables and audit triggers below (and in § One-shot Triggered Audits → "OpenAI Codex ToS formal pin") refers to the **original per-plugin enablement plan** captured at project founding (one Tier-D plugin enabled per phase). The milestone phase numbering in [`README.md` § Phase plan](./README.md#phase-plan) was re-aligned at v0.1.1 close (D43-A, 2026-05-25) to reflect actually-shipped bundling — Phase 1 shipped all three Tier-D plugins + cache + fallback together as a single milestone, and Phase 2 became multi-key auth per ADR 0007. The two numberings are orthogonal: ALIGNMENT.md tracks **per-plugin enablement maturity**; README tracks **milestone release scope**.
+
 ### Enabled Providers
 
 | Provider key | Tier | Default state | Authority pin | Inclusion source |

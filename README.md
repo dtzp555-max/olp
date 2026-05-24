@@ -190,6 +190,15 @@ Phase 1 is in progress. This table reflects what is currently shipped vs. what i
 | `scripts/migrate-from-ocp.mjs` | 📋 Planned (Phase 7) | OCP → OLP migration tool |
 | `setup.mjs` | 📋 Planned | Setup wizard / initial config |
 
+### Known limitations
+
+Behaviors that work correctly at personal/family scale but have ratified follow-ups for a v1.x sprint. Single landing page: [`docs/v1x-roadmap.md`](./docs/v1x-roadmap.md).
+
+- **Streaming-path singleflight not implemented.** The cache layer's D4 singleflight (one spawn per identical concurrent request) is fully wired on the buffered path but NOT on the streaming path. N concurrent identical streaming requests at v0.1 will each spawn their own CLI process. Design ratified in [ADR 0005 Amendment 8](./docs/adr/0005-cache-cross-provider.md); implementation tracked via [issue #16](https://github.com/dtzp555-max/olp/issues/16) and [v1.x roadmap #1](./docs/v1x-roadmap.md). At family scale this is observably fine — every caller still receives the correct response; the cost is N CLI processes instead of one.
+- **Soft triggers configured but inert.** `routing.soft_triggers` in `~/.olp/config.json` is honored by the engine's evaluation logic but `quotaStatus()` polling is not wired (ADR 0004 Amendment 2). A startup warning fires if the field is non-empty so the inert state is visible.
+- **Multi-key auth not yet implemented.** All requests today share the cache namespace `__anonymous__`. The cache data model is keyed by `keyId` and ready to accept real identities when `lib/keys.mjs` lands. Tracked in [v1.x roadmap #2](./docs/v1x-roadmap.md).
+- **Provider-level `cacheKeyFields` mask not implemented.** Cache keys include every IR field including ones individual plugins drop at spawn (e.g., Anthropic plugin drops `temperature`). Spurious cache misses possible (extra spawn cost; never spurious hits). Conservative posture documented in [ADR 0005 Amendment 7](./docs/adr/0005-cache-cross-provider.md). Tracked in [v1.x roadmap #5](./docs/v1x-roadmap.md).
+
 ---
 
 ## Architecture

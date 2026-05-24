@@ -7,6 +7,139 @@
 
 ## Amendments
 
+### Amendment 8 — 2026-05-25: Streaming singleflight — v1.x design ratification (D42, issue #16)
+
+**Status:** Design ratified. Implementation deferred to v1.x.
+
+**Context.** Amendment 6 (D34) formally deferred streaming-path D4 singleflight participation with the note "the design alone warrants a dedicated ADR." Round-6 cold-audit F13 (filed as issue #16) raised the sibling TOCTOU window: `server.mjs:782 preCheckHit = await cacheStore.peek(...)` followed by streaming-branch entry at line 811 (gated on `!preCheckHit`) creates a race where, between peek and spawn, a concurrent populator can write the cache OR a TTL can expire. The streaming branch is path-locked at the moment of the peek result.
+
+This amendment ratifies the v1.x design so the implementation work has a single specification to follow.
+
+**Design — per-(keyId, cacheKey) inflight Map + tee-streaming + bounded per-client backpressure.**
+
+1. **Coordination primitive.** Extend `CacheStore` with `getOrComputeStreaming(keyId, cacheKey, sourceFactory): { stream: AsyncIterator<IRChunk>, isFirst: boolean }`. Internally maintains `_streamingInflight: Map<compositeKey, StreamingInflightEntry>`. Three outcomes on call:
+   - **Cache hit** (cached entry exists and is alive): synthesize an async iterator that yields the cached chunks. `isFirst = false`. No spawn.
+   - **Inflight join** (entry exists in `_streamingInflight`): attach a new `AttachedClient` to the existing entry. `isFirst = false`. No spawn.
+   - **Cache miss + no inflight**: create a new `StreamingInflightEntry`, invoke `sourceFactory()` to obtain the underlying spawn iterator, attach as the source. `isFirst = true`. Subsequent identical-key callers join this entry until it completes or aborts.
+
+   The Map check + insert is synchronous (no `await` between read and write), matching the D38 `tryAcquireSpawn` atomicity invariant. Document this in the implementation header.
+
+2. **StreamingInflightEntry shape.**
+
+   ```
+   {
+     compositeKey: string,          // keyId + '\0' + cacheKey
+     source: AsyncIterator<IRChunk>,
+     sourceAbortController: AbortController,
+     accumulatedChunks: IRChunk[],  // for late joiners (replay buffer)
+     attachedClients: Set<AttachedClient>,
+     sourceDone: boolean,           // source iterator exhausted
+     sourceError: Error | null,     // non-null if source threw
+     sourceAborted: boolean,        // true if AbortController fired
+     spawnAcquiredProvider: string | null,  // for D38 release coordination
+   }
+   ```
+
+3. **AttachedClient shape.**
+
+   ```
+   {
+     id: string,                    // request ID (D40 fallback log correlator)
+     queue: IRChunk[],              // per-client tee buffer
+     queueByteSize: number,         // running sum of JSON.stringify(chunk).length for cap
+     yieldedAccumulated: boolean,   // true after late-joiner replay drained
+     done: boolean,
+     resolveNext: ((chunk) => void) | null,  // promise resolver for the next chunk
+     rejectNext: ((err) => void) | null,
+   }
+   ```
+
+4. **Tee fan-out loop (single-reader, multi-writer).** Source iterator is drained by ONE reader (the entry's tee task), which on each chunk:
+   - Pushes the chunk into `accumulatedChunks` (late-joiner replay buffer; bounded — see §10).
+   - For each `client ∈ attachedClients`: if `client.queueByteSize + chunkSize > PER_CLIENT_QUEUE_CAP` (default 1 MB), the client is disconnected with `STREAM_BACKPRESSURE` (see §8). Otherwise push the chunk into `client.queue`, update `queueByteSize`, fire `resolveNext` if pending.
+
+   When the source iterator returns/throws/aborts, the tee task:
+   - On normal completion: writes `accumulatedChunks` to cache via the standard cache-write conditions (cacheable opt-out, truncated-not-cached, size cap — all from Amendment 1/3/5). Resolves all clients' `resolveNext` with their remaining queue then sentinel-marks `done`. Releases the D38 spawn slot once. Removes the entry from `_streamingInflight`.
+   - On source error: rejects all clients with the error. Does NOT write cache. Releases the D38 spawn slot. Removes entry.
+   - On source abort (all clients disconnected): cancels the iterator via AbortController, releases the slot, removes entry. No cache write (partial response not persisted, matches D16 buffered-path SPAWN_FAILED salvage NOT applying to abort).
+
+5. **Late-joiner policy.** When a new client attaches mid-stream:
+   - Drain `accumulatedChunks` into the client's queue immediately (synchronous burst).
+   - If the burst exceeds `PER_CLIENT_QUEUE_CAP`, the client is rejected immediately with `STREAM_BACKPRESSURE` (the implication is that the source has produced more than 1 MB before this client attached — late joiner is too late to catch up).
+   - From that point on, the client receives live chunks via the tee loop.
+
+6. **Cache TTL race during inflight.** If a cache entry is alive at peek time but expires during the inflight period, late joiners that arrive AFTER expiry still see the inflight entry in `_streamingInflight` (Map lookup precedes cache peek per the new contract). They attach via inflight join. No fresh spawn. The expired cache entry is overwritten by the inflight completion.
+
+7. **D38 maxConcurrent coordination.** Only the first caller's source-spawn calls `tryAcquireSpawn`. Subsequent attached clients DO NOT call it — they share the existing spawn slot. On source completion / error / abort, `releaseSpawn` fires once. If `tryAcquireSpawn` returns false for the first caller, the request fails with `CONCURRENCY_LIMIT` per D38 (existing behavior) and the streaming branch is not entered.
+
+8. **Backpressure error code.** New `PROVIDER_ERROR_CODES.STREAM_BACKPRESSURE`. **NOT a hard trigger** — the source spawned successfully; only one client's queue overflowed. The affected client receives a synthetic `{ type: 'stop', finish_reason: 'length' }` followed by `[DONE]` (matching D35 #10 truncation marker pattern). Server logs `stream_backpressure_disconnect` with `{ provider, model, client_id, queue_byte_size, per_client_cap }`. Other attached clients continue receiving chunks normally.
+
+9. **Client mid-stream disconnect (network drop / abort).** The HTTP response stream's `close` event triggers client cleanup: remove from `attachedClients`, no fallback advancement (the source is still running for other clients). If `attachedClients.size === 0`, the tee task fires `sourceAbortController.abort()` (which propagates to the underlying CLI spawn — D38's plugin spawn loops already handle AbortController per ADR 0002 § Provider contract).
+
+10. **Replay buffer cap.** `accumulatedChunks` is bounded at `ACCUMULATED_REPLAY_CAP` (default 10 MB, matches the existing cache-entry size cap from D23). If the source produces more than the cap before completion, the entry is marked NOT cacheable (cache write skipped at source-complete). Late joiners attaching past the cap receive `STREAM_BACKPRESSURE` immediately (the replay burst would exceed `PER_CLIENT_QUEUE_CAP`). First caller's stream continues unaffected because they were attached before the cap was hit.
+
+11. **Observability.** New log events:
+    - `streaming_inflight_join` — fires when a request attaches to an existing inflight entry. Fields: `{ provider, model, attached_count_after, accumulated_chunk_count }`.
+    - `streaming_inflight_source_done` — fires when the source completes. Fields: `{ provider, model, attached_count, accumulated_chunk_count, cache_written }`.
+    - `stream_backpressure_disconnect` — see §8.
+    - `streaming_inflight_abort` — fires when all clients disconnect and source is aborted. Fields: `{ provider, model, accumulated_chunk_count }`.
+
+   New X-OLP-* header: `X-OLP-Streaming-Inflight: source | attached | solo` distinguishing which role this client played. `solo` = first caller, no joiners during stream (functionally equivalent to today's behavior). `source` = first caller, ≥1 joiner attached. `attached` = joined an existing inflight entry. Adds one field to the X-OLP-* set (currently 5); update D18-D40 documentation when implementation lands.
+
+12. **Server.mjs wiring.** Replace the current streaming branch peek+spawn pattern (server.mjs:782 `preCheckHit = await cacheStore.peek(...)` and lines 811–817 conditional) with:
+    ```js
+    const { stream, isFirst } = await cacheStore.getOrComputeStreaming(
+      keyId,
+      streamCacheKey,
+      async () => {
+        // sourceFactory: invoked only on first caller; encapsulates the D38
+        // tryAcquireSpawn gate and provider.spawn invocation
+        ...
+      }
+    );
+    ```
+    `isFirst` plumbed into the X-OLP-Streaming-Inflight header. The TOCTOU window collapses because Map check + insert is synchronous.
+
+13. **Test surface (when implementation lands).** At minimum:
+    - Single client streaming (`isFirst=true`, no joiners) — behavior identical to today.
+    - 2 concurrent identical streams — only 1 spawn (`getActiveSpawnCount` returns 1 at the spawn peak); both clients receive identical chunk sequences in order.
+    - 3 concurrent, mid-stream join — client 2 attaches mid-stream, receives accumulated burst + live tail; client 3 attaches after source-complete, served from cache.
+    - First-client disconnect mid-stream, clients 2/3 continue, source NOT aborted.
+    - All clients disconnect mid-stream → source aborted (AbortController fired), no cache write.
+    - Source errors mid-stream → all attached clients receive the error; no cache write.
+    - Backpressure: slow client → `PER_CLIENT_QUEUE_CAP` exceeded → `STREAM_BACKPRESSURE` disconnect with `finish_reason: 'length'`; other clients unaffected.
+    - D38 semaphore: 2 concurrent identical streams hitting `maxConcurrent=1` — first spawns, second JOINS (does not get CONCURRENCY_LIMIT). 3 concurrent DIFFERENT streams hitting `maxConcurrent=2` — first 2 spawn, third gets CONCURRENCY_LIMIT (existing D38 path).
+    - Cache TTL race: entry expires during inflight; late joiner attaches via inflight join; inflight completion overwrites the expired cache slot.
+    - Replay buffer cap: source produces > `ACCUMULATED_REPLAY_CAP`; entry marked not cacheable; late joiner past cap gets `STREAM_BACKPRESSURE`; first caller stream unaffected.
+    - X-OLP-Streaming-Inflight header values across all the above scenarios.
+
+14. **Defaults to ratify in implementation.** `PER_CLIENT_QUEUE_CAP = 1 MB`, `ACCUMULATED_REPLAY_CAP = 10 MB` (matches D23 cache-entry size cap), `STREAM_BACKPRESSURE` not in `HARD_TRIGGER_CODES`. These are starting points; v1.x implementation may tune based on real-world latency profiles.
+
+**Issue #16 status.** Stays OPEN as the v1.x implementation tracker. The issue body should be updated post-D42 to reference this amendment and adjust scope ("design ratified; implementation pending"). DO NOT close issue #16 until §13's test surface is green on the actual implementation.
+
+**Cross-references and safeguards (so the implementation is not forgotten):**
+- `docs/v1x-roadmap.md` (new at D42) — single landing page for all v1.x deferrals, with streaming SF as item #1. Each entry cross-references the relevant ADR amendment and the GitHub issue.
+- `lib/cache/store.mjs` — TODO comment near `getOrCompute` pointing at this amendment for the streaming sibling API.
+- `server.mjs` — TODO comment near the streaming branch entry (line ~810) pointing at this amendment + issue #16 with the words "ADR 0005 Amendment 8 — v1.x".
+- `README.md § Known limitations` — line item exposing this to users (current behavior: each concurrent identical streaming request spawns its own CLI).
+- This amendment is item #1 in the next session-start handoff if the maintainer opens a v1.x sprint.
+
+**Why this is the right shape (rationale):**
+- Mirrors the D4 buffered-path singleflight (`getOrCompute`) pattern, keeping the cache API surface coherent rather than fragmenting into two parallel coordination primitives.
+- Reuses D38 `tryAcquireSpawn` semantics for the first-caller path; attached callers naturally don't consume slots.
+- Late-joiner replay via `accumulatedChunks` resolves the case where a client arrives between source-spawn and source-complete without forcing it to wait for completion.
+- Bounded per-client queue protects against the "one slow client stalls the source" failure mode; the slow client gets a clean `STREAM_BACKPRESSURE` disconnect instead of corrupting the tee for other clients.
+- AbortController propagation ensures the source CLI process is reaped if all clients drop — no orphan processes consuming Anthropic/Codex/Mistral quota.
+
+**Authority:**
+- Amendment 6 (D34 F1) — original deferral with "design alone warrants a dedicated ADR" note; this amendment is the dedicated ADR.
+- GitHub issue #16 (round-6 F13) — sibling TOCTOU window; same root cause.
+- ADR 0002 Amendment 6 (D38) — `tryAcquireSpawn` / `releaseSpawn` semantics that the §7 coordination builds on.
+- D40 Amendment 5 — per-hop observability pattern that §11 extends to streaming.
+- CC 开发铁律 v1.6 § 10.x — design ADR ratification; fresh-context reviewer not required for design-only amendments (no code change in D42).
+
+**Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (design-only amendment per Iron Rule 10's implementation-phase scope — the implementation PR that lands this ADR's design will go through full Iron Rule 10 with a fresh-context opus reviewer at that time).
+
 ### Amendment 7 — 2026-05-24: Document cache-key-vs-CLI-args discrepancy as v0.1 conservative trade-off (D34 F8)
 
 - **Finding:** Round-6 cold-audit F8 (P2) — Provider plugins (`lib/providers/anthropic.mjs`, `codex.mjs`, `mistral.mjs`) drop `temperature`, `max_tokens`, `top_p`, `stop`, `tools`, and `tool_choice` when spawning their respective CLIs. These CLIs (`claude -p`, `codex exec --json`, `vibe --prompt`) do not accept those flags. However, the cache key (per Amendment 2) includes all of them. Consequence: two requests that differ only in `temperature` produce identical CLI output (the CLI ignores it) but different cache keys → spurious miss. The caller pays the spawn cost twice for what is, at the CLI layer, the same request.

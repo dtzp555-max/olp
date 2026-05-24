@@ -807,6 +807,12 @@ async function handleChatCompletions(req, res) {
   // Acquired here, released in the `finally` below. The gate intentionally
   // lives BEFORE the streaming-branch entry check so the buffered fallthrough
   // can re-attempt acquire from a clean slate.
+  // TODO(v1.x — ADR 0005 Amendment 8 / issue #16): replace this peek+spawn
+  // pattern with cacheStore.getOrComputeStreaming(...) to close the TOCTOU
+  // window between line ~782 peek and the spawn at line ~846, and to make N
+  // concurrent identical streaming requests share one spawn (tee-streaming).
+  // Design ratified in D42; see docs/v1x-roadmap.md #1 for the trigger and
+  // acceptance criteria. DO NOT remove this comment until the v1.x impl lands.
   let streamingAcquired = false;
   if (ir.stream && chain.length === 1 && !bypassCacheForFirstHop && !preCheckHit && cacheableForFirstHop) {
     const candidatePlugin = loadedProviders.get(chain[0].provider);

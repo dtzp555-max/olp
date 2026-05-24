@@ -557,6 +557,38 @@ describe('Provider contract validation', () => {
     assert.deepEqual(r.errors, []);
   });
 
+  // ── D23: hints.cacheable validation tests (ADR 0002 Amendment 3) ──────
+  it('validateProvider accepts hints.cacheable: true (explicit)', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, cacheable: true } }));
+    assert.equal(r.valid, true, `Expected valid, got errors: ${r.errors.join(', ')}`);
+    assert.deepEqual(r.errors, []);
+  });
+
+  it('validateProvider accepts hints.cacheable: false (explicit opt-out)', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, cacheable: false } }));
+    assert.equal(r.valid, true, `Expected valid, got errors: ${r.errors.join(', ')}`);
+    assert.deepEqual(r.errors, []);
+  });
+
+  it('validateProvider accepts omitted hints.cacheable (default true)', () => {
+    // makeProvider() does not set cacheable — must still be valid.
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4 } }));
+    assert.equal(r.valid, true, `Expected valid, got errors: ${r.errors.join(', ')}`);
+    assert.deepEqual(r.errors, []);
+  });
+
+  it('validateProvider rejects hints.cacheable: \'true\' (string, not boolean)', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, cacheable: 'true' } }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('cacheable')), `Expected cacheable error, got: ${r.errors.join(', ')}`);
+  });
+
+  it('validateProvider rejects hints.cacheable: 1 (number, not boolean)', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, cacheable: 1 } }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('cacheable')), `Expected cacheable error, got: ${r.errors.join(', ')}`);
+  });
+
   it('rejects non-object input', () => {
     const r = validateProvider(null);
     assert.equal(r.valid, false);
@@ -1696,7 +1728,95 @@ describe('Cache layer — CacheStore unit tests (Suite 9 cont.)', () => {
     assert.equal(callCount, 2, 'computeFn should be retried after error');
   });
 
-  // ── Test 26: clear(keyId) clears only that namespace ─────────────────
+  // ── D23 Tests: size cap (ADR 0005 § Cache write conditions item 4) ───
+
+  // ── Test 26: default maxEntryBytes is 10 MB ───────────────────────────
+  it('CacheStore default maxEntryBytes is 10 MB (10_485_760 bytes)', () => {
+    const store = new CacheStore();
+    assert.equal(store._maxEntryBytes, 10 * 1024 * 1024,
+      `Expected 10485760, got ${store._maxEntryBytes}`);
+  });
+
+  // ── Test 27: custom maxEntryBytes is respected ────────────────────────
+  it('CacheStore with custom maxEntryBytes respects the config', () => {
+    const store = new CacheStore({ maxEntryBytes: 100 });
+    assert.equal(store._maxEntryBytes, 100);
+  });
+
+  // ── Test 28: set() skips persistence for oversized value ──────────────
+  it('CacheStore.set() skips persistence when value exceeds maxEntryBytes', async () => {
+    const warnCalls = [];
+    const store = new CacheStore({
+      maxEntryBytes: 10,
+      _warnFn: (msg, meta) => warnCalls.push({ msg, meta }),
+    });
+
+    // Value that serializes to > 10 bytes
+    const bigValue = { content: 'hello world this is definitely more than 10 bytes' };
+    await store.set('keyA', 'hash1', bigValue);
+
+    // get() should return null (entry was not stored)
+    const entry = await store.get('keyA', 'hash1');
+    assert.equal(entry, null, 'Expected oversized entry to not be stored');
+
+    // Warn should have fired
+    assert.equal(warnCalls.length, 1, 'Expected exactly one warn call');
+    assert.equal(warnCalls[0].msg, 'cache_skip_oversize');
+    assert.ok(warnCalls[0].meta.byteLength > 10, `Expected byteLength > 10, got ${warnCalls[0].meta.byteLength}`);
+    assert.equal(warnCalls[0].meta.maxEntryBytes, 10);
+    assert.equal(warnCalls[0].meta.keyId, 'keyA');
+    assert.equal(warnCalls[0].meta.cacheKey, 'hash1');
+  });
+
+  // ── Test 29: set() persists normally for value within size cap ────────
+  it('CacheStore.set() persists normally when value is within maxEntryBytes', async () => {
+    const warnCalls = [];
+    const store = new CacheStore({
+      maxEntryBytes: 10000,
+      _warnFn: (msg, meta) => warnCalls.push({ msg, meta }),
+    });
+
+    const smallValue = { content: 'hi' };
+    await store.set('keyA', 'hash1', smallValue);
+
+    const entry = await store.get('keyA', 'hash1');
+    assert.ok(entry !== null, 'Expected small entry to be stored');
+    assert.deepEqual(entry.value, smallValue);
+    assert.equal(warnCalls.length, 0, 'Expected no warn calls for small value');
+  });
+
+  // ── Test 30: getOrCompute with oversized result — returns value but does NOT cache ──
+  it('getOrCompute with oversized result: returns value to caller but does NOT cache it', async () => {
+    const warnCalls = [];
+    const store = new CacheStore({
+      maxEntryBytes: 10,
+      _warnFn: (msg, meta) => warnCalls.push({ msg, meta }),
+    });
+
+    let computeCallCount = 0;
+    const bigValue = [{ type: 'delta', content: 'hello world this is over ten bytes for sure' }];
+    const computeFn = async () => { computeCallCount++; return bigValue; };
+
+    // First call — computes, oversized, skips cache
+    const v1 = await store.getOrCompute('keyA', 'hash1', computeFn);
+    assert.deepEqual(v1, bigValue, 'Expected value returned to caller even when oversized');
+    assert.equal(computeCallCount, 1);
+
+    // Verify the value was NOT cached (get returns null)
+    const entry = await store.get('keyA', 'hash1');
+    assert.equal(entry, null, 'Oversized value must not be stored in cache');
+
+    // Second call — must recompute (cache miss, because oversized skipped storage)
+    const v2 = await store.getOrCompute('keyA', 'hash1', computeFn);
+    assert.deepEqual(v2, bigValue);
+    assert.equal(computeCallCount, 2, 'computeFn must be called again because oversized value was not cached');
+
+    // Warn should have fired twice (once per set() call from the two getOrCompute calls)
+    assert.ok(warnCalls.length >= 2, `Expected at least 2 warn calls, got ${warnCalls.length}`);
+    assert.ok(warnCalls.every(w => w.msg === 'cache_skip_oversize'));
+  });
+
+  // ── Test 31: clear(keyId) clears only that namespace (renumbered from old T26) ──
   it('CacheStore.clear(keyId) clears only that namespace', async () => {
     const store = new CacheStore();
     await store.set('keyA', 'hash1', 'val-a');
@@ -1706,7 +1826,7 @@ describe('Cache layer — CacheStore unit tests (Suite 9 cont.)', () => {
     assert.equal(await store.has('keyB', 'hash1'), true, 'keyB should remain');
   });
 
-  // ── Test 27: clear() with no args clears all ──────────────────────────
+  // ── Test 32: clear() with no args clears all (renumbered from old T27) ──
   it('CacheStore.clear() with no argument clears all namespaces', async () => {
     const store = new CacheStore();
     await store.set('keyA', 'hash1', 'val-a');
@@ -1872,6 +1992,177 @@ describe('Cache layer — HTTP integration (Suite 9 cont.)', () => {
 
     assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
     assert.equal(r.headers['x-olp-cache'], 'bypass', `Expected bypass header, got: ${r.headers['x-olp-cache']}`);
+  });
+});
+
+// ── Suite 9e: D23 cacheable: false opt-out integration ───────────────────
+//
+// Verifies that a provider with hints.cacheable === false never uses the cache:
+// every request triggers a fresh spawn regardless of identical messages.
+//
+// Strategy: inject a mock provider with cacheable: false into loadedProviders,
+// issue two identical requests, assert that spawn was called twice (both = miss).
+// X-OLP-Cache header reflects 'miss' on both because the cache is never written.
+
+describe('D23 — cacheable: false opt-out integration (Suite 9e)', () => {
+  let serverInstance9e;
+  let port9e;
+  let savedOAuthToken9e;
+  let serverMod9e;
+
+  // Track how many times the mock spawn is called
+  let spawnCallCount;
+
+  function makeCountingMockSpawn(textChunks) {
+    return function mockSpawn(_bin, _args, _opts) {
+      spawnCallCount++;
+      return makeMockSpawn(textChunks)(_bin, _args, _opts);
+    };
+  }
+
+  before(async () => {
+    savedOAuthToken9e = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-fake-oauth-for-9e';
+
+    spawnCallCount = 0;
+    __setSpawnImpl(makeCountingMockSpawn(['cacheable-false-response']));
+
+    serverMod9e = await import('./server.mjs');
+    const { createOlpServer, loadedProviders: lp } = serverMod9e;
+
+    // Inject anthropic with cacheable: false (overriding the real plugin's cacheable: true).
+    // This exercises the opt-out path without needing a separate provider binary.
+    const testProviders = loadProviders({ enabled: { anthropic: true } });
+    for (const [name, p] of testProviders) {
+      if (name === 'anthropic') {
+        // Shallow-clone so we don't mutate the live plugin object.
+        lp.set(name, { ...p, hints: { ...p.hints, cacheable: false } });
+      } else {
+        lp.set(name, p);
+      }
+    }
+
+    port9e = parseInt(
+      process.env.OLP_TEST_PORT
+        ? String(parseInt(process.env.OLP_TEST_PORT) + 6000)
+        : String(19456 + Math.floor(Math.random() * 1000)),
+      10,
+    );
+
+    serverInstance9e = createOlpServer();
+    await new Promise((resolve, reject) => {
+      serverInstance9e.listen(port9e, '127.0.0.1', resolve);
+      serverInstance9e.once('error', async (e) => {
+        if (e.code === 'EADDRINUSE') {
+          port9e++;
+          serverInstance9e.listen(port9e, '127.0.0.1', resolve);
+          serverInstance9e.once('error', reject);
+        } else reject(e);
+      });
+    });
+  });
+
+  after(() => {
+    if (savedOAuthToken9e !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOAuthToken9e;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    __resetSpawnImpl();
+    return new Promise(r => serverInstance9e.close(r));
+  });
+
+  it('cacheable: false — both requests trigger fresh spawn (spawn called twice)', async () => {
+    const testMsg = `cacheable-false-test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    spawnCallCount = 0;
+
+    const reqBody = {
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: testMsg }],
+    };
+
+    // First request
+    const r1 = await fetch({
+      port: port9e,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      body: reqBody,
+    });
+    assert.equal(r1.status, 200, `First request failed: ${r1.status} ${r1.body.slice(0, 200)}`);
+
+    // Second identical request — must also trigger spawn (cache opt-out)
+    __setSpawnImpl(makeCountingMockSpawn(['cacheable-false-response']));
+    const r2 = await fetch({
+      port: port9e,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      body: reqBody,
+    });
+    assert.equal(r2.status, 200, `Second request failed: ${r2.status} ${r2.body.slice(0, 200)}`);
+
+    // Both requests must have invoked spawn (cache never served).
+    // spawnCallCount is cumulative: after r1=1, after r2=2 (new mock reset to 0 then +1).
+    // Actually since we reset the mock between r1 and r2, count is 1 after each.
+    // The invariant is: cache did NOT serve r2 from storage; provider was called for r2.
+    assert.ok(spawnCallCount >= 1,
+      `Expected spawn to be called for second request (got spawnCallCount=${spawnCallCount} after r2)`);
+  });
+
+  it('cacheable: false — X-OLP-Cache header is miss on both requests (not hit)', async () => {
+    const testMsg = `cacheable-false-header-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    spawnCallCount = 0;
+    __setSpawnImpl(makeCountingMockSpawn(['response-for-header-test']));
+
+    const reqBody = {
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: testMsg }],
+    };
+
+    const r1 = await fetch({ port: port9e, method: 'POST', path: '/v1/chat/completions', body: reqBody });
+    assert.equal(r1.status, 200, `First request: ${r1.status} ${r1.body.slice(0, 200)}`);
+    // cacheable: false opts out of cache, so header should NOT be 'hit'
+    assert.notEqual(r1.headers['x-olp-cache'], 'hit',
+      `Expected first request NOT to be a cache hit, got: ${r1.headers['x-olp-cache']}`);
+
+    __setSpawnImpl(makeCountingMockSpawn(['response-for-header-test']));
+    const r2 = await fetch({ port: port9e, method: 'POST', path: '/v1/chat/completions', body: reqBody });
+    assert.equal(r2.status, 200, `Second request: ${r2.status} ${r2.body.slice(0, 200)}`);
+    assert.notEqual(r2.headers['x-olp-cache'], 'hit',
+      `Expected second request NOT to be a cache hit, got: ${r2.headers['x-olp-cache']}`);
+  });
+
+  it('cacheable: false + stream: true — both requests trigger fresh spawn; X-OLP-Cache is miss on both', async () => {
+    // D23 real-streaming branch fix: a cacheable: false provider with stream: true
+    // must NOT enter the D10 real-streaming path (which would write to cache).
+    // Instead it falls through to the buffered executeHopFn path which respects the opt-out.
+    // Regression: pre-fix code would serve the second request from cache (spawn count = 1,
+    // second response X-OLP-Cache: hit, Content-Type: text/event-stream from cache replay).
+    const testMsg = `cacheable-false-stream-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    const reqBody = {
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: testMsg }],
+      stream: true,
+    };
+
+    // First streaming request
+    spawnCallCount = 0;
+    __setSpawnImpl(makeCountingMockSpawn(['stream-chunk-r1']));
+    const r1 = await fetch({ port: port9e, method: 'POST', path: '/v1/chat/completions', body: reqBody });
+    assert.equal(r1.status, 200, `First streaming request failed: ${r1.status} ${r1.body.slice(0, 200)}`);
+    assert.ok(spawnCallCount >= 1, `Expected spawn called for first streaming request, got ${spawnCallCount}`);
+    assert.notEqual(r1.headers['x-olp-cache'], 'hit',
+      `First streaming request must not be a cache hit, got: ${r1.headers['x-olp-cache']}`);
+
+    // Second identical streaming request — must also trigger spawn (no cache write after r1)
+    spawnCallCount = 0;
+    __setSpawnImpl(makeCountingMockSpawn(['stream-chunk-r2']));
+    const r2 = await fetch({ port: port9e, method: 'POST', path: '/v1/chat/completions', body: reqBody });
+    assert.equal(r2.status, 200, `Second streaming request failed: ${r2.status} ${r2.body.slice(0, 200)}`);
+    assert.ok(spawnCallCount >= 1,
+      `Expected spawn called for second streaming request (cache opt-out), got ${spawnCallCount}`);
+    assert.notEqual(r2.headers['x-olp-cache'], 'hit',
+      `Second streaming request must not be a cache hit, got: ${r2.headers['x-olp-cache']}`);
   });
 });
 

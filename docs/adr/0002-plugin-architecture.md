@@ -7,6 +7,14 @@
 
 ## Amendments
 
+### Amendment 3 — 2026-05-24: Add `cacheable` to Provider contract hints (D23)
+
+- **Finding:** Cold-audit round-2 Finding 3 (P2 contract/cache-condition drift) — ADR 0005 § "Cache write conditions" item 3 references `hints.cacheable` but the field was never named in this ADR's Provider contract hints list. `validateProvider` did not enforce it; no plugin declared it; no consumer read it. The field existed only in prose.
+- **Change:** Add `cacheable: boolean (optional, default true)` to the contract hints. Plugins that omit it are treated as `cacheable: true` (backward-compatible default — preserves v0.1 behavior for the three shipped plugins). A plugin author who explicitly sets `cacheable: false` opts out of OLP's response cache entirely: `executeHopFn` in `server.mjs` skips `cacheStore.getOrCompute` and calls `collectAllChunks` directly; neither `cache.get` nor `cache.set` is called for that hop.
+- **Rationale:** Some providers may be cheap and stateful enough that caching adds risk without value (e.g., providers with strong intra-session continuity, or providers whose output is intentionally non-deterministic). Giving plugins an explicit opt-out keeps the design honest without imposing a runtime cost on the common case (all three shipped plugins are `cacheable: true`).
+- **Authority:** ADR 0005 § "Cache write conditions" item 3 — established the field; D23 ratifies it in the contract.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (Round-2 Cold Audit caught it as Finding 3).
+
 ### Amendment 1 — 2026-05-23: Add `maxSpawnTimeMs` to Provider contract hints (retroactive sync)
 
 - **Finding:** Cold-audit Finding 4 (P2 governance violation) — commit `2cfd0b1` (D10) added `maxSpawnTimeMs` to all three provider plugins (`anthropic.mjs`, `codex.mjs`, `mistral.mjs`) and the fallback engine's spawn-timeout enforcement loop, but the Provider contract documentation in this ADR was not updated in the same merge.
@@ -63,11 +71,12 @@ Every provider plugin exports an object conforming to:
 - `estimateCost: (request) => { inputTokens, outputTokensEstimate, currency, usd }` — best-effort, may return null
 - `quotaStatus: async (authContext) => { available, percentUsed, resetsAt, pool }` — best-effort, null if unretrievable
 - `healthCheck: async () => { ok, latencyMs, error? }` — startup and `/health` endpoint use this
-- `hints: { requiresTTY, concurrentSpawnSafe, maxConcurrent, maxSpawnTimeMs }` — fingerprint, concurrency, and timeout hints:
+- `hints: { requiresTTY, concurrentSpawnSafe, maxConcurrent, maxSpawnTimeMs, cacheable }` — fingerprint, concurrency, timeout, and cache hints:
   - `requiresTTY` — boolean; whether the provider CLI requires a TTY to produce non-interactive output (e.g., some CLIs suppress JSON output unless forced with a flag or a TTY is present).
   - `concurrentSpawnSafe` — boolean; whether the provider CLI is safe to spawn concurrently under the same auth context without rate-limit or session collisions.
   - `maxConcurrent` — integer; maximum simultaneous spawn count OLP will allow for this provider. **Declarative hint only at v0.1**: the value is type-validated at startup (`lib/providers/base.mjs`) but no runtime enforcement (semaphore / in-flight counter / spawn queue) is wired in `server.mjs` yet. Tracking issue to be filed for a follow-up that lands the runtime guard.
   - `maxSpawnTimeMs` — optional integer, milliseconds; maximum wall-clock time OLP allows for a single provider spawn before treating it as a hard fallback trigger. Defaults to `600000` (10 minutes) if absent. Used by the fallback engine's spawn-timeout enforcement loop; see ADR 0004 § Trigger taxonomy — Hard triggers bullet 4.
+  - `cacheable` — optional boolean, default `true`; if explicitly set to `false`, the provider opts out of OLP's response cache entirely. `executeHopFn` skips `cacheStore.getOrCompute` and calls `collectAllChunks` directly; no cache read or write occurs for any request to this provider. Omitting the field is equivalent to `cacheable: true`. See ADR 0005 § "Cache write conditions" item 3 and Amendment 3 above. (D23)
 
 **Loading model.** `lib/providers/index.mjs` is a hand-maintained static enumeration. There is no filesystem scan, no `require.context`, no dynamic discovery. Adding a provider requires:
 1. Write `lib/providers/<name>.mjs` conforming to the contract.

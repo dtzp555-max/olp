@@ -444,6 +444,19 @@ async function handleChatCompletions(req, res) {
       return chunks;
     }
 
+    // D23: cacheable opt-out check (ADR 0002 Amendment 3 + ADR 0005 Amendment 3).
+    // If a provider explicitly sets hints.cacheable === false, skip the cache entirely
+    // for every request to this provider. collectAllChunks is called directly; neither
+    // cacheStore.get nor cacheStore.set is invoked. This is upstream of D13's
+    // cache_control bypass — both are "skip the cache" paths, but for different reasons.
+    if (hopProviderPlugin.hints?.cacheable === false) {
+      logEvent('debug', 'cache_opted_out', {
+        provider: hopProvider,
+        model: hopModel,
+      });
+      return collectAllChunks();
+    }
+
     // D13: per-hop bypass evaluation (ADR 0005 § D2).
     // Bypass only when this hop's provider is Anthropic AND markers are present.
     const bypassCacheForThisHop = shouldBypassCacheForHop(hopProvider);
@@ -482,8 +495,13 @@ async function handleChatCompletions(req, res) {
   // bypass (anthropic + markers), the cache is not consulted (preCheckHit=false).
   // If the first hop is non-Anthropic (or no markers), the cache peek proceeds normally.
   const bypassCacheForFirstHop = shouldBypassCacheForHop(chain[0].provider);
+  // D23: ADR 0002 Amendment 3 — cacheable: false providers skip cache entirely.
+  // Compute once here so both the peek guard and the streaming-branch entry condition
+  // can consult the same flag without re-reading the plugin map.
+  const firstHopProvider = loadedProviders.get(chain[0].provider);
+  const cacheableForFirstHop = firstHopProvider?.hints?.cacheable !== false;
   const firstHopCacheKey = computeCacheKey(chain[0].provider, chain[0].model, ir);
-  const preCheckHit = bypassCacheForFirstHop ? false : await cacheStore.peek(keyId, firstHopCacheKey);
+  const preCheckHit = (bypassCacheForFirstHop || !cacheableForFirstHop) ? false : await cacheStore.peek(keyId, firstHopCacheKey);
 
   // ── P1.2: Real SSE streaming path (single-hop cache-miss) ──────────────
   // ADR 0003 entry adapter pattern: for await irChunk → res.write(irChunkToOpenAISSE).
@@ -491,6 +509,8 @@ async function handleChatCompletions(req, res) {
   //   - stream===true  → caller wants SSE
   //   - chain.length===1  → no fallback needed; first-chunk rule allows streaming
   //   - !bypassCacheForFirstHop + !preCheckHit → genuine cache miss (not hit/bypass)
+  //   - cacheableForFirstHop → provider allows caching (D23: cacheable: false falls
+  //     through to the buffered executeHopFn path which already respects the opt-out)
   //
   // If any chunk has been written (firstChunkEmitted), fallback is impossible
   // per ADR 0004 § Fallback safety first-chunk rule. On error after first chunk:
@@ -499,7 +519,7 @@ async function handleChatCompletions(req, res) {
   //
   // On success: write chunks to res AND cache so subsequent identical requests
   // hit the burst-replay path.
-  if (ir.stream && chain.length === 1 && !bypassCacheForFirstHop && !preCheckHit) {
+  if (ir.stream && chain.length === 1 && !bypassCacheForFirstHop && !preCheckHit && cacheableForFirstHop) {
     const streamProvider = chain[0].provider;
     const streamModel = chain[0].model;
     const streamCacheKey = computeCacheKey(streamProvider, streamModel, ir);
@@ -561,12 +581,17 @@ async function handleChatCompletions(req, res) {
           res.write(SSE_DONE);
           res.end();
           // Cache the buffered chunks for burst-replay on subsequent identical requests.
-          await cacheStore.set(keyId, streamCacheKey, streamedChunks);
-          logEvent('info', 'streaming_response_cached', {
-            provider: streamProvider,
-            model: streamModel,
-            chunks: streamedChunks.length,
-          });
+          // D23 defense-in-depth: cacheableForFirstHop is true here (cacheable: false
+          // falls through to the buffered path, never enters this block), but the guard
+          // makes the intent explicit and survives future refactors.
+          if (cacheableForFirstHop) {
+            await cacheStore.set(keyId, streamCacheKey, streamedChunks);
+            logEvent('info', 'streaming_response_cached', {
+              provider: streamProvider,
+              model: streamModel,
+              chunks: streamedChunks.length,
+            });
+          }
           return;
         }
       }
@@ -574,7 +599,8 @@ async function handleChatCompletions(req, res) {
       // Generator exhausted without a stop chunk — emit [DONE] and cache.
       res.write(SSE_DONE);
       res.end();
-      if (streamedChunks.length > 0) {
+      // D23 defense-in-depth: same guard as the stop-chunk path above.
+      if (streamedChunks.length > 0 && cacheableForFirstHop) {
         await cacheStore.set(keyId, streamCacheKey, streamedChunks);
       }
     } catch (e) {

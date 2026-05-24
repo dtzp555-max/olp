@@ -86,6 +86,8 @@ OLP reads its config from `~/.olp/config.json`. The minimum useful shape:
 }
 ```
 
+> **Note:** `routing.soft_triggers` thresholds are parsed and stored but have **no runtime effect at v0.1** — the quota polling path (`quotaStatus()` per hop) is deferred to v1.x per [ADR 0004 Amendment 2](./docs/adr/0004-fallback-engine.md#amendment-2--2026-05-24-soft-triggers-deferred-to-v1x-d22). The evaluation logic exists and is tested; only the production data ingestion path is deferred.
+
 Trigger types, fallback safety, idempotency rules, and the full example config land here when Phase 4 ships. See [ADR 0004 (Fallback Engine Semantics & Safety)](./docs/adr/0004-fallback-engine.md) for the design.
 
 ---
@@ -147,6 +149,7 @@ Phase 1 is in progress. This table reflects what is currently shipped vs. what i
 | `lib/cache/keys.mjs` | ✅ Shipped | Content-addressed key computation |
 | `lib/cache/store.mjs` | ✅ Shipped | In-memory Map (file-backed layout: 📋 Phase 2 storage adapter) |
 | `lib/fallback/engine.mjs` | ✅ Shipped | Trigger evaluation + chain advancement (ADR 0004) |
+| Soft trigger data path (`quotaStatus()` polling) | 📋 Planned (v1.x) | Evaluation logic shipped + tested; data ingestion deferred per ADR 0004 Amendment 2 |
 | `models-registry.json` | ✅ Shipped | SPOT for `(provider, model)` metadata |
 | `test-features.mjs` | ✅ Shipped | 328-test suite (CI: `test.yml`) |
 | `lib/keys.mjs` | 📋 Planned (Phase 2) | Multi-key auth, per-key namespacing, audit log |

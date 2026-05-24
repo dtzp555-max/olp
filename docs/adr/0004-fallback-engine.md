@@ -25,6 +25,20 @@
 
 - **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (Cold Audit). Diff-review reviewers on earlier passes focused on the first-chunk rule for the real-streaming path; the buffered path has its own truncation-vs-fallback decision point, which the cold-audit pass on 2026-05-23 identified as Finding 17.
 
+### Amendment 2 — 2026-05-24: Soft triggers deferred to v1.x (D22)
+
+- **Finding:** Cold-audit round-2 Finding 2 (P2 — feature surface implemented but data ingestion not wired). The § Trigger taxonomy in the Decision section below lists soft triggers as a live, configurable feature category. However, `evaluateSoftTriggers` in `lib/fallback/engine.mjs` is inert at v0.1 because: (a) `buildDefaultChain` hardcodes `quotaSnapshot: null` on every hop; (b) no call site for `provider.quotaStatus()` exists in production code paths (`server.mjs` or `lib/fallback/engine.mjs`); (c) `evaluateSoftTriggers` correctly short-circuits to `false` when `quotaSnapshot == null`. A user populating `routing.soft_triggers` in `~/.olp/config.json` gets zero runtime effect at v0.1.
+
+- **Decision:** Defer soft triggers to v1.x — re-classify them alongside Deterministic-deferred and Cost-aware-deferred in the trigger taxonomy. The evaluation code (`evaluateSoftTriggers` in `lib/fallback/engine.mjs`) stays in place: it is small, well-tested via unit tests that inject quota snapshots directly, and architecturally correct. v1.x reactivation requires only wiring the data ingestion path, not rewriting the evaluation logic. Configured `routing.soft_triggers` thresholds in `~/.olp/config.json` have no runtime effect at v0.1 and are silently ignored.
+
+- **Rationale:** At v0.1, wiring `quotaStatus()` polling requires: per-hop async I/O before each spawn decision, error handling for providers that do not implement the optional `quotaStatus()` method, a caching layer to avoid re-polling on every request, and a latency budget for a pre-spawn network call. No current provider has a reliable quota endpoint (`claude -p` does not expose quota; `codex exec --json` does not; `vibe --prompt` does not). Implementation cost is high; value at v0.1 is zero. The inert-but-correct state is the conservative call.
+
+- **Effect on § Trigger taxonomy:** The soft triggers entry in the table below is updated to mark soft triggers as deferred to v1.x, alongside Deterministic-deferred and Cost-aware-deferred. The architectural text describing the soft trigger design (the three threshold types) is retained — it remains the correct v1.x design — with an inline deferral note appended.
+
+- **What v1.x reactivation looks like:** A single ADR amendment + three code changes: (a) wire `await provider.quotaStatus(authContext)` in `buildDefaultChain` or per-hop in `executeWithFallback`, (b) populate `chainHop.quotaSnapshot` from the polling result, (c) add integration tests verifying the production path produces non-null snapshots that drive evaluation. The `evaluateSoftTriggers` function in `engine.mjs` does not change.
+
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (Round-2 Cold Audit). Diff-review reviewers on D5/D9 focused on evaluation correctness; nobody traced the production data path end-to-end to verify `quotaSnapshot` was ever populated. Round-2 cold audit caught it.
+
 ## Context
 
 A multi-provider proxy is only valuable if it fails over gracefully. Per spec §1, OLP's core value proposition is "your IDEs and family clients keep working as long as *any* of your subscriptions has quota left." If Anthropic returns 529 (overloaded), or OpenAI returns 429 with `insufficient_quota`, or `claude -p` exits non-zero, the client should not see an error; the client should see the next provider in the chain transparently take over.
@@ -56,6 +70,7 @@ Per spec §4.3, the OLP fallback engine implements the following:
   - `daily_request_count_threshold` — fall back after N requests on the primary today
   - `five_hour_window_percent_threshold` — fall back based on rolling 5h window quota usage
   - Soft triggers are evaluated *before* spawn. If a soft trigger fires for the primary, the proxy advances to the next chain entry without attempting the primary at all.
+  - **📋 Deferred to v1.x (Amendment 2)** — evaluation surface is implemented in `lib/fallback/engine.mjs#evaluateSoftTriggers` and unit-tested, but the production data ingestion path (`quotaStatus()` polling per hop) is deferred to v1.x. Configured `routing.soft_triggers` thresholds in `~/.olp/config.json` have no runtime effect at v0.1.
 
 - **Deterministic triggers (deferred to v1.x).** Time-of-day routing, request-content routing ("code requests prefer Codex"). Out of scope for v0.1; tracked in spec §8 future work.
 

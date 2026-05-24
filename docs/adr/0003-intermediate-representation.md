@@ -5,6 +5,20 @@
 - **Authors:** project maintainer (with AI drafting assistance)
 - **Related:** OLP v0.1 spec §4.1, §4.2 (IR subsection); ADR 0002 (plugin architecture); ADR 0004 (fallback engine — requires shape-stable requests for safe replay)
 
+## Amendments
+
+### Amendment 1 — 2026-05-24: Remove __irRoundTripTest() claim; document substitute test strategy (D31 F5)
+
+- **Finding:** Round-3 cold-audit F5 (P2 ADR-claim vs implementation drift) — § Mitigations names a `__irRoundTripTest()` export on every provider plugin as the structural counter-measure against silent lossy translation. ZERO plugins export this function; the export-name was an early-design aspiration that does not fit the actual plugin shape (spawn-wrappers with asymmetric request→CLI-args+stdin and response-stream→IR, not symmetric `irToNative`+`nativeToIR` functions that could be tested in isolation via a round-trip fixture).
+- **Decision:** Remove the `__irRoundTripTest()` export-name claim from § Mitigations. The structural counter-measure against silent lossy translation is preserved via the existing test strategy documented below; the goal (CI-visible lossy-translation coverage) is met; only the mechanism name was wrong.
+- **Substitute test strategy (live at v0.1):**
+  - Entry-surface IR↔OpenAI round-trip — Suite 3 (`irChunkToOpenAISSE format` + `openai-to-ir` tests in `test-features.mjs`) covers the OpenAI ↔ IR direction at the entry surface.
+  - Per-plugin spawn-with-mock tests in each plugin's test block (anthropic, codex, and mistral spawn unit tests) exercise the IR → CLI args → IR-chunk round-trip end-to-end.
+  - Lossy-translation edges are documented inline in each plugin's header comment; `mistral.mjs`'s explicit "DOCS-N" UNPINNED markers are the most thorough example; `anthropic.mjs` and `codex.mjs` carry equivalent lossy-field tables in their headers.
+  - Future plugins MUST include both: (a) a spawn-with-mock test block, and (b) header documentation of any lossy IR fields. These two requirements are the enforcement mechanism replacing the `__irRoundTripTest()` export-name aspiration.
+- **Original § Mitigations update:** The `__irRoundTripTest()` sentence in § Mitigations below is replaced with a pointer to this amendment. See § Mitigations.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (Round-3 Cold Audit caught it as F5).
+
 ## Context
 
 OLP exposes exactly one external API surface: OpenAI-compatible `/v1/chat/completions` (per spec §4.1). Internally, OLP fans out to N providers, each with its own native protocol — Anthropic Messages API, OpenAI Chat Completions, Mistral La Plateforme, xAI Grok, Moonshot Kimi, etc. The combinatorial fact is unavoidable: a request entering as OpenAI shape must exit as Anthropic shape (or Mistral shape, or whatever the routing chain advances to), and the response on the way back must travel the inverse path.
@@ -86,7 +100,7 @@ for await (const irChunk of irResponseStream) {
 
 **Mitigations**
 - IR v1.0 is deliberately a subset, not a superset, of what providers can do. Where providers diverge in expressive power (tool calling, structured outputs, reasoning modes), the IR encodes the *common subset* in v1.0, with caveats documenting provider extensions. Expanding the IR to cover provider extensions is an explicit amendment, not a silent generalization.
-- Each provider plugin includes a `__irRoundTripTest()` export that exercises the plugin's `irToNative` + `nativeToIR` pair against a fixture set in `test-features.mjs`. Round-trip discrepancies fail CI. This is the structural counter-measure against the silent-lossy-translation failure mode.
+- *(The `__irRoundTripTest()` export-name claim that originally appeared here was removed by Amendment 1 (D31 F5). The structural counter-measure against silent lossy translation is the substitute test strategy described in Amendment 1: entry-surface round-trip tests in Suite 3 of `test-features.mjs` + per-plugin spawn-with-mock test blocks + inline lossy-field header documentation. Future plugins must satisfy both requirements.)*
 - The IR has no external surface. If IR v1.0 turns out to be the wrong shape and IR v2.0 is incompatible, the migration is OLP-internal: provider plugins are updated, the entry adapter is updated, no client code changes. The cost of being wrong is bounded by the project's own codebase.
 
 ## Alternatives considered

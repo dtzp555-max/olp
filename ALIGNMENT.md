@@ -34,6 +34,34 @@ The five Rules below apply to every PR touching a provider plugin, the entry sur
 
 5. **Rule 5 (Cite in Commits).** Every commit touching `lib/providers/<name>.mjs` must cite the provider CLI authority in the commit body. Every commit touching the entry surface must cite the OpenAI spec section URL. Every commit touching the IR must cite the authorizing ADR. CI performs a soft check for the citation pattern; reviewers enforce per `CLAUDE.md`.
 
+### Rule 4 exception class — Speculative-Candidate Plugin (D31 F13+F14)
+
+Rule 4 says "unalignable plugins / fields are deleted, not feature-flagged." This sub-section formalizes a narrow exception: a plugin may ship in `lib/providers/<name>.mjs` with UNPINNED assumptions documented in its header IF AND ONLY IF all five of the following hold:
+
+1. The plugin's `STATIC_REGISTRY` entry is present (so the Provider contract validates at startup).
+2. The plugin is `candidate: true` in `models-registry.json` (or equivalently, the plugin's row in the Provider Inventory table below is in the **Candidate Providers** section, not **Enabled Providers**).
+3. The plugin is NOT in any user's `providers.enabled` config — i.e., it cannot be Enabled in any deployment. `POST /v1/chat/completions` returns 503 for this provider until a Phase E2E audit passes and the enabled flag is explicitly set.
+4. The plugin header contains an explicit section enumerating each speculative shape assumption with a labeled assumption-ID (e.g., A3, A4) and a planned-pin trigger (e.g., "D7 will probe via real CLI capture", "first enable will pin").
+5. The plugin's defensive multi-shape parsers (e.g., trying multiple NDJSON event field names) are tied to the UNPINNED markers — a future implementer can grep the header assumption labels to find every speculative branch and remove all but the actually-observed shape at pin time.
+
+A plugin satisfying all five conditions is a **Speculative-Candidate**. It is Rule 2 / Rule 4 compliant via this exception class.
+
+**Enablement (Speculative-Candidate → Enabled)** requires:
+- Removing the UNPINNED assumption labels from the header (replacing each with `CONFIRMED` or `CONFIRMED-NOT-APPLICABLE` as appropriate).
+- Replacing defensive multi-shape parsers with single-shape implementations matching the observed (now-pinned) wire format.
+- Filing a per-assumption ADR amendment or a single inclusion ADR (per ADR 0006) documenting the primary-source pin for each assumption that was UNPINNED.
+
+**Currently in this class (D31 ratification, 2026-05-24):**
+
+| Plugin file | Phase | Labelled UNPINNED assumptions |
+|---|---|---|
+| `lib/providers/codex.mjs` (D6) | Phase 2 | A3 (auth token field name), A4 (NDJSON event schema) |
+| `lib/providers/mistral.mjs` (D8) | Phase 3 | A4 (JSON output event schema), A5 (model flag), A6 (exact model IDs), A7 (streaming vs json output mode), A8 (stdin prompt passing) |
+
+The Anthropic plugin (`lib/providers/anthropic.mjs`, D4–D5) is NOT in this class — its CLI authority is pinned (`@anthropic-ai/claude-code` v2.1.89 per the Provider Authority Pins table above). It conforms to the standard Rule 4 path.
+
+**CI enforcement note:** The `alignment.yml` workflow does not currently enforce the Speculative-Candidate annotation requirement automatically. The five-condition check is a reviewer obligation. A future PR may add a grep-based gate requiring any file in `lib/providers/` that contains the string `UNPINNED` to also contain the five-condition annotations. D31 establishes the class; automated enforcement is deferred.
+
 ---
 
 ## Authorities

@@ -1206,6 +1206,53 @@ describe('Cache layer — computeCacheKey (Suite 9)', () => {
     const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
     assert.equal(k1, k2);
   });
+
+  // ── D15 Tests: Amendment 2 — max_tokens, top_p, stop, tool_choice ────
+
+  // ── Test 9: max_tokens distinguishes ─────────────────────────────────
+  it('computeCacheKey differs when max_tokens differs (D15 Amendment 2)', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'x' }], max_tokens: 100 });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'x' }], max_tokens: 4000 });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir1);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 10: top_p distinguishes ──────────────────────────────────────
+  it('computeCacheKey differs when top_p differs (D15 Amendment 2)', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'x' }], top_p: 0.5 });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'x' }], top_p: 0.9 });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir1);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 11: stop distinguishes ───────────────────────────────────────
+  it('computeCacheKey differs when stop sequences differ (D15 Amendment 2)', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'x' }], stop: ['\n'] });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'x' }], stop: ['END', '\n'] });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir1);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 12: tool_choice distinguishes ───────────────────────────────
+  it('computeCacheKey differs when tool_choice differs (D15 Amendment 2)', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'x' }], tool_choice: 'auto' });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'x' }], tool_choice: 'none' });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir1);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
+    assert.notEqual(k1, k2);
+  });
+
+  // ── Test 13: undefined max_tokens stable (both absent → same key) ────
+  it('computeCacheKey is identical when max_tokens absent in both requests (D15 Amendment 2)', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'x' }] });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'x' }] });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir1);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
+    assert.equal(k1, k2);
+  });
 });
 
 describe('Cache layer — extractCacheControlMarkers + hasCacheControl (Suite 9 cont.)', () => {

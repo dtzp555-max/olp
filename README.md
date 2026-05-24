@@ -155,7 +155,7 @@ See also the [Implementation status](#implementation-status-as-of-2026-05-24) ta
 
 Every response served through OLP carries:
 
-- `X-OLP-Provider-Used: <provider-key>` — which provider's plugin served the request.
+- `X-OLP-Provider-Used: <provider-key>` — which provider's plugin served the request. On a chain-exhausted response, this identifies the chain's configured primary entry (`chain[0]`), not necessarily the first hop where `spawn()` was invoked — see ADR 0004 Amendment 6 for the v0.1 chain-origin semantics and the v1.x soft-trigger reactivation note.
 - `X-OLP-Model-Used: <model-id>` — which model the served provider used.
 - `X-OLP-Fallback-Hops: <n>` — number of fallback hops (`0` if served by the primary chain entry).
 - `X-OLP-Cache: hit | miss | bypass` — cache layer outcome.

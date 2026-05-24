@@ -27,6 +27,15 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 - **Authority:** ADR 0004 § Decision § Chain advancement step 4 (original promise — D40 fulfils it); ADR 0004 Amendment 5 (D40 ratification); D18 (5 standard X-OLP-* headers; D40 builds on the convention); D28 (per-hop structured log fields; D40 reuses the field shapes); GitHub issue #7 — closed by this commit.
 - **Test count:** 452 → 468 (7 engine-level tuple-shape tests + 6 serialiser unit tests including the 4KB cap + non-ASCII regression + 3 HTTP integration tests).
 
+### D41 — `X-OLP-Provider-Used` semantics documented (issue #8)
+
+- **Doc-only clarification.** On a chain-exhausted response, `X-OLP-Provider-Used` identifies the chain's configured primary entry (`chain[0].provider`), not necessarily the first hop where `spawn()` was actually invoked. At v0.1 this is unobservable because soft triggers are deferred (ADR 0004 Amendment 2) — every hop is attempted in order, so chain-origin and first-attempted are equivalent. When soft triggers reactivate in v1.x, a soft-skipped hop 0 followed by hard-failed hops 1+N would still report `providerUsed=chain[0]` despite chain[0] never being spawned.
+- **Option B (document chain-origin) chosen over Option A (track `firstAttemptedProvider`).** Rationale: Option A would add state to `executeWithFallback` for an unreachable v0.1 code path (ALIGNMENT.md Rule 2 — No Invention). The D40 `X-OLP-Fallback-Detail` header already carries precise per-hop spawn history (including soft-skip records with `trigger_type: 'soft'`), so the disambiguation channel exists on the wire without needing `providerUsed` to handle it.
+- **Updates:** ADR 0004 Amendment 6 documents the semantics; `README.md` § Observability headers replaces "which provider's plugin served the request" with the chain-origin wording; `lib/fallback/engine.mjs` chain-exhausted return site gains an inline comment citing the amendment and the v1.x re-evaluation note.
+- **No code-behavior change. No new tests** — the relevant scenario is dead-by-config at v0.1; the v1.x soft-trigger reactivation work should add a test that exercises the soft-skip + chain-exhausted edge case and pins whichever option the v1.x maintainer chooses (the amendment names Option A as the likely v1.x preference).
+- **Authority:** ADR 0004 Amendment 6 (this commit); ADR 0004 § Decision § Chain advancement step 4; ADR 0004 Amendment 2 (soft triggers deferred — precondition); ADR 0004 Amendment 5 (per-hop attribution channel via `X-OLP-Fallback-Detail`); ALIGNMENT.md Rule 2 (No Invention rationale); GitHub issue #8 — closed by this commit.
+- **Test count:** 468 → 468 (no test change).
+
 ## v0.1.0 — 2026-05-24
 
 ### Phase 1 Close — Multi-provider proxy core

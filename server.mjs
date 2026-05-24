@@ -29,7 +29,7 @@ import {
   generateRequestId,
   SSE_DONE,
 } from './lib/ir/ir-to-openai.mjs';
-import { loadProviders, listAllProviderNames } from './lib/providers/index.mjs';
+import { loadProviders, listAllProviderNames, getAliasMap } from './lib/providers/index.mjs';
 import { ProviderError } from './lib/providers/base.mjs';
 import { computeCacheKey, hasCacheControl, extractCacheControlMarkers } from './lib/cache/keys.mjs';
 import { CacheStore } from './lib/cache/store.mjs';
@@ -259,17 +259,21 @@ function handleHealth(req, res) {
  * Returns the list of models served by all currently loaded (enabled) providers.
  * Per ADR 0002 § "Loading model" + OpenAI spec /v1/models:
  *   Each entry: { id, object: 'model', created, owned_by }
- *   - id:        canonical model ID from the provider's models[] array
+ *   - id:        canonical model ID (or alias string for alias entries)
  *   - object:    literal 'model' (OpenAI spec)
  *   - created:   Unix epoch seconds (stable per request; computed once from Date.now())
  *   - owned_by:  provider.name (e.g. 'anthropic', 'openai', 'mistral')
- * Only canonical IDs are emitted (no aliases — per D17 SPOT decision).
- * Order: insertion order of loadedProviders, then insertion order of each provider's models[].
+ * Order: canonical models first (insertion order of loadedProviders, then models[]),
+ *        then alias entries (for aliases whose target provider is currently loaded).
+ * Authority: OpenAI /v1/models spec (https://platform.openai.com/docs/api-reference/models);
+ *            models-registry.json alias map (SPOT per D17); F15 round-3 adds alias surfacing.
  * Empty case: if no providers are enabled, data: [] is returned naturally.
  */
 function handleModels(req, res) {
   const createdTs = Math.floor(Date.now() / 1000);
   const data = [];
+
+  // Canonical entries first
   for (const [providerName, provider] of loadedProviders) {
     for (const modelId of provider.models) {
       data.push({
@@ -280,6 +284,19 @@ function handleModels(req, res) {
       });
     }
   }
+
+  // Alias entries for loaded (enabled) providers, canonical-first ordering preserved
+  for (const [alias, { providerName }] of getAliasMap()) {
+    if (loadedProviders.has(providerName)) {
+      data.push({
+        id: alias,
+        object: 'model',
+        created: createdTs,
+        owned_by: providerName,
+      });
+    }
+  }
+
   sendJSON(res, 200, { object: 'list', data });
 }
 

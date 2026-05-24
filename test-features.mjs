@@ -28,7 +28,7 @@ import {
   SSE_DONE,
 } from './lib/ir/ir-to-openai.mjs';
 import { validateProvider, ProviderError, withTimeout } from './lib/providers/base.mjs';
-import { loadProviders, getProviderForModel, getProviderByName, listAllProviderNames } from './lib/providers/index.mjs';
+import { loadProviders, getProviderForModel, getProviderByName, listAllProviderNames, getAliasMap } from './lib/providers/index.mjs';
 import anthropic, {
   irToAnthropic,
   anthropicChunkToIR,
@@ -5519,13 +5519,16 @@ import {
   __setFallbackConfig as setFallbackConfig17,
   __resetFallbackConfig as resetFallbackConfig17,
   __clearCache as clearCache17,
+  createOlpServer as createServer27,
+  __setProvidersEnabled as setProviders27,
+  __resetProvidersEnabled as resetProviders27,
 } from './server.mjs';
 
 describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
 
-  // ── 17a: /v1/models with anthropic enabled → 3 model entries ─────────────
+  // ── 17a: /v1/models with anthropic enabled → 3 canonical + 4 alias entries ─────────────
 
-  it('17a: /v1/models with anthropic enabled → 200 + 3 entries with owned_by="anthropic"', async () => {
+  it('17a: /v1/models with anthropic enabled → 200 + 7 entries (3 canonical + 4 aliases) with owned_by="anthropic"', async () => {
     setProviders17({ anthropic: true });
     const s = createServer17();
     const p = 25456 + Math.floor(Math.random() * 400);
@@ -5539,8 +5542,8 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
       const body = JSON.parse(r.body);
       assert.equal(body.object, 'list');
       assert.ok(Array.isArray(body.data), 'data must be an array');
-      // Anthropic has 3 canonical models in models-registry.json
-      assert.equal(body.data.length, 3, `Expected 3 anthropic models, got ${body.data.length}`);
+      // Anthropic has 3 canonical models + 4 aliases (claude, sonnet, opus, haiku) in models-registry.json
+      assert.equal(body.data.length, 7, `Expected 7 anthropic entries (3 canonical + 4 aliases), got ${body.data.length}`);
       for (const entry of body.data) {
         assert.equal(entry.owned_by, 'anthropic', `Expected owned_by='anthropic', got '${entry.owned_by}'`);
       }
@@ -5572,9 +5575,10 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
     }
   });
 
-  // ── 17c: /v1/models contains only canonical IDs, no aliases ───────────────
+  // ── 17c: /v1/models returns both canonical IDs and alias IDs ───────────────
+  // Updated by D27 F15: aliases are now surfaced in /v1/models (canonical-first order).
 
-  it('17c: /v1/models returns canonical IDs only (no aliases like "sonnet")', async () => {
+  it('17c: /v1/models returns canonical IDs and alias IDs for loaded providers', async () => {
     setProviders17({ anthropic: true });
     const s = createServer17();
     const p = 25464 + Math.floor(Math.random() * 400);
@@ -5587,13 +5591,19 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
       assert.equal(r.status, 200);
       const body = JSON.parse(r.body);
       const ids = body.data.map(e => e.id);
-      // Aliases that must NOT appear
-      const knownAliases = ['sonnet', 'opus', 'haiku', 'claude', 'codex', 'devstral'];
-      for (const alias of knownAliases) {
-        assert.ok(!ids.includes(alias), `Alias '${alias}' must not appear in /v1/models data`);
+      // Canonical IDs must appear
+      assert.ok(ids.includes('claude-sonnet-4-6'), 'canonical claude-sonnet-4-6 must appear');
+      assert.ok(ids.includes('claude-opus-4-7'), 'canonical claude-opus-4-7 must appear');
+      assert.ok(ids.includes('claude-haiku-4-5'), 'canonical claude-haiku-4-5 must appear');
+      // Aliases for the loaded (anthropic) provider must also appear
+      const anthropicAliases = ['claude', 'sonnet', 'opus', 'haiku'];
+      for (const alias of anthropicAliases) {
+        assert.ok(ids.includes(alias), `Alias '${alias}' must appear in /v1/models data when anthropic is enabled`);
       }
-      // The canonical ID must appear
-      assert.ok(ids.includes('claude-sonnet-4-6'), 'claude-sonnet-4-6 must appear in /v1/models data');
+      // Canonical IDs come before alias IDs (canonical-first ordering)
+      const firstAliasIdx = Math.min(...anthropicAliases.map(a => ids.indexOf(a)));
+      const lastCanonicalIdx = Math.max(ids.indexOf('claude-sonnet-4-6'), ids.indexOf('claude-opus-4-7'), ids.indexOf('claude-haiku-4-5'));
+      assert.ok(lastCanonicalIdx < firstAliasIdx, 'canonical entries must appear before alias entries');
     } finally {
       resetProviders17();
       await new Promise(r => s.close(r));
@@ -6641,6 +6651,239 @@ describe('D26 F19 — streaming truncation marker on stop-less exhaustion', () =
       } else {
         lpF19c.delete('anthropic');
       }
+    }
+  });
+
+});
+
+// ── Suite D27: round-3 batch (F8, F15) ────────────────────────────────────────
+//
+// F8: validateIRRequest now validates response_format and tool_choice.
+// F15: /v1/models now surfaces alias entries for loaded providers.
+//
+// Authority:
+//   F8 — ADR 0003 § Optional fields (response_format object; tool_choice string/object)
+//   F15 — OpenAI /v1/models spec (https://platform.openai.com/docs/api-reference/models);
+//          models-registry.json alias map (SPOT per D17)
+
+// ── F8: response_format and tool_choice validation ────────────────────────────
+
+describe('D27 F8 — validateIRRequest response_format + tool_choice validation', () => {
+
+  it('F8: response_format object with string .type is accepted', () => {
+    const r = validateIRRequest(makeIR({ response_format: { type: 'json_object' } }));
+    assert.equal(r.valid, true);
+    assert.deepEqual(r.errors, []);
+  });
+
+  it('F8: response_format string (not object) is rejected', () => {
+    const r = validateIRRequest(makeIR({ response_format: 'json_object' }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('response_format must be an object')),
+      `Expected 'response_format must be an object', got: ${JSON.stringify(r.errors)}`);
+  });
+
+  it('F8: response_format object with non-string .type is rejected', () => {
+    const r = validateIRRequest(makeIR({ response_format: { type: 42 } }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('response_format.type must be a string')),
+      `Expected 'response_format.type must be a string', got: ${JSON.stringify(r.errors)}`);
+  });
+
+  it('F8: response_format undefined is accepted (optional field)', () => {
+    const ir = makeIR();
+    delete ir.response_format;
+    const r = validateIRRequest(ir);
+    assert.equal(r.valid, true);
+  });
+
+  it("F8: tool_choice 'auto' is accepted", () => {
+    const r = validateIRRequest(makeIR({ tool_choice: 'auto' }));
+    assert.equal(r.valid, true);
+    assert.deepEqual(r.errors, []);
+  });
+
+  it("F8: tool_choice 'none' is accepted", () => {
+    const r = validateIRRequest(makeIR({ tool_choice: 'none' }));
+    assert.equal(r.valid, true);
+    assert.deepEqual(r.errors, []);
+  });
+
+  it("F8: tool_choice 'required' is accepted", () => {
+    const r = validateIRRequest(makeIR({ tool_choice: 'required' }));
+    assert.equal(r.valid, true);
+    assert.deepEqual(r.errors, []);
+  });
+
+  it('F8: tool_choice unknown string is rejected', () => {
+    const r = validateIRRequest(makeIR({ tool_choice: 'any' }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes("tool_choice string must be 'auto' | 'none' | 'required'")),
+      `Expected tool_choice string error, got: ${JSON.stringify(r.errors)}`);
+  });
+
+  it('F8: tool_choice {type:"function", function:{name:"X"}} is accepted', () => {
+    const r = validateIRRequest(makeIR({ tool_choice: { type: 'function', function: { name: 'my_fn' } } }));
+    assert.equal(r.valid, true);
+    assert.deepEqual(r.errors, []);
+  });
+
+  it('F8: tool_choice {type:"tool"} (wrong type field) is rejected', () => {
+    const r = validateIRRequest(makeIR({ tool_choice: { type: 'tool' } }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes("tool_choice.type must be 'function'")),
+      `Expected tool_choice.type error, got: ${JSON.stringify(r.errors)}`);
+  });
+
+  it('F8: tool_choice {} (object but no type field) is rejected', () => {
+    const r = validateIRRequest(makeIR({ tool_choice: {} }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes("tool_choice.type must be 'function'")),
+      `Expected tool_choice.type error for empty object, got: ${JSON.stringify(r.errors)}`);
+  });
+
+  it('F8: tool_choice undefined is accepted (optional field)', () => {
+    const ir = makeIR();
+    delete ir.tool_choice;
+    const r = validateIRRequest(ir);
+    assert.equal(r.valid, true);
+  });
+
+  it('F8: tool_choice number is rejected (not string or object)', () => {
+    const r = validateIRRequest(makeIR({ tool_choice: 42 }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('tool_choice must be a string or an object')),
+      `Expected 'tool_choice must be a string or an object', got: ${JSON.stringify(r.errors)}`);
+  });
+
+});
+
+// ── F15: /v1/models alias surfacing ───────────────────────────────────────────
+
+describe('D27 F15 — /v1/models alias surfacing', () => {
+
+  it('F15a: /v1/models with anthropic enabled contains all canonical IDs and all 4 anthropic aliases', async () => {
+    setProviders27({ anthropic: true });
+    const s = createServer27();
+    const p = 27100 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      const ids = body.data.map(e => e.id);
+      // Canonical IDs
+      assert.ok(ids.includes('claude-opus-4-7'), 'canonical claude-opus-4-7 must appear');
+      assert.ok(ids.includes('claude-sonnet-4-6'), 'canonical claude-sonnet-4-6 must appear');
+      assert.ok(ids.includes('claude-haiku-4-5'), 'canonical claude-haiku-4-5 must appear');
+      // Anthropic aliases
+      for (const alias of ['claude', 'sonnet', 'opus', 'haiku']) {
+        assert.ok(ids.includes(alias), `alias '${alias}' must appear when anthropic is enabled`);
+      }
+    } finally {
+      resetProviders27();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  it('F15b: each alias entry has owned_by equal to its canonical target provider', async () => {
+    setProviders27({ anthropic: true });
+    const s = createServer27();
+    const p = 27200 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      const aliasMap = getAliasMap();
+      for (const entry of body.data) {
+        if (aliasMap.has(entry.id)) {
+          const { providerName } = aliasMap.get(entry.id);
+          assert.equal(entry.owned_by, providerName,
+            `alias '${entry.id}' must have owned_by='${providerName}', got '${entry.owned_by}'`);
+        }
+      }
+    } finally {
+      resetProviders27();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  it('F15c: /v1/models with no providers enabled returns empty data (no aliases)', async () => {
+    setProviders27({});
+    const s = createServer27();
+    const p = 27300 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.deepEqual(body.data, [], 'data must be empty when no providers are enabled (no aliases either)');
+    } finally {
+      resetProviders27();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  it('F15d: /v1/models with anthropic+mistral enabled contains both providers\' canonicals and aliases', async () => {
+    setProviders27({ anthropic: true, mistral: true });
+    const s = createServer27();
+    const p = 27400 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      const ids = body.data.map(e => e.id);
+      // Anthropic canonicals + aliases
+      assert.ok(ids.includes('claude-sonnet-4-6'), 'anthropic canonical must appear');
+      assert.ok(ids.includes('sonnet'), 'anthropic alias sonnet must appear');
+      assert.ok(ids.includes('claude'), 'anthropic alias claude must appear');
+      // Mistral canonicals + aliases
+      assert.ok(ids.includes('devstral-2-25-12'), 'mistral canonical must appear');
+      assert.ok(ids.includes('devstral'), 'mistral alias devstral must appear');
+      // Verify minimum total count: 3 anthropic + 4 anthropic aliases + 2 mistral + 4 mistral aliases = 13
+      assert.ok(body.data.length >= 13,
+        `Expected >=13 entries for anthropic+mistral, got ${body.data.length}`);
+    } finally {
+      resetProviders27();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  it('F15e: alias entries for disabled providers do not appear', async () => {
+    // Only anthropic enabled — codex aliases (codex, codex-spark, gpt5, gpt5-mini) must NOT appear
+    setProviders27({ anthropic: true });
+    const s = createServer27();
+    const p = 27500 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      const ids = body.data.map(e => e.id);
+      for (const alias of ['codex', 'codex-spark', 'gpt5', 'gpt5-mini', 'devstral', 'devstral-2']) {
+        assert.ok(!ids.includes(alias),
+          `Alias '${alias}' must NOT appear when its provider is not enabled`);
+      }
+    } finally {
+      resetProviders27();
+      await new Promise(r => s.close(r));
     }
   });
 

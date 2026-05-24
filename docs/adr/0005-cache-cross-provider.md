@@ -7,6 +7,14 @@
 
 ## Amendments
 
+### Amendment 4 — 2026-05-24: Clarify D2 cache_control detection surface (F10)
+
+- **Finding:** Round-3 cold-audit F10 (P3 detection-surface drift) — § D2 reads as if detection happens on the IR ("If THE IR REQUEST contains Anthropic cache_control markers AND..."), but `openai-to-ir.mjs` strips `cache_control` markers from messages per ADR 0003's whitelist policy. Actual v1.0 detection happens on the raw OpenAI request body at the entry surface in `server.mjs`.
+- **Clarification:** At v1.0, `cache_control` marker detection for the D2 bypass uses the raw OpenAI request body's `messages` array, NOT the IR. This is because the IR (per ADR 0003) does not carry `cache_control` as a field — markers are an OpenAI-vendor-specific request annotation that the IR consciously does not surface. The bypass logic in `server.mjs`'s `executeHopFn` correctly consults `body.messages` directly via `extractCacheControlMarkers(body?.messages ?? [])`.
+- **Cache key implication:** The cache key's `cache_control` slot (added by D15 Amendment 2) is structurally always `null` at v1.0 because it is computed via `extractCacheControlMarkers(ir.messages)` which always returns `[]`. This is forward-compatible: if a future ADR 0003 amendment adds `cache_control` to the IR field set, the slot will start carrying meaningful data without a cache-key schema change. The slot stays as documented; no v1.0 cache-key revision needed.
+- **No code change:** F10 is a docs-only clarification. The bypass behavior is correct; the cache key slot's nullness is intentional given v1.0 IR design.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (Round-3 Cold Audit).
+
 ### Amendment 3 — 2026-05-24: Implement § "Cache write conditions" items 3 and 4 (D23)
 
 - **Finding:** Cold-audit round-2 Finding 3 (P2 cache-condition drift) — § "Cache write conditions" items 3 and 4 were documented in this ADR but never wired in code. Zero matches for `cacheable` / `10485760` / any size-cap pattern in `lib/` or `server.mjs`. The invariants existed only in prose.

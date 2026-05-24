@@ -533,6 +533,7 @@ describe('Plugin registry', () => {
     const r = getProviderForModel(m, 'alpha-v1');
     assert.ok(r !== null);
     assert.equal(r.name, 'alpha');
+    assert.equal(r.canonicalModel, 'alpha-v1', 'D17: canonicalModel must equal modelString on direct lookup');
   });
 
   it('getProviderForModel returns null for unknown model', () => {
@@ -599,6 +600,133 @@ function makeMockSpawn(stdoutChunks, exitCode = 0) {
     return proc;
   };
 }
+
+// ── Suite D17: Alias-aware getProviderForModel (Finding 12 + 13) ─────────────
+//
+// Tests that getProviderForModel resolves aliases from models-registry.json
+// to canonical IDs and routes to the correct (enabled) provider.
+
+describe('D17 — alias-aware getProviderForModel', () => {
+
+  // ── Anthropic aliases ────────────────────────────────────────────────
+  it('D17: alias "sonnet" → anthropic, canonical claude-sonnet-4-6', () => {
+    const loaded = new Map([['anthropic', anthropic]]);
+    const r = getProviderForModel(loaded, 'sonnet');
+    assert.ok(r !== null);
+    assert.equal(r.name, 'anthropic');
+    assert.equal(r.canonicalModel, 'claude-sonnet-4-6');
+  });
+
+  it('D17: alias "claude" → anthropic, canonical claude-sonnet-4-6', () => {
+    const loaded = new Map([['anthropic', anthropic]]);
+    const r = getProviderForModel(loaded, 'claude');
+    assert.ok(r !== null);
+    assert.equal(r.name, 'anthropic');
+    assert.equal(r.canonicalModel, 'claude-sonnet-4-6');
+  });
+
+  it('D17: alias "opus" → anthropic, canonical claude-opus-4-7', () => {
+    const loaded = new Map([['anthropic', anthropic]]);
+    const r = getProviderForModel(loaded, 'opus');
+    assert.ok(r !== null);
+    assert.equal(r.name, 'anthropic');
+    assert.equal(r.canonicalModel, 'claude-opus-4-7');
+  });
+
+  it('D17: alias "haiku" → anthropic, canonical claude-haiku-4-5', () => {
+    const loaded = new Map([['anthropic', anthropic]]);
+    const r = getProviderForModel(loaded, 'haiku');
+    assert.ok(r !== null);
+    assert.equal(r.name, 'anthropic');
+    assert.equal(r.canonicalModel, 'claude-haiku-4-5');
+  });
+
+  // ── OpenAI aliases ────────────────────────────────────────────────────
+  it('D17: alias "codex" → openai, canonical gpt-5.3-codex', () => {
+    const loaded = new Map([['openai', codex]]);
+    const r = getProviderForModel(loaded, 'codex');
+    assert.ok(r !== null);
+    assert.equal(r.name, 'openai');
+    assert.equal(r.canonicalModel, 'gpt-5.3-codex');
+  });
+
+  it('D17: alias "gpt5" → openai, canonical gpt-5.5', () => {
+    const loaded = new Map([['openai', codex]]);
+    const r = getProviderForModel(loaded, 'gpt5');
+    assert.ok(r !== null);
+    assert.equal(r.name, 'openai');
+    assert.equal(r.canonicalModel, 'gpt-5.5');
+  });
+
+  // ── Mistral aliases ───────────────────────────────────────────────────
+  it('D17: alias "devstral" → mistral, canonical devstral-2-25-12', () => {
+    const loaded = new Map([['mistral', mistral]]);
+    const r = getProviderForModel(loaded, 'devstral');
+    assert.ok(r !== null);
+    assert.equal(r.name, 'mistral');
+    assert.equal(r.canonicalModel, 'devstral-2-25-12');
+  });
+
+  it('D17: alias "devstral-small" → mistral, canonical devstral-small-2-25-12', () => {
+    const loaded = new Map([['mistral', mistral]]);
+    const r = getProviderForModel(loaded, 'devstral-small');
+    assert.ok(r !== null);
+    assert.equal(r.name, 'mistral');
+    assert.equal(r.canonicalModel, 'devstral-small-2-25-12');
+  });
+
+  // ── Canonical pass-through ────────────────────────────────────────────
+  it('D17: canonical "claude-sonnet-4-6" → anthropic, canonicalModel unchanged', () => {
+    const loaded = new Map([['anthropic', anthropic]]);
+    const r = getProviderForModel(loaded, 'claude-sonnet-4-6');
+    assert.ok(r !== null);
+    assert.equal(r.name, 'anthropic');
+    assert.equal(r.canonicalModel, 'claude-sonnet-4-6');
+  });
+
+  // ── Unknown model → null ──────────────────────────────────────────────
+  it('D17: unknown model "gpt-4-imaginary" → null', () => {
+    const loaded = new Map([['anthropic', anthropic], ['openai', codex], ['mistral', mistral]]);
+    assert.equal(getProviderForModel(loaded, 'gpt-4-imaginary'), null);
+  });
+
+  // ── Alias points to disabled provider → null ─────────────────────────
+  it('D17: alias "devstral" with only anthropic loaded → null (mistral not enabled)', () => {
+    // The alias is known (devstral → mistral) but mistral is not in loadedProviders.
+    const loaded = new Map([['anthropic', anthropic]]);
+    assert.equal(getProviderForModel(loaded, 'devstral'), null);
+  });
+
+  it('D17: alias "sonnet" with only mistral loaded → null (anthropic not enabled)', () => {
+    const loaded = new Map([['mistral', mistral]]);
+    assert.equal(getProviderForModel(loaded, 'sonnet'), null);
+  });
+
+  // ── buildDefaultChain with alias ──────────────────────────────────────
+  it('D17: buildDefaultChain("sonnet") → chain carries canonical claude-sonnet-4-6', () => {
+    const loaded = new Map([['anthropic', anthropic]]);
+    const chain = buildDefaultChain('sonnet', loaded, {}, {});
+    assert.ok(chain !== null);
+    assert.equal(chain.length, 1);
+    assert.equal(chain[0].provider, 'anthropic');
+    assert.equal(chain[0].model, 'claude-sonnet-4-6');
+  });
+
+  it('D17: buildDefaultChain("devstral") → chain carries canonical devstral-2-25-12', () => {
+    const loaded = new Map([['mistral', mistral]]);
+    const chain = buildDefaultChain('devstral', loaded, {}, {});
+    assert.ok(chain !== null);
+    assert.equal(chain.length, 1);
+    assert.equal(chain[0].provider, 'mistral');
+    assert.equal(chain[0].model, 'devstral-2-25-12');
+  });
+
+  it('D17: buildDefaultChain("unknown-alias") with no providers → null', () => {
+    const loaded = new Map();
+    assert.equal(buildDefaultChain('unknown-alias', loaded, {}, {}), null);
+  });
+
+});
 
 describe('Anthropic plugin (D4)', () => {
 
@@ -2692,51 +2820,65 @@ describe('Mistral Vibe plugin (D8)', () => {
     assert.ok(mistral.displayName.toLowerCase().includes('mistral'));
   });
 
-  // ── Test 4: models include all registry IDs + aliases ────────────────
-  it('mistral.models includes every canonical registry id AND every alias', () => {
-    // The plugin merges canonical IDs and alias keys into models[] so that
-    // getProviderForModel routes either form. Test that the registry's
-    // canonical IDs are a subset, and the aliases are all included too.
+  // ── Test 4: models is canonical-only (D17 Finding 12 fix) ───────────
+  it('mistral.models contains only canonical registry IDs — no alias strings', () => {
+    // D17 fix: models[] is canonical-only across all plugins. Alias routing
+    // is the responsibility of getProviderForModel() in lib/providers/index.mjs.
     const registryIds = modelsRegistry.providers.mistral.models.map(m => m.id);
     const registryAliases = Object.keys(modelsRegistry.providers.mistral.aliases ?? {});
     for (const id of registryIds) {
       assert.ok(mistral.models.includes(id), `canonical id ${id} missing from mistral.models`);
     }
     for (const alias of registryAliases) {
-      assert.ok(mistral.models.includes(alias), `alias ${alias} missing from mistral.models`);
+      assert.ok(!mistral.models.includes(alias), `alias ${alias} must NOT appear in mistral.models (D17)`);
     }
-    assert.equal(mistral.models.length, registryIds.length + registryAliases.length);
+    assert.equal(mistral.models.length, registryIds.length, `Expected ${registryIds.length} canonical IDs, got ${mistral.models.length}`);
   });
 
-  it('mistral.models contains canonical IDs + short-form aliases', () => {
-    // Per canonical models registry (docs.mistral.ai/getting-started/models/
-    // models_overview, D8 review-2 finding): canonical IDs are date-stamped
-    // (devstral-2-25-12, devstral-small-2-25-12). Vibe config.toml uses short
-    // forms (devstral-2, devstral-small-2). Plugin exposes BOTH so
-    // getProviderForModel routes either form.
+  it('mistral.models contains exactly the two canonical date-stamped IDs', () => {
+    // D17 fix: canonical-only shape. Length: 2 canonical IDs.
     assert.ok(mistral.models.includes('devstral-2-25-12'), 'missing canonical devstral-2-25-12');
     assert.ok(mistral.models.includes('devstral-small-2-25-12'), 'missing canonical devstral-small-2-25-12');
-    assert.ok(mistral.models.includes('devstral-2'), 'missing short-form alias devstral-2');
-    assert.ok(mistral.models.includes('devstral-small-2'), 'missing short-form alias devstral-small-2');
-    assert.ok(mistral.models.includes('devstral'), 'missing alias devstral');
-    assert.ok(mistral.models.includes('devstral-small'), 'missing alias devstral-small');
-    // Length: 2 canonical + 4 aliases = 6 total
-    assert.equal(mistral.models.length, 6, `Expected 6 entries (2 canonical + 4 aliases), got ${mistral.models.length}`);
+    assert.ok(!mistral.models.includes('devstral-2'), 'alias devstral-2 must NOT be in models[] (D17)');
+    assert.ok(!mistral.models.includes('devstral-small-2'), 'alias devstral-small-2 must NOT be in models[] (D17)');
+    assert.ok(!mistral.models.includes('devstral'), 'alias devstral must NOT be in models[] (D17)');
+    assert.ok(!mistral.models.includes('devstral-small'), 'alias devstral-small must NOT be in models[] (D17)');
+    // Length: 2 canonical only
+    assert.equal(mistral.models.length, 2, `Expected 2 canonical IDs, got ${mistral.models.length}`);
   });
 
   // ── Test 5: getProviderForModel finds mistral for each model ──────────
-  it('getProviderForModel finds mistral for devstral-2', () => {
+  it('getProviderForModel finds mistral for canonical devstral-2-25-12', () => {
+    const loaded = new Map([['mistral', mistral]]);
+    const result = getProviderForModel(loaded, 'devstral-2-25-12');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'mistral');
+    assert.equal(result.canonicalModel, 'devstral-2-25-12');
+  });
+
+  it('getProviderForModel finds mistral for alias devstral-2 → canonical devstral-2-25-12 (D17)', () => {
+    // D17: alias resolution now handled in getProviderForModel, not in models[].
     const loaded = new Map([['mistral', mistral]]);
     const result = getProviderForModel(loaded, 'devstral-2');
     assert.ok(result !== null);
     assert.equal(result.name, 'mistral');
+    assert.equal(result.canonicalModel, 'devstral-2-25-12');
   });
 
-  it('getProviderForModel finds mistral for devstral-small-2', () => {
+  it('getProviderForModel finds mistral for alias devstral → canonical devstral-2-25-12 (D17)', () => {
+    const loaded = new Map([['mistral', mistral]]);
+    const result = getProviderForModel(loaded, 'devstral');
+    assert.ok(result !== null);
+    assert.equal(result.name, 'mistral');
+    assert.equal(result.canonicalModel, 'devstral-2-25-12');
+  });
+
+  it('getProviderForModel finds mistral for alias devstral-small-2 → canonical devstral-small-2-25-12 (D17)', () => {
     const loaded = new Map([['mistral', mistral]]);
     const result = getProviderForModel(loaded, 'devstral-small-2');
     assert.ok(result !== null);
     assert.equal(result.name, 'mistral');
+    assert.equal(result.canonicalModel, 'devstral-small-2-25-12');
   });
 
   // ── Test 6: irToMistral translation ──────────────────────────────────
@@ -3224,7 +3366,11 @@ describe('Mistral Vibe plugin (D8)', () => {
     const p = loaded.get('mistral');
     const { valid, errors } = validateProvider(p);
     assert.equal(valid, true, `Contract errors: ${errors.join('; ')}`);
-    assert.ok(p.models.includes('devstral-2'));
+    // D17: models[] is canonical-only. Verify via getProviderForModel instead of direct inclusion.
+    assert.ok(p.models.includes('devstral-2-25-12'), 'canonical devstral-2-25-12 must be in models[]');
+    const r = getProviderForModel(loaded, 'devstral-2');
+    assert.ok(r !== null, 'alias devstral-2 must route to mistral via getProviderForModel (D17)');
+    assert.equal(r.name, 'mistral');
   });
 
   // ── Test 16: auth artifact reading helpers ────────────────────────────

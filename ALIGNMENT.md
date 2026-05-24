@@ -48,9 +48,9 @@ Each provider plugin in `lib/providers/<name>.mjs` is governed by the underlying
 
 | Provider key | Provider CLI | Audit pin (TBD on Phase-1 spawn) | Risk Tier (see § Risk Tier Framework) |
 |---|---|---|---|
-| `anthropic` | `claude -p` from `@anthropic-ai/claude-code` | inherits OCP's `cli.js` 2.1.89 audit pin at fork; OLP-side pin set when Phase 1 lands | D (pre-2026-06-15) / re-evaluate post-2026-06-15 |
-| `openai` | `codex exec --json` from OpenAI Codex CLI | TBD at Phase 2 spawn |  D |
-| `mistral` | `vibe --prompt --output json` from Mistral Vibe CLI | TBD at Phase 3 spawn | D |
+| `anthropic` | `claude -p` from `@anthropic-ai/claude-code` | inherits OCP's `cli.js` 2.1.89 audit pin at fork; OLP-side pin: `@anthropic-ai/claude-code` v2.1.89 (observed at D4 — `lib/providers/anthropic.mjs` header). Re-evaluate post-2026-06-15 per One-shot Triggered Audit above. | D (pre-2026-06-15) / re-evaluate post-2026-06-15 |
+| `openai` | `codex exec --json` from OpenAI Codex CLI | Codex CLI reference page: https://developers.openai.com/codex/cli/reference (retrieved 2026-05-23 — §§ "codex exec [flags] PROMPT", "--json / --experimental-json", "--model, -m"; D6 WebFetch-verified reachable). Secondary authority: https://developers.openai.com/codex/cli/features §§ "Supported Models", "Automation". | D |
+| `mistral` | `vibe --prompt --output json` from Mistral Vibe CLI | Mistral Vibe terminal quickstart: https://docs.mistral.ai/mistral-vibe/terminal/quickstart (retrieved 2026-05-23 — § "--prompt flag triggers programmatic mode; --output selects format (text, json, streaming)"; D8 WebFetch-verified reachable). Configuration authority: https://docs.mistral.ai/mistral-vibe/terminal/configuration (§§ auth file `~/.vibe/.env`, `MISTRAL_API_KEY` env var). | D |
 | `grok` | `grok -p --output-format streaming-json` (xAI Build) | TBD at Phase 8+ enable | C |
 | `kimi` | `kimi -p --output-format stream-json` (Moonshot) | TBD at Phase 8+ enable | C |
 | `minimax` | TBD CLI command (MiniMax Token Plan) | TBD at opt-in enable | B |
@@ -147,6 +147,8 @@ In addition to the recurring 14 May audit below, the following one-shot audits a
 - **2026-06-16 (or first Anthropic Agent SDK Credit billing-cycle close, whichever is later)** — verify the post-2026-06-15 Anthropic billing-split behaviour matches the spec §2 assumption: programmatic `claude -p` traffic is metered against the separate Agent SDK Credit pool, not Plan limits. Update the Anthropic Authority pin row above with the observed behaviour, update ADR 0006 with the post-effective-date Tier re-evaluation, and append a Decision-log entry to the spec §10. If observed behaviour diverges from the spec assumption (e.g., Plan limits still apply, or credit pool meter differs from `$100/Max5x/month`), file a Risk-Tier reclassification per ADR 0006 amendment procedure.
 
 - **Antigravity primary-source pin (open-ended, no deadline)** — find a primary-source URL or archival snapshot for the Google FAQ language naming OpenClaw / OpenCode / Claude Code as prohibited. Pin the URL + retrieval timestamp into ADR 0006. If the primary source cannot be located within 90 days of this commit and only secondary reports remain, file an ADR 0006 amendment proposing a re-classification (Tier A may need to soften to Tier C "evidence-backed signal only" if the prohibition cannot be primary-sourced).
+
+- **OpenAI Codex ToS formal pin (trigger: Phase 2 E2E enable for Codex, OR 2026-12-31, whichever comes first)** — ADR 0006 § Classification table row "OpenAI Codex" currently relies on Codex GitHub Discussion #8338 (maintainer posture: "I'm an engineer, not a lawyer") as the authority pin, which is a maintainer statement of permissive intent rather than a formal ToS blessing. Before Codex transitions from Candidate to Enabled (Phase 2 E2E audit), locate and pin a primary-source ToS URL or official OpenAI policy document that explicitly addresses third-party CLI proxying. If no such document exists by 2026-12-31, file an ADR 0006 amendment documenting the absence as the formal conclusion of this audit task. Update ADR 0006 § Classification table row "OpenAI Codex" with the audit outcome.
 
 ---
 

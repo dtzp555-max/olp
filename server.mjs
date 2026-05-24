@@ -596,12 +596,26 @@ async function handleChatCompletions(req, res) {
         }
       }
 
-      // Generator exhausted without a stop chunk — emit [DONE] and cache.
+      // Generator exhausted without a stop chunk — emit [DONE] but do NOT cache.
+      // A stop-less exhaustion means the response is truncated (the generator
+      // ended without the model signalling completion). Caching a truncated
+      // response would serve wrong answers to future identical requests.
+      // Compare: D16's buffered-path truncation eviction explicitly avoids
+      // persisting truncated entries for the same reason.
       res.write(SSE_DONE);
       res.end();
-      // D23 defense-in-depth: same guard as the stop-chunk path above.
       if (streamedChunks.length > 0 && cacheableForFirstHop) {
-        await cacheStore.set(keyId, streamCacheKey, streamedChunks);
+        const lastChunk = streamedChunks[streamedChunks.length - 1];
+        const hasStopChunk = lastChunk?.type === 'stop';
+        if (hasStopChunk) {
+          await cacheStore.set(keyId, streamCacheKey, streamedChunks);
+        } else {
+          logEvent('warn', 'streaming_no_stop_chunk', {
+            chunks_count: streamedChunks.length,
+            provider: streamProvider,
+            model: streamModel,
+          });
+        }
       }
     } catch (e) {
       if (firstChunkEmitted) {

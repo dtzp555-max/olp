@@ -151,7 +151,7 @@ Phase 1 is in progress. This table reflects what is currently shipped vs. what i
 | `lib/fallback/engine.mjs` | ✅ Shipped | Trigger evaluation + chain advancement (ADR 0004) |
 | Soft trigger data path (`quotaStatus()` polling) | 📋 Planned (v1.x) | Evaluation logic shipped + tested; data ingestion deferred per ADR 0004 Amendment 2 |
 | `models-registry.json` | ✅ Shipped | SPOT for `(provider, model)` metadata |
-| `test-features.mjs` | ✅ Shipped | 328-test suite (CI: `test.yml`) |
+| `test-features.mjs` | ✅ Shipped | Comprehensive test suite covering IR, cache, fallback, and integration paths (CI: `test.yml`) |
 | `lib/keys.mjs` | 📋 Planned (Phase 2) | Multi-key auth, per-key namespacing, audit log |
 | `dashboard.html` | 📋 Planned (Phase 6) | Owner-only multi-provider dashboard |
 | `docs/provider-caveats.md` | 📋 Planned (Phase 3+) | Lossy-translation reference; for now documented inline in each plugin header |
@@ -169,7 +169,7 @@ OLP is a Node.js (ESM, `.mjs`) HTTP proxy with no build step and minimal depende
 - **Entry surface** — `server.mjs` handles `/v1/chat/completions` and the administrative endpoints. Governed by OpenAI's `/v1/chat/completions` specification as the wire authority. See [`ALIGNMENT.md` § Authorities](./ALIGNMENT.md#authorities).
 - **Intermediate Representation (IR)** — `lib/ir/` normalizes between the entry surface and provider-native shapes. The IR is the lingua franca; any extension is an [ADR 0003](./docs/adr/0003-intermediate-representation.md) amendment.
 - **Provider plugins** — `lib/providers/<name>.mjs`. Each plugin implements the contract in [ADR 0002 (Plugin Architecture for Providers)](./docs/adr/0002-plugin-architecture.md), spawns its CLI, and translates between IR and provider-native IO.
-- **Cache layer** — `lib/cache/` is a content-addressed cache keyed on `(provider, model, messages, tools, temperature, response_format, cache_control)`. Per-key isolation, prompt-caching bypass, chunked stream replay, and singleflight. See [ADR 0005 (Cache Layer Cross-Provider Design)](./docs/adr/0005-cache-cross-provider.md). Current backing store is an in-memory Map; file-backed storage is planned for Phase 2.
+- **Cache layer** — `lib/cache/` is a content-addressed cache keyed on the 11-field tuple defined in [ADR 0005 § "Cache key composition (v1.0)"](./docs/adr/0005-cache-cross-provider.md#decision) (provider, model, messages, tools, temperature, response_format, cache_control, max_tokens, top_p, stop, tool_choice — as of Amendment 2/D15). Per-key isolation, prompt-caching bypass, chunked stream replay, and singleflight. See [ADR 0005 (Cache Layer Cross-Provider Design)](./docs/adr/0005-cache-cross-provider.md). Current backing store is an in-memory Map; file-backed storage is planned for Phase 2.
 - **Fallback engine** — `lib/fallback/` advances a configured chain one provider at a time on configured triggers, never retrying after the first response chunk has been emitted to the client. See [ADR 0004](./docs/adr/0004-fallback-engine.md).
 - **Multi-key auth** — `lib/keys.mjs` (📋 planned, Phase 2) will carry OCP's per-OLP-key namespace isolation forward. Each OLP API key will have independent quota, cache namespace, and audit log; each key declares which providers it can access.
 

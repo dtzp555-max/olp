@@ -5414,6 +5414,84 @@ describe('Streaming cache-miss real-time (Suite 15)', () => {
     }
   });
 
+  it('15e: streaming generator exhausted without stop chunk → response delivered but NOT cached (F9)', async () => {
+    // Authority: ADR 0005 § "Cache write conditions" item 1 — "response completed
+    // successfully (no truncation, no error mid-stream)". A generator that exhausts
+    // without emitting a stop chunk is a truncated response and must NOT be cached.
+    // Compare D16's buffered-path truncation eviction.
+    //
+    // Implementation note: __setSpawnImpl cannot produce a no-stop response because
+    // the anthropic provider plugin synthesizes a stop chunk on clean proc exit
+    // (lib/providers/anthropic.mjs line ~376: `yield anthropicStopToIR('stop')`).
+    // Instead we inject a custom provider whose spawn() async generator yields a
+    // delta chunk and then RETURNS without yielding a stop chunk, bypassing the
+    // plugin layer entirely. Same injection pattern as 15d.
+    //
+    // Verifies: (a) client receives the chunks (200); (b) the response is NOT
+    // written to cache — a second identical request triggers a fresh spawn (cache
+    // miss), proving no caching happened after request 1.
+
+    const { loadedProviders: lp15e, __clearCache: cc15e } = await import('./server.mjs');
+    const savedAnthropicProvider = lp15e.get('anthropic');
+
+    let spawnCallCount = 0;
+    const noStopProvider = {
+      ...savedAnthropicProvider,
+      spawn: async function* () {
+        spawnCallCount++;
+        // Yield one delta chunk but NO stop chunk — generator exhausts here.
+        yield { type: 'delta', content: 'no-stop-content', finish_reason: null };
+        // (implicit return — no stop chunk emitted)
+      },
+    };
+    lp15e.set('anthropic', noStopProvider);
+    cc15e();
+
+    const makeRequest = () => new Promise((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: port15,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        let data = '';
+        res.on('data', d => { data += d.toString(); });
+        res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.write(JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'no-stop-chunk-f9-test' }],
+        stream: true,
+      }));
+      req.end();
+    });
+
+    try {
+      // First request: generator exhausts without stop → client receives response (200)
+      const r1 = await makeRequest();
+      assert.equal(r1.status, 200, `First request failed: ${r1.status} ${r1.body.slice(0, 200)}`);
+      assert.equal(spawnCallCount, 1, 'Spawn called once for first request');
+      assert.equal(r1.headers['x-olp-cache'], 'miss', 'First request must be cache miss');
+
+      // Second identical request: must ALSO be cache miss + fresh spawn (proves no caching after r1)
+      const r2 = await makeRequest();
+      assert.equal(r2.status, 200, `Second request failed: ${r2.status} ${r2.body.slice(0, 200)}`);
+      assert.equal(spawnCallCount, 2,
+        `Expected spawn called again for r2 (no-stop response must not be cached), got spawnCallCount=${spawnCallCount}`);
+      assert.equal(r2.headers['x-olp-cache'], 'miss', 'Second request must also be cache miss (no caching of truncated response)');
+    } finally {
+      // Restore the original anthropic provider
+      if (savedAnthropicProvider !== undefined) {
+        lp15e.set('anthropic', savedAnthropicProvider);
+      } else {
+        lp15e.delete('anthropic');
+      }
+    }
+  });
+
 });
 
 // ── Suite 17: D18 — /v1/models population + X-OLP-* headers on errors ────────

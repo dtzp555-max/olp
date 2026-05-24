@@ -109,6 +109,41 @@
         "devstral-small": "devstral-small-2-25-12",
         "devstral-small-2": "devstral-small-2-25-12"
       }
+    },
+    "grok": {
+      "displayName": "xAI Grok",
+      "tier": "C",
+      "candidate": true,
+      "models": [],
+      "comment": "anticipated Phase 8+; no canonical models pinned yet"
+    },
+    "kimi": {
+      "displayName": "Moonshot Kimi",
+      "tier": "C",
+      "candidate": true,
+      "models": [],
+      "comment": "anticipated Phase 8+; no canonical models pinned yet"
+    },
+    "minimax": {
+      "displayName": "MiniMax",
+      "tier": "B",
+      "candidate": true,
+      "models": [],
+      "comment": "anticipated Phase 8+; no canonical models pinned yet"
+    },
+    "glm": {
+      "displayName": "Zhipu GLM",
+      "tier": "B",
+      "candidate": true,
+      "models": [],
+      "comment": "anticipated Phase 8+; no canonical models pinned yet"
+    },
+    "qwen": {
+      "displayName": "Alibaba Qwen",
+      "tier": "B",
+      "candidate": true,
+      "models": [],
+      "comment": "anticipated Phase 8+; no canonical models pinned yet"
     }
   }
 }

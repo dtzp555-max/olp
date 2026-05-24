@@ -521,6 +521,42 @@ describe('Provider contract validation', () => {
     assert.ok(r.errors.some(e => e.includes('maxConcurrent')));
   });
 
+  it('validateProvider rejects negative maxSpawnTimeMs', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, maxSpawnTimeMs: -1 } }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('maxSpawnTimeMs')));
+  });
+
+  it('validateProvider rejects zero maxSpawnTimeMs', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, maxSpawnTimeMs: 0 } }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('maxSpawnTimeMs')));
+  });
+
+  it('validateProvider rejects non-integer maxSpawnTimeMs (e.g., 100.5)', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, maxSpawnTimeMs: 100.5 } }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('maxSpawnTimeMs')));
+  });
+
+  it('validateProvider rejects non-number maxSpawnTimeMs (e.g., \'600\')', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, maxSpawnTimeMs: '600' } }));
+    assert.equal(r.valid, false);
+    assert.ok(r.errors.some(e => e.includes('maxSpawnTimeMs')));
+  });
+
+  it('validateProvider accepts omitted maxSpawnTimeMs (optional field)', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4 } }));
+    assert.equal(r.valid, true);
+    assert.deepEqual(r.errors, []);
+  });
+
+  it('validateProvider accepts positive integer maxSpawnTimeMs (e.g., 60000)', () => {
+    const r = validateProvider(makeProvider({ hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, maxSpawnTimeMs: 60000 } }));
+    assert.equal(r.valid, true);
+    assert.deepEqual(r.errors, []);
+  });
+
   it('rejects non-object input', () => {
     const r = validateProvider(null);
     assert.equal(r.valid, false);

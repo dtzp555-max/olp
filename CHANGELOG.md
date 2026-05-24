@@ -4,7 +4,45 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+(empty — Phase 2 entries land here once Phase 2 opens)
+
+## v0.1.1 — 2026-05-25
+
+### Phase 1 cleanup — pre-Phase-2 batch (D35–D42, closes 16 of 17 issues)
+
+**Overview.** v0.1.1 closes the post-v0.1.0 cleanup batch covering all 17 pre-Phase-2 issues raised during the 6-round cold-audit cycle on the Phase 1 deliverable. 8 D-day commits (D35–D42) shipped between 2026-05-24 and 2026-05-25. 16 issues closed; issue #16 (streaming singleflight) stays OPEN as the v1.x tracker with its design ratified in ADR 0005 Amendment 8.
+
+**Test count: 416 (v0.1.0) → 468 (v0.1.1).** +52 tests across the cleanup batch.
+
+### D35 — pre-Phase-2 batch #1 (issues #4 #9 #10 #11 #12)
+
+- **#4 — X-OLP-Latency-Ms uniform.** Audit confirmed already-correct via D32; D35 adds the `#4-audit` regression test pinning the 5-header invariant on the 503 no-provider sendError so future drift is caught immediately.
+- **#9 — Streaming empty-then-clean-exit headers.** Zero-chunk streaming path now guards `!res.headersSent` and emits Content-Type=text/event-stream, Cache-Control=no-cache, Connection=keep-alive, X-Accel-Buffering=no, plus all 5 X-OLP-* headers via olpHeaders before writing `SSE_DONE`. Zero-chunk path correctly does NOT cache.
+- **#10 — Streaming post-first-chunk error truncation marker.** Two sibling fixes: catch-block-firstChunkEmitted=true and error-chunk-after-first-chunk both now emit synthetic `{type:'stop', finish_reason:'length'}` via `irChunkToOpenAISSE` + `SSE_DONE` + `res.end()`. Per ADR 0004 § Fallback safety: post-first-chunk truncation surfaces as `length` finish, never a hang.
+- **#11 — `validateIRRequest` irVersion strict check.** ADR 0003 IR contract pins irVersion to `'1.0'`. Validator now: `obj.irVersion !== undefined && obj.irVersion !== '1.0'` → rejection. Strict string match — `undefined` accepted (back-compat), `'1.0'` accepted, `'2.0'` rejected, numeric `1.0` rejected (`1.0 !== '1.0'`).
+- **#12 — `alignment.yml` scripts/** trigger removal.** Removed from both `push.paths` and `pull_request.paths` since the `scripts/` directory does not currently exist (planned for Phase 7).
+- **Test count:** 416 → 424 (+8).
+
+### D36 — pre-Phase-2 batch #2 (issues #2 #5 #6 #13 #14 #15)
+
+- **#2 — cache_control partial-noop debug log.** `server.mjs handleChatCompletions` fires `logEvent('debug', 'cache_control_partial_noop', { chain, marker_count })` at most once per request when markers present AND chain has at least one non-Anthropic hop. Per ADR 0005 § D2.
+- **#5 — ADR 0002 vibe.mjs → mistral.mjs.** § Decision filesystem layout corrected to match the shipped file naming convention (file named after provider key, not CLI binary). Amendment 5 documents the correction + makes the convention statement explicit for future contributors.
+- **#6 — mistral.mjs A5 flip + ALIGNMENT.md table update.** Header A5 (model flag) flipped from `UNPINNED-D-later-verifies` to `CONFIRMED-NOT-APPLICABLE` with DeepWiki citation; ALIGNMENT.md Speculative-Candidate table mistral row updated to remove A5.
+- **#13 — /v1/models alias governance.** ALIGNMENT.md gains "Controlled deviations (entry-surface scope)" subsection documenting the alias surface as a controlled Rule 2(b) deviation; `docs/openai-spec-pin.md` gains the alias-surfacing subsection with full 4-field contract table.
+- **#14 — cache_control slot determinism regression test.** 4 tests in test-features.mjs construct hand-built IRs with synthetic markers (bypassing openAIToIR which strips them at v0.1) and verify the cache key SHA-256 is deterministic. Per ALIGNMENT.md Rule 2 (No Invention), no `sortMarkers` helper shipped — the slot is dead-code at v0.1.
+- **#15 — Anthropic v2.1.89 transcript artifact.** New file `docs/provider-audits/anthropic.md` as a single living version-capture artifact. Records observed `claude --version` (2.1.132 at capture date 2026-05-24), pinned version (v2.1.89 from D4), drift note, sample invocation, flag-surface table for 5 OLP-consumed flags. Closes the circular ALIGNMENT.md ↔ plugin header citation by anchoring on an external artifact.
+- **Test count:** 424 → 431 (+7).
+
+### D37 — release.yml phase_rolling_mode gate (issue #17)
+
+- **CI gate enforcing phase_rolling_mode promotion discipline.** New "Enforce phase_rolling_mode (Unreleased must be promoted)" step in `release.yml` between the version-match check and the CHANGELOG extraction step. Awk extracts content between `## Unreleased` and the next `## ` heading; sed strips blank lines and parenthetical-sentinel-only lines. Non-trivial remaining content fails the workflow with `::error::` instructing the maintainer to promote Unreleased → `## v<version>` per CLAUDE.md release_kit.phase_rolling_mode.
+- **Dry-run validated against 4 cases:** current sentinel-only Unreleased → PASS; synthetic non-trivial Unreleased → FIRES with offending lines reported; no Unreleased section → PASS; multi-sentinel + blank lines → PASS.
+- **Gate is purely additive** — fires only on tag push to `v*.*.*`, does not affect normal push/PR CI.
+- **Test count:** 431 → 431 (no test change — CI workflow only).
+
 ### D38 — maxConcurrent runtime enforcement (issue #1)
+
+- **Spawn lifecycle gate** — `hints.maxConcurrent` is now enforced at runtime per ADR 0002 Amendment 6: `lib/providers/index.mjs` exports a per-provider `tryAcquireSpawn` / `releaseSpawn` / `getActiveSpawnCount` semaphore; `server.mjs` gates both the buffered and streaming spawn call sites in `handleChatCompletions` with a try/finally release. Saturation surfaces as `ProviderError(CONCURRENCY_LIMIT)` which the fallback engine treats as a hard trigger (ADR 0004 Amendment 4) — the chain advances to the next hop instead of queueing. If the entire chain is saturated, the user receives a chain-exhausted error via the existing exhaustion path. Closes #1. Queue+timeout deferred (see ADR 0002 Amendment 6 § Design choice). Test count 431 → 447.
 
 - **Spawn lifecycle gate** — `hints.maxConcurrent` is now enforced at runtime per ADR 0002 Amendment 6: `lib/providers/index.mjs` exports a per-provider `tryAcquireSpawn` / `releaseSpawn` / `getActiveSpawnCount` semaphore; `server.mjs` gates both the buffered and streaming spawn call sites in `handleChatCompletions` with a try/finally release. Saturation surfaces as `ProviderError(CONCURRENCY_LIMIT)` which the fallback engine treats as a hard trigger (ADR 0004 Amendment 4) — the chain advances to the next hop instead of queueing. If the entire chain is saturated, the user receives a chain-exhausted error via the existing exhaustion path. Closes #1. Queue+timeout deferred (see ADR 0002 Amendment 6 § Design choice). Test count 431 → 447.
 
@@ -44,6 +82,30 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 - **No code-behavior change. No new tests.** Amendment 8 is design-only. The implementation will go through full Iron Rule 10 (fresh-context opus reviewer + acceptance-criteria-gated test pass) when the v1.x sprint kicks off.
 - **Authority:** ADR 0005 Amendment 8 (this commit); ADR 0005 Amendment 6 (D34 — original deferral note); GitHub issue #16 (round-6 F13 — sibling TOCTOU); ADR 0002 Amendment 6 (D38 — `tryAcquireSpawn` semantics that §7 coordination builds on); ADR 0004 Amendment 5 (D40 — observability pattern §11 extends); `CLAUDE.md` release_kit_overlay phase_rolling_mode — under Unreleased; CC 开发铁律 v1.6 § 10.x (design-only amendment; fresh-context reviewer not required per the Iron Rule 10 implementation-phase scope, documented in the amendment's procedural mechanism).
 - **Test count:** 468 → 468 (no test change — design-only).
+
+### Phase 1 cleanup release_kit checklist
+
+- [x] All 8 D-day deliverables landed on main (D35-D42)
+- [x] CI green on every D-day commit + on this release commit's head
+- [x] Cold-audit round 7 (fresh-context opus full-pass) — PASS_WITH_MINOR, 0 P1/P2 findings
+- [x] 16 of 17 pre-Phase-2 GitHub issues closed (#1-#15 and #17); #16 stays OPEN as v1.x tracker
+- [x] Issue #16 status comment posted referencing ADR 0005 Amendment 8 design ratification
+- [x] CHANGELOG "Unreleased" promoted to "## v0.1.1 — 2026-05-25" with D35-D42 entries
+- [x] `package.json` bumped from 0.1.0 → 0.1.1
+- [x] `docs/v1x-roadmap.md` created — 7 deferred items with anchors + start triggers
+- [ ] Tag pushed (next step in this PR's lifecycle)
+- [ ] `release.yml` triggered + GitHub Release created (auto on tag push; D37 phase_rolling_mode gate will pass because Unreleased is now sentinel-only)
+
+### Known limitations carried to v1.x
+
+Full list with code anchors + start triggers in [`docs/v1x-roadmap.md`](./docs/v1x-roadmap.md):
+- Streaming-path singleflight (issue #16, ADR 0005 Amendment 8 design ratified)
+- Multi-key auth (`lib/keys.mjs`)
+- Soft-trigger reactivation (ADR 0004 Amendment 2)
+- `/health` activeSpawns integration (ADR 0002 Amendment 6 forward note)
+- Provider-level `cacheKeyFields` mask (ADR 0005 Amendment 7 forward note)
+- Streaming-path SPAWN_FAILED salvage (bundled with #1 in v1.x)
+- D40 AUTH_MISSING tuple test coverage (test polish)
 
 ## v0.1.0 — 2026-05-24
 

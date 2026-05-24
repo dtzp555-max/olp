@@ -11,7 +11,7 @@
 
 **Status:** Design ratified. Implementation deferred to v1.x.
 
-**Context.** Amendment 6 (D34) formally deferred streaming-path D4 singleflight participation with the note "the design alone warrants a dedicated ADR." Round-6 cold-audit F13 (filed as issue #16) raised the sibling TOCTOU window: `server.mjs:782 preCheckHit = await cacheStore.peek(...)` followed by streaming-branch entry at line 811 (gated on `!preCheckHit`) creates a race where, between peek and spawn, a concurrent populator can write the cache OR a TTL can expire. The streaming branch is path-locked at the moment of the peek result.
+**Context.** Amendment 6 (D34) formally deferred streaming-path D4 singleflight participation with the note "the design alone warrants a dedicated ADR." Round-6 cold-audit F13 (filed as issue #16) raised the sibling TOCTOU window: `server.mjs:782 preCheckHit = await cacheStore.peek(...)` followed by the streaming-branch entry conditionals at lines 817–823 (the TODO anchor sits just above at line ~810 and is the navigable landmark; line numbers may drift across commits) creates a race where, between peek and spawn, a concurrent populator can write the cache OR a TTL can expire. The streaming branch is path-locked at the moment of the peek result.
 
 This amendment ratifies the v1.x design so the implementation work has a single specification to follow.
 
@@ -59,7 +59,7 @@ This amendment ratifies the v1.x design so the implementation work has a single 
    - For each `client ∈ attachedClients`: if `client.queueByteSize + chunkSize > PER_CLIENT_QUEUE_CAP` (default 1 MB), the client is disconnected with `STREAM_BACKPRESSURE` (see §8). Otherwise push the chunk into `client.queue`, update `queueByteSize`, fire `resolveNext` if pending.
 
    When the source iterator returns/throws/aborts, the tee task:
-   - On normal completion: writes `accumulatedChunks` to cache via the standard cache-write conditions (cacheable opt-out, truncated-not-cached, size cap — all from Amendment 1/3/5). Resolves all clients' `resolveNext` with their remaining queue then sentinel-marks `done`. Releases the D38 spawn slot once. Removes the entry from `_streamingInflight`.
+   - On normal completion: writes `accumulatedChunks` to cache via the standard cache-write conditions — `truncated-not-cached` from § Decision § "Cache write conditions" item 1; `cacheable=false` opt-out from Amendment 3; `claude -p --output-format text` wire-shape limitation from Amendment 5; size cap from Amendment 3. (Note: ADR 0005 has no Amendment 1 heading — the section §-Decision body item-1 is the source for `truncated-not-cached`, NOT a numbered amendment.) Resolves all clients' `resolveNext` with their remaining queue then sentinel-marks `done`. Releases the D38 spawn slot once. Removes the entry from `_streamingInflight`.
    - On source error: rejects all clients with the error. Does NOT write cache. Releases the D38 spawn slot. Removes entry.
    - On source abort (all clients disconnected): cancels the iterator via AbortController, releases the slot, removes entry. No cache write (partial response not persisted, matches D16 buffered-path SPAWN_FAILED salvage NOT applying to abort).
 

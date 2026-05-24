@@ -1,6 +1,6 @@
 {
   "name": "olp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Personal multi-provider LLM proxy. Successor to OCP. One HTTP endpoint, multiple subscriptions behind it, automatic routing + fallback + caching.",
   "type": "module",
   "main": "server.mjs",

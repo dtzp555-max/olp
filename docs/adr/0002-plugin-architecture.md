@@ -7,6 +7,8 @@
 
 ## Amendments
 
+> **Note on numbering.** Sequence is 1, 3, 4, 5, 6 — Amendment 2 was never written. The reserved slot was originally planned for a separate `maxConcurrent` ratification, but that content was folded into Amendment 1 (the retroactive contract-sync amendment) at filing time and the gap was not backfilled. The gap is intentional and load-bearing — no missing content; do not renumber Amendments 3+ to close it (cross-references to Amendment N from other docs would silently break).
+
 ### Amendment 6 — 2026-05-24: `maxConcurrent` runtime enforcement landed (D38, issue #1)
 
 - **Finding:** Amendment 1 (2026-05-23) ratified `maxSpawnTimeMs` into the Provider contract but explicitly noted that `hints.maxConcurrent` remained **declarative-only at v0.1** — type-validated at startup in `lib/providers/base.mjs` (`validateProvider` requires it to be a non-negative integer) but unenforced at runtime (no semaphore / in-flight counter / spawn queue in `server.mjs`). Cold-audit catch from D11 (commit `f659e29`): the diff-review reviewer grep-verified that the original ADR draft's claim "Enforced by the spawn-concurrency guard in `server.mjs`" was false. GitHub issue #1 was filed to track the gap. D38 closes that gap.

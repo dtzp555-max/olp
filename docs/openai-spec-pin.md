@@ -136,14 +136,37 @@ Each entry: `{ "id": "<model-id>", "object": "model", "created": <ts>, "owned_by
 no invented fields (per D27 F15). Alias entries are also surfaced as separate list members
 (per D27 F15 alias surfacing).
 
+**`created` field stability (F12 round-5 cold-audit):** OpenAI spec treats `created` as a
+stable per-model attribute, not a request-time value. `server.mjs handleModels` uses
+`getModelCreated(modelId)` (from `lib/providers/index.mjs`) which reads the per-entry
+`created` field from `models-registry.json`. If a model entry has no `created` field,
+the fallback is `models-registry.json` top-level `bootstrapCreated`
+(currently `1778630400` = 2026-05-13). The per-model timestamps are the closest
+approximation to the real model announcement dates per provider docs. Alias entries
+use the same `created` timestamp as their canonical model target.
+
 ---
 
 ### GET /health
 
 OLP-specific endpoint (not in OpenAI spec). Returns:
 ```json
-{ "ok": true, "version": "<semver>", "providers": { "enabled": <n>, "available": <n> } }
+{
+  "ok": true,
+  "version": "<semver>",
+  "providers": {
+    "enabled": <n>,
+    "available": <n>,
+    "status": {
+      "<provider-name>": { "ok": true, "latencyMs": <ms> }
+    }
+  }
+}
 ```
+
+Per-provider `status` entries are the result of each loaded provider's `healthCheck()` call
+(ADR 0002 § Provider contract). If `healthCheck()` throws, the entry is
+`{ "ok": false, "error": "<message>" }`. (F5 round-5 cold-audit.)
 
 ---
 

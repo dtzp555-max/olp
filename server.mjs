@@ -29,7 +29,7 @@ import {
   generateRequestId,
   SSE_DONE,
 } from './lib/ir/ir-to-openai.mjs';
-import { loadProviders, listAllProviderNames, getAliasMap } from './lib/providers/index.mjs';
+import { loadProviders, listAllProviderNames, getAliasMap, getModelCreated } from './lib/providers/index.mjs';
 import { ProviderError } from './lib/providers/base.mjs';
 import { computeCacheKey, hasCacheControl, extractCacheControlMarkers } from './lib/cache/keys.mjs';
 import { CacheStore } from './lib/cache/store.mjs';
@@ -267,15 +267,25 @@ function olpErrorHeaders({ startMs, model }) {
 
 /**
  * GET /health
- * Returns server health including count of loaded providers.
+ * Returns server health including count of loaded providers and per-provider
+ * healthCheck() snapshots (ADR 0002 § Provider contract: healthCheck is used
+ * by startup and /health endpoint per ADR 0002 § Provider contract description).
  */
-function handleHealth(req, res) {
+async function handleHealth(req, res) {
   const enabled = loadedProviders.size;
   const available = listAllProviderNames().length;
+  const providerStatuses = {};
+  for (const [name, provider] of loadedProviders) {
+    try {
+      providerStatuses[name] = await provider.healthCheck();
+    } catch (e) {
+      providerStatuses[name] = { ok: false, error: e.message };
+    }
+  }
   sendJSON(res, 200, {
     ok: true,
     version: VERSION,
-    providers: { enabled, available },
+    providers: { enabled, available, status: providerStatuses },
   });
 }
 
@@ -295,7 +305,6 @@ function handleHealth(req, res) {
  * Empty case: if no providers are enabled, data: [] is returned naturally.
  */
 function handleModels(req, res) {
-  const createdTs = Math.floor(Date.now() / 1000);
   const data = [];
 
   // Canonical entries first
@@ -304,19 +313,23 @@ function handleModels(req, res) {
       data.push({
         id: modelId,
         object: 'model',
-        created: createdTs,
+        // F12 (round-5 cold-audit): use stable per-model timestamp from
+        // models-registry.json rather than Date.now() on each request.
+        // OpenAI spec treats `created` as a stable per-model attribute.
+        created: getModelCreated(modelId),
         owned_by: providerName,
       });
     }
   }
 
   // Alias entries for loaded (enabled) providers, canonical-first ordering preserved
-  for (const [alias, { providerName }] of getAliasMap()) {
+  for (const [alias, { providerName, canonicalModel }] of getAliasMap()) {
     if (loadedProviders.has(providerName)) {
       data.push({
         id: alias,
         object: 'model',
-        created: createdTs,
+        // Alias entries use the same stable timestamp as their canonical model.
+        created: getModelCreated(canonicalModel),
         owned_by: providerName,
       });
     }
@@ -434,6 +447,14 @@ async function handleChatCompletions(req, res) {
   //   If executeHopFn returns successfully, the chunks are buffered and we write
   //   them to `res` only AFTER executeWithFallback returns — ensuring no writes
   //   occur during chain iteration.
+  //
+  // F8 (round-5 cold-audit): track whether the SERVING hop's response came from
+  // cache. preCheckHit only covered the PRIMARY hop's key; when a fallback hop
+  // serves from its own cache, the header must report 'hit', not 'miss'.
+  // lastHopWasCached is set by executeHopFn before returning so the cacheStatus
+  // computation below can consume it after executeWithFallback completes.
+  let lastHopWasCached = false;
+
   async function executeHopFn(hopProvider, hopModel, irReq) {
     const hopCacheKey = computeCacheKey(hopProvider, hopModel, irReq);
     const hopProviderPlugin = loadedProviders.get(hopProvider);
@@ -535,7 +556,16 @@ async function handleChatCompletions(req, res) {
     // to satisfy ADR 0005 § "Cache write conditions" item 1 (no truncation).
     // D4 singleflight is preserved: getOrCompute still deduplicates concurrent
     // requests during the spawn; the eviction only affects persistent caching.
+    //
+    // F8 (round-5 cold-audit): peek before getOrCompute so we know whether the
+    // value comes from cache or is freshly computed. peek() is stats-neutral per
+    // its contract (no hit/miss counter side-effect), so it does not distort the
+    // stats that getOrCompute will update on the canonical miss path.
+    // This is option (b) of the F8 spec: check cache BEFORE calling getOrCompute.
+    const hopWasCached = await cacheStore.peek(keyId, hopCacheKey);
     const result = await cacheStore.getOrCompute(keyId, hopCacheKey, collectAllChunks);
+    // Record for use in cacheStatus computation after executeWithFallback returns.
+    lastHopWasCached = hopWasCached;
     if (result.__truncated) {
       // Evict the truncated entry so future requests get a fresh spawn.
       // ADR 0005 § "Cache write conditions" item 1: truncated responses must not
@@ -673,18 +703,16 @@ async function handleChatCompletions(req, res) {
       }
       res.write(SSE_DONE);
       res.end();
+      // Loop exhausted without stop chunk = truncation. The stop-chunk completion
+      // path returns earlier (above, inside the for-await loop); reaching here means
+      // the generator returned without emitting stop. Never cache (per ADR 0005 cache
+      // write conditions item 1: truncated responses must not persist in cache).
       if (streamedChunks.length > 0 && cacheableForFirstHop) {
-        const lastChunk = streamedChunks[streamedChunks.length - 1];
-        const hasStopChunk = lastChunk?.type === 'stop';
-        if (hasStopChunk) {
-          await cacheStore.set(keyId, streamCacheKey, streamedChunks);
-        } else {
-          logEvent('warn', 'streaming_no_stop_chunk', {
-            chunks_count: streamedChunks.length,
-            provider: streamProvider,
-            model: streamModel,
-          });
-        }
+        logEvent('warn', 'streaming_no_stop_chunk', {
+          chunks_count: streamedChunks.length,
+          provider: streamProvider,
+          model: streamModel,
+        });
       }
     } catch (e) {
       if (firstChunkEmitted) {
@@ -805,7 +833,13 @@ async function handleChatCompletions(req, res) {
   // global flag. If the serving provider was Anthropic and markers were present,
   // the cache was bypassed; otherwise it was a hit (preCheckHit) or miss.
   const bypassCacheForServingHop = shouldBypassCacheForHop(providerUsed);
-  const cacheStatus = bypassCacheForServingHop ? 'bypass' : (preCheckHit && fallbackHops === 0 ? 'hit' : 'miss');
+  // F8 (round-5 cold-audit): cacheStatus accounts for fallback-hop cache hits.
+  // preCheckHit covers the primary-hop case (fallbackHops===0); lastHopWasCached
+  // covers any hop (including fallback hops that served from their own cache).
+  // The two flags combine: if either signals a cache hit AND no bypass, report 'hit'.
+  const cacheStatus = bypassCacheForServingHop ? 'bypass'
+    : (lastHopWasCached || (preCheckHit && fallbackHops === 0)) ? 'hit'
+    : 'miss';
   const headers = olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus, fallbackHops });
 
   if (ir.stream) {
@@ -847,7 +881,7 @@ async function router(req, res) {
 
   try {
     if (method === 'GET' && path === '/health') {
-      return handleHealth(req, res);
+      return await handleHealth(req, res);
     }
 
     if (method === 'GET' && path === '/v1/models') {

@@ -28,7 +28,7 @@ import {
   SSE_DONE,
 } from './lib/ir/ir-to-openai.mjs';
 import { validateProvider, ProviderError, withTimeout } from './lib/providers/base.mjs';
-import { loadProviders, getProviderForModel, getProviderByName, listAllProviderNames, getAliasMap } from './lib/providers/index.mjs';
+import { loadProviders, getProviderForModel, getProviderByName, listAllProviderNames, getAliasMap, getModelCreated, REGISTRY_BOOTSTRAP_CREATED } from './lib/providers/index.mjs';
 import anthropic, {
   irToAnthropic,
   anthropicChunkToIR,
@@ -5833,6 +5833,13 @@ import {
   createOlpServer as createServer27,
   __setProvidersEnabled as setProviders27,
   __resetProvidersEnabled as resetProviders27,
+  createOlpServer as createServer33,
+  __setProvidersEnabled as setProviders33,
+  __resetProvidersEnabled as resetProviders33,
+  __setFallbackConfig as setFallbackConfig33,
+  __resetFallbackConfig as resetFallbackConfig33,
+  __clearCache as clearCache33,
+  loadedProviders as loadedProviders33,
 } from './server.mjs';
 
 describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
@@ -7283,6 +7290,389 @@ describe('D27 F15 — /v1/models alias surfacing', () => {
       resetProviders27();
       await new Promise(r => s.close(r));
     }
+  });
+
+});
+
+// ── Suite D33: round-5 cold-audit cleanup batch ───────────────────────────────
+//
+// F3: function_call deprecated field → deterministic IR id (no Date.now())
+// F5: /health returns per-provider healthCheck() snapshots
+// F8_fallback: fallback-hop cache-hit → X-OLP-Cache: hit (not miss)
+// F12: /v1/models `created` is stable per-model timestamp
+//
+// Authority:
+//   F3 — ADR 0005 § "same inputs → same key, no random, no timestamp"
+//   F5 — ADR 0002 § Provider contract (healthCheck)
+//   F8_fallback — ADR 0005 § D1 cache; ADR 0004 § Observability headers
+//   F12 — OpenAI /v1/models spec (https://platform.openai.com/docs/api-reference/models);
+//          models-registry.json bootstrapCreated fallback
+
+describe('D33 round-5 cold-audit cleanup', () => {
+
+  // ── F3: deterministic function_call ID ────────────────────────────────────
+
+  describe('F3 — function_call deprecated field → deterministic cache key', () => {
+
+    it('F3a: two identical function_call requests produce the same IR id', () => {
+      const req = {
+        model: 'test-model',
+        messages: [
+          {
+            role: 'assistant',
+            function_call: { name: 'get_weather', arguments: '{"city":"Paris"}' },
+          },
+        ],
+      };
+      const ir1 = openAIToIR(req);
+      const ir2 = openAIToIR(req);
+      const id1 = ir1.messages[0].tool_calls?.[0]?.id;
+      const id2 = ir2.messages[0].tool_calls?.[0]?.id;
+      assert.ok(id1, 'function_call must produce a tool_calls entry with an id');
+      assert.equal(id1, id2,
+        `Two identical function_call requests must produce the same id; got ${id1} vs ${id2}`);
+      assert.ok(id1.startsWith('fc-'), 'id must start with "fc-"');
+    });
+
+    it('F3b: two identical function_call requests produce the same cache key', () => {
+      const req = {
+        model: 'test-model',
+        messages: [
+          {
+            role: 'assistant',
+            function_call: { name: 'my_tool', arguments: '{}' },
+          },
+        ],
+      };
+      const ir1 = openAIToIR(req);
+      const ir2 = openAIToIR(req);
+      const key1 = computeCacheKey('anthropic', 'claude-sonnet-4-6', ir1);
+      const key2 = computeCacheKey('anthropic', 'claude-sonnet-4-6', ir2);
+      assert.equal(key1, key2,
+        'Identical function_call requests must produce identical cache keys');
+    });
+
+    it('F3c: different function_call names produce different cache keys', () => {
+      const req1 = openAIToIR({
+        model: 'test-model',
+        messages: [{ role: 'assistant', function_call: { name: 'tool_a', arguments: '{}' } }],
+      });
+      const req2 = openAIToIR({
+        model: 'test-model',
+        messages: [{ role: 'assistant', function_call: { name: 'tool_b', arguments: '{}' } }],
+      });
+      const key1 = computeCacheKey('anthropic', 'claude-sonnet-4-6', req1);
+      const key2 = computeCacheKey('anthropic', 'claude-sonnet-4-6', req2);
+      assert.notEqual(key1, key2,
+        'Different function_call names must produce different cache keys');
+    });
+
+  });
+
+  // ── F5: /health per-provider snapshot ─────────────────────────────────────
+
+  describe('F5 — /health returns per-provider healthCheck() snapshots', () => {
+
+    it('F5a: /health with no providers enabled returns providers.status = {}', async () => {
+      setProviders33({});
+      const s = createServer33();
+      await new Promise((resolve, reject) => {
+        s.listen(0, '127.0.0.1', resolve);
+        s.once('error', reject);
+      });
+      const p = s.address().port;
+      try {
+        const r = await fetch({ port: p, method: 'GET', path: '/health' });
+        assert.equal(r.status, 200);
+        const body = JSON.parse(r.body);
+        assert.ok(body.ok, '/health must return ok:true');
+        assert.ok('status' in body.providers,
+          '/health providers must include a "status" key');
+        assert.deepEqual(body.providers.status, {},
+          'status must be empty when no providers are loaded');
+      } finally {
+        resetProviders33();
+        await new Promise(r => s.close(r));
+      }
+    });
+
+    it('F5b: /health with anthropic enabled includes providers.status.anthropic', async () => {
+      setProviders33({ anthropic: true });
+      const s = createServer33();
+      await new Promise((resolve, reject) => {
+        s.listen(0, '127.0.0.1', resolve);
+        s.once('error', reject);
+      });
+      const p = s.address().port;
+      try {
+        const r = await fetch({ port: p, method: 'GET', path: '/health' });
+        assert.equal(r.status, 200);
+        const body = JSON.parse(r.body);
+        assert.ok('anthropic' in body.providers.status,
+          'providers.status must include anthropic when it is enabled');
+        const ahc = body.providers.status.anthropic;
+        assert.ok(typeof ahc === 'object' && ahc !== null,
+          'providers.status.anthropic must be an object');
+        assert.ok('ok' in ahc,
+          'providers.status.anthropic must have an "ok" field');
+      } finally {
+        resetProviders33();
+        await new Promise(r => s.close(r));
+      }
+    });
+
+    it('F5c: /health includes status for each loaded provider', async () => {
+      setProviders33({ anthropic: true, mistral: true });
+      const s = createServer33();
+      await new Promise((resolve, reject) => {
+        s.listen(0, '127.0.0.1', resolve);
+        s.once('error', reject);
+      });
+      const p = s.address().port;
+      try {
+        const r = await fetch({ port: p, method: 'GET', path: '/health' });
+        assert.equal(r.status, 200);
+        const body = JSON.parse(r.body);
+        assert.equal(body.providers.enabled, 2, 'enabled must be 2');
+        assert.ok('anthropic' in body.providers.status, 'anthropic status must appear');
+        assert.ok('mistral' in body.providers.status, 'mistral status must appear');
+        assert.ok(!('openai' in body.providers.status),
+          'openai must NOT appear in status when not loaded');
+      } finally {
+        resetProviders33();
+        await new Promise(r => s.close(r));
+      }
+    });
+
+    it('F5d: /health status entry has ok:false + error on healthCheck() throw', async () => {
+      setProviders33({ anthropic: true });
+      const savedProvider = loadedProviders33.get('anthropic');
+      // Inject a provider whose healthCheck always throws
+      const throwingProvider = {
+        ...savedProvider,
+        healthCheck: async () => { throw new Error('probe-failed'); },
+      };
+      loadedProviders33.set('anthropic', throwingProvider);
+      const s = createServer33();
+      await new Promise((resolve, reject) => {
+        s.listen(0, '127.0.0.1', resolve);
+        s.once('error', reject);
+      });
+      const p = s.address().port;
+      try {
+        const r = await fetch({ port: p, method: 'GET', path: '/health' });
+        assert.equal(r.status, 200, '/health must still return 200 even when healthCheck throws');
+        const body = JSON.parse(r.body);
+        assert.ok(body.ok, 'top-level ok must still be true');
+        const ahc = body.providers.status.anthropic;
+        assert.equal(ahc.ok, false, 'status.anthropic.ok must be false when healthCheck throws');
+        assert.ok(typeof ahc.error === 'string', 'status.anthropic.error must be a string');
+        assert.ok(ahc.error.includes('probe-failed'), 'error must include the thrown message');
+      } finally {
+        if (savedProvider !== undefined) {
+          loadedProviders33.set('anthropic', savedProvider);
+        } else {
+          loadedProviders33.delete('anthropic');
+        }
+        resetProviders33();
+        await new Promise(r => s.close(r));
+      }
+    });
+
+  });
+
+  // ── F8_fallback: fallback-hop cache-hit → X-OLP-Cache: hit ───────────────
+
+  describe('F8_fallback — fallback-hop cache-hit reports X-OLP-Cache: hit', () => {
+
+    it('F8_fallback: 2-hop chain, primary fails, secondary cache-hit → X-OLP-Cache: hit', async () => {
+      // Two providers: primary (alpha) always fails with QUOTA_EXHAUSTED; secondary
+      // (beta) succeeds. On second request, secondary serves from cache.
+      // The X-OLP-Cache header must be 'hit' on the second request.
+      //
+      // Uses an explicit chain config: [alpha → beta]. alpha is enabled but fails;
+      // beta is enabled and succeeds. Secondary's cache key is different from primary's
+      // (different provider name), so the second request hits beta's cache.
+
+      setProviders33({ anthropic: true, mistral: true });
+      clearCache33();
+
+      // Override anthropic spawn to always throw QUOTA_EXHAUSTED
+      const savedAnthropic = loadedProviders33.get('anthropic');
+      const failingPrimary = {
+        ...savedAnthropic,
+        spawn: async function* () {
+          throw new ProviderError('quota exhausted (test)', 'QUOTA_EXHAUSTED');
+        },
+      };
+      loadedProviders33.set('anthropic', failingPrimary);
+
+      // Override mistral spawn to yield a valid response
+      const savedMistral = loadedProviders33.get('mistral');
+      let secondarySpawnCount = 0;
+      const succeedingSecondary = {
+        ...savedMistral,
+        spawn: async function* () {
+          secondarySpawnCount++;
+          yield { type: 'delta', role: 'assistant', content: 'fallback-response' };
+          yield { type: 'stop', finish_reason: 'stop' };
+        },
+      };
+      loadedProviders33.set('mistral', succeedingSecondary);
+
+      // Wire a 2-hop chain: anthropic (claude-sonnet-4-6) → mistral (devstral-2-25-12)
+      setFallbackConfig33({
+        chains: {
+          'claude-sonnet-4-6': [
+            { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+            { provider: 'mistral', model: 'devstral-2-25-12' },
+          ],
+        },
+        soft_triggers: {},
+        providersEnabled: { anthropic: true, mistral: true },
+      });
+
+      const s = createServer33();
+      await new Promise((resolve, reject) => {
+        s.listen(0, '127.0.0.1', resolve);
+        s.once('error', reject);
+      });
+      const p = s.address().port;
+
+      const makeRequest = () => fetch({
+        port: p,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'f8-fallback-cache-test' }],
+          stream: false,
+        },
+      });
+
+      try {
+        // First request: primary fails → secondary spawns → result cached under secondary key
+        const r1 = await makeRequest();
+        assert.equal(r1.status, 200, `r1 must be 200; got ${r1.status}`);
+        assert.equal(r1.headers['x-olp-cache'], 'miss',
+          'r1 must be cache miss (first time secondary serves)');
+        assert.equal(secondarySpawnCount, 1, 'secondary must spawn once for r1');
+
+        // Second request: primary still fails → secondary serves from its own cache
+        const r2 = await makeRequest();
+        assert.equal(r2.status, 200, `r2 must be 200; got ${r2.status}`);
+        assert.equal(r2.headers['x-olp-cache'], 'hit',
+          'r2 must be cache hit — fallback hop served from secondary cache');
+        assert.equal(secondarySpawnCount, 1,
+          'secondary must NOT spawn again for r2 (served from cache)');
+      } finally {
+        if (savedAnthropic !== undefined) {
+          loadedProviders33.set('anthropic', savedAnthropic);
+        } else {
+          loadedProviders33.delete('anthropic');
+        }
+        if (savedMistral !== undefined) {
+          loadedProviders33.set('mistral', savedMistral);
+        } else {
+          loadedProviders33.delete('mistral');
+        }
+        resetFallbackConfig33();
+        resetProviders33();
+        clearCache33();
+        await new Promise(r => s.close(r));
+      }
+    });
+
+  });
+
+  // ── F12: /v1/models stable `created` timestamps ────���──────────────────────
+
+  describe('F12 — /v1/models stable per-model created timestamp', () => {
+
+    it('F12a: getModelCreated returns a stable number for known model IDs', () => {
+      // These models have explicit created fields in models-registry.json
+      const claudeSonnet = getModelCreated('claude-sonnet-4-6');
+      const claudeSonnet2 = getModelCreated('claude-sonnet-4-6');
+      assert.equal(claudeSonnet, claudeSonnet2,
+        'getModelCreated must return the same value on repeated calls');
+      assert.ok(typeof claudeSonnet === 'number' && claudeSonnet > 0,
+        'getModelCreated must return a positive number');
+      // claude-sonnet-4-6 has created=1775001600 (2026-04-01)
+      assert.equal(claudeSonnet, 1775001600,
+        'claude-sonnet-4-6 created must match models-registry.json entry');
+    });
+
+    it('F12b: getModelCreated falls back to REGISTRY_BOOTSTRAP_CREATED for unknown IDs', () => {
+      const unknown = getModelCreated('non-existent-model-xyz');
+      assert.equal(unknown, REGISTRY_BOOTSTRAP_CREATED,
+        'unknown model must fall back to REGISTRY_BOOTSTRAP_CREATED');
+    });
+
+    it('F12c: REGISTRY_BOOTSTRAP_CREATED matches models-registry.json bootstrapCreated', () => {
+      assert.equal(REGISTRY_BOOTSTRAP_CREATED, modelsRegistry.bootstrapCreated,
+        'REGISTRY_BOOTSTRAP_CREATED must equal models-registry.json bootstrapCreated');
+    });
+
+    it('F12d: /v1/models returns stable created for canonical models (not Date.now())', async () => {
+      setProviders33({ anthropic: true });
+      const s = createServer33();
+      await new Promise((resolve, reject) => {
+        s.listen(0, '127.0.0.1', resolve);
+        s.once('error', reject);
+      });
+      const p = s.address().port;
+      try {
+        const r1 = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+        const r2 = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+        assert.equal(r1.status, 200);
+        assert.equal(r2.status, 200);
+        const body1 = JSON.parse(r1.body);
+        const body2 = JSON.parse(r2.body);
+
+        // Both responses must have same created values for all entries
+        const entries1 = Object.fromEntries(body1.data.map(e => [e.id, e.created]));
+        const entries2 = Object.fromEntries(body2.data.map(e => [e.id, e.created]));
+        for (const [id, ts] of Object.entries(entries1)) {
+          assert.equal(entries2[id], ts,
+            `created for '${id}' must be stable across requests; got ${ts} vs ${entries2[id]}`);
+        }
+
+        // claude-sonnet-4-6 must use the registry value, not Date.now()
+        const sonnetEntry = body1.data.find(e => e.id === 'claude-sonnet-4-6');
+        assert.ok(sonnetEntry, 'claude-sonnet-4-6 must appear in /v1/models');
+        assert.equal(sonnetEntry.created, 1775001600,
+          'claude-sonnet-4-6 created must be 1775001600 (2026-04-01), not Date.now()');
+      } finally {
+        resetProviders33();
+        await new Promise(r => s.close(r));
+      }
+    });
+
+    it('F12e: alias entries in /v1/models use the canonical model\'s created timestamp', async () => {
+      setProviders33({ anthropic: true });
+      const s = createServer33();
+      await new Promise((resolve, reject) => {
+        s.listen(0, '127.0.0.1', resolve);
+        s.once('error', reject);
+      });
+      const p = s.address().port;
+      try {
+        const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+        assert.equal(r.status, 200);
+        const body = JSON.parse(r.body);
+        // 'sonnet' alias → canonical 'claude-sonnet-4-6' → created 1775001600
+        const sonnetAlias = body.data.find(e => e.id === 'sonnet');
+        const sonnetCanon = body.data.find(e => e.id === 'claude-sonnet-4-6');
+        assert.ok(sonnetAlias, '"sonnet" alias must appear in /v1/models');
+        assert.ok(sonnetCanon, 'claude-sonnet-4-6 canonical must appear in /v1/models');
+        assert.equal(sonnetAlias.created, sonnetCanon.created,
+          'alias "sonnet" must have same created as canonical "claude-sonnet-4-6"');
+      } finally {
+        resetProviders33();
+        await new Promise(r => s.close(r));
+      }
+    });
+
   });
 
 });

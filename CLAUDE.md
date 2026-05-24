@@ -108,4 +108,34 @@ release_kit:
     - any first-run migration quirk (e.g., from OCP) → README § "Troubleshooting" + scripts/migrate-from-ocp.mjs if applicable
     # NOTE: scripts/migrate-from-ocp.mjs is planned (Phase 7), not yet authored. The scripts/ directory
     # does not currently exist. References here are forward-looking; do not attempt to run this script.
+  phase_rolling_mode:
+    # Iron Rule 5 (release-kit version bump before push) applies at Phase boundaries,
+    # NOT to individual D-day commits within a Phase.
+    #
+    # Rationale: OLP Phase 1 is a single cohesive deliverable (boot layer + provider
+    # plugins + cache + fallback engine + hardening). Bumping a version tag for every
+    # D-day push would produce 30+ noise tags with no user-facing semantic boundary.
+    # ADR 0005 § "Cache key stability" requires that key composition is stable across
+    # a release; mid-phase tag churn would falsely signal stability windows.
+    #
+    # Policy:
+    #   - While a Phase is in progress, individual D-day pushes land under "Unreleased"
+    #     in CHANGELOG.md. package.json stays at the Phase-N pre-release identifier
+    #     (e.g. "0.1.0-bootstrap" during Phase 1 boot; the token may be updated to
+    #     "0.1.0-phase1" once Phase 1 implementation starts landing).
+    #   - The version bump + git tag fires at Phase CLOSE — a dedicated "Phase N close"
+    #     PR that bumps package.json, promotes "Unreleased" to the release version in
+    #     CHANGELOG.md, and triggers .github/workflows/release.yml via the tag push.
+    #   - The Phase close PR is triggered explicitly by the project maintainer; it is
+    #     NOT automatic. No automated tooling bumps the version.
+    #   - Cross-Phase discipline: if D-day work touches a boundary already tagged (e.g.
+    #     a hotfix to a shipped Phase N deliverable), follow Iron Rule 5 normally — bump
+    #     patch, tag, release before pushing.
+    #
+    # This overlay is the authoritative source. If Iron Rule 5 appears to be silently
+    # violated (no version bump after many D-day pushes), check this section first
+    # before filing a compliance finding.
+    current_phase: Phase 1
+    current_pre_release_identifier: "0.1.0-bootstrap"
+    phase_close_trigger: explicit maintainer action (not automated)
 ```

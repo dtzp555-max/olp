@@ -4,6 +4,11 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+> **Phase rolling mode active** — individual D-day pushes accumulate here until Phase 1 closes.
+> Version bump + tag fires at Phase close (explicit maintainer action, not automated).
+> Per `CLAUDE.md` release_kit overlay § `phase_rolling_mode`. Iron Rule 5 is NOT being
+> silently violated; this policy is the documented exception for intra-Phase work.
+
 ### Phase 1 — Provider plugins + cache + fallback engine + P1 hardening
 
 - **D10 (P1 round-3 hardening from external Codex review).** Three production-blocking defects from the Phase 1 round-3 review folded in:

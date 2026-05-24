@@ -4,18 +4,88 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-> **Phase rolling mode active** — individual D-day pushes accumulate here until Phase 1 closes.
-> Version bump + tag fires at Phase close (explicit maintainer action, not automated).
-> Per `CLAUDE.md` release_kit overlay § `phase_rolling_mode`. Iron Rule 5 is NOT being
-> silently violated; this policy is the documented exception for intra-Phase work.
+(empty — Phase 2 entries land here once Phase 2 opens)
 
-### Phase 1 — Provider plugins + cache + fallback engine + P1 hardening
+## v0.1.0 — 2026-05-24
 
-- **D10 (P1 round-3 hardening from external Codex review).** Three production-blocking defects from the Phase 1 round-3 review folded in:
-  - **`providers.enabled` config wired through `loadProviders()`** (ADR 0002 § Disable model). `loadFallbackConfigSync()` now returns a tri-field shape `{ chains, soft_triggers, providersEnabled }`; `server.mjs` reads `_startupConfig.providersEnabled` at startup and passes it to `loadProviders()`. Empty / missing config → 0 enabled providers → `503 no_enabled_provider`, matching the v0.1 0-Enabled posture. `__setProvidersEnabled` / `__resetProvidersEnabled` test seams added.
-  - **Real SSE streaming on single-hop cache-miss** (ADR 0003 entry adapter pattern). New `handleChatCompletions` branch when `ir.stream === true && chain.length === 1 && !bypassCache && !preCheckHit`: `for await (const irChunk of provider.spawn(...))` writes SSE per chunk via `res.write(irChunkToOpenAISSE(...))`, accumulates chunks for `cacheStore.set` on completion. First-chunk rule preserved (error-before-first-chunk → `sendError(502)`; error-after-first-chunk → truncated `res.end()`). Multi-hop chains still buffer (`executeWithFallback` path) to maintain fallback safety.
-  - **Spawn timeout hard trigger** (ADR 0004 § Trigger taxonomy bullet 4). `SPAWN_TIMEOUT` added to `PROVIDER_ERROR_CODES` and `HARD_TRIGGER_CODES`. All three provider plugins (`anthropic.mjs` / `codex.mjs` / `mistral.mjs`) wrap their spawn drain loop with `setTimeout` (default 600_000ms, configurable via `hints.maxSpawnTimeMs`); on fire, `proc.kill('SIGTERM')` + reject pending drain promise with `ProviderError(..., 'SPAWN_TIMEOUT')`. Timer cleared in `finally` block; `resolveNext` / `rejectNext` atomically nulled to prevent late-fire double-settle.
-- **Test suite: 277 → 288 (+11).** New Suite 14 (providers.enabled wiring, 4 tests), Suite 15 (streaming cache-miss real-time, 3 tests including arrival-count assertion proving real streaming architecturally), Suite 16 (spawn timeout, 4 tests including full 2-hop chain advancement from timed-out primary).
+### Phase 1 Close — Multi-provider proxy core
+
+**Overview.** Phase 1 delivers the OLP minimum-viable multi-provider proxy: OpenAI-compatible HTTP entry surface, plugin architecture for 3 Tier-D providers (Anthropic Claude / OpenAI Codex / Mistral Vibe), cache layer (D1 per-key isolation + D4 buffered-path singleflight + size cap + cacheable opt-out), fallback engine with first-chunk safety + spawn-timeout hard trigger + structured per-hop log observability, IR↔OpenAI translation honoring the Rule 2(b) no-invention constraint, and a 416-test suite covering all of it.
+
+Released under `phase_rolling_mode` (CLAUDE.md release_kit overlay): 25 D-day commits accumulated on `main` between 2026-05-23 and 2026-05-24 before this version bump + tag.
+
+**Provider posture.** Three Tier D plugins ship as **Candidate** (per ALIGNMENT.md § Provider Inventory) — runnable via `providers.enabled` config but not Enabled by default. Five additional Tier B/C plugin slots exist in `models-registry.json` as Speculative-Candidate / candidate stubs awaiting CLI authority pins. Zero Enabled providers at v0.1; transition to Enabled requires Phase audit + primary-source pin per ADR 0002.
+
+### What landed (D10–D34 commit index)
+
+The per-commit detail is in the git log; this index summarizes the deliverables.
+
+**Phase 1 core hardening:**
+- **D10** (`2cfd0b1`) — P1 round-3: providers.enabled config wiring + real SSE streaming on single-hop cache-miss + spawn-timeout hard trigger across all 3 plugins.
+
+**Round-1 fold-in batch (cold audit caught 17 findings):**
+- **D11** (`f659e29`) — ADR 0002 Amendment 1: `maxSpawnTimeMs` ratified into Provider contract hints.
+- **D12** (`4b1a9c8`) — IR translator Rule 2(b) compliance: removed invented top-level `error` field on `chat.completion` shapes.
+- **D13** (`f34b690`) — Per-hop `cache_control` bypass evaluation (was request-global).
+- **D14** (`a7085d9`) — Defer `res.writeHead(200)` until first chunk; early-error returns 502 JSON instead of 200 empty SSE.
+- **D15** (`8ae77c3`) — ADR 0005 Amendment 2: cache key includes `max_tokens` / `top_p` / `stop` / `tool_choice`.
+- **D16** (`bafa6d1`) — ADR 0004 Amendment 1: SPAWN_FAILED-with-chunks salvage (don't discard partial responses).
+- **D17** (`cb86807`) — Alias routing SPOT via `models-registry.json`; `getProviderForModel` canonicalizes.
+- **D18** (`82ff007`) — `/v1/models` populated from registry; 5 standard X-OLP-* headers on error responses.
+- **D19** (`ed82e65`) — Cleanup batch: finish_reason validator, dead alignment.yml KNOWN_PROVIDERS removal, unused imports.
+- **D20** (`d85a2dc`) — Docs drift: README/AGENTS/ADR forward-references annotated `📋 Planned`.
+
+**Round-2 fold-in batch (13 findings):**
+- **D21** (`1466d3a`) — `validateProvider` enforces `maxSpawnTimeMs` contract field.
+- **D22** (`e10b7d7`) — ADR 0004 Amendment 2: soft triggers deferred to v1.x.
+- **D23** (`7ef5510`) — `hints.cacheable` opt-out + 10MB cache entry size cap (ADR 0002 Amendment 3, ADR 0005 Amendment 3).
+- **D24** (`f8348ad`) — Spawn-timeout race fix: post-loop `if (spawnTimedOut) throw SPAWN_TIMEOUT` closes the rejectNext-null window across all 3 plugins.
+- **D25** (`cd391b1`) — Round-2 P3 docs batch.
+
+**Round-3 fold-in batch (13 findings):**
+- **D26** (`a281d3e`) — Soft-trigger startup warning, stderr propagation on error-chunk SPAWN_FAILED (codex+mistral), anthropic D4-observation header, streaming truncation marker.
+- **D27** (`c3ba751`) — IR validator response_format + tool_choice checks, ADR 0005 Amendment 4 (cache_control IR vs body), `/v1/models` alias surfacing.
+- **D28** (`4a238c9`) — Per-hop log observability: `chain_id`, `trigger_type`, `ir_request_hash`, `next_provider` on all 8 fallback log events.
+- **D29** (`de9f3ca`) — Suite 17 port-collision flake fix: 16 test sites switched to OS-assigned `listen(0)`.
+- **D30** (`5119b42`) — README env vars correctness, `docs/openai-spec-pin.md` v0.1 baseline.
+- **D31** (`d6347e3`) — ADR amendment trio: F5 (ADR 0003 Amendment 1 substitute test strategy), F11 (ADR 0005 Amendment 5 Anthropic wire limitation), F13+F14 (ALIGNMENT.md Speculative-Candidate exception class).
+
+**Round-4 fold-in batch (10 findings):**
+- **D32** (`30de965`) — Provider auth env vars in README, X-OLP-* on early-return paths, ADR 0002 Amendment 4 ratifying `contractVersion`, dead OUTPUT_PARSE_ERROR removal, codex parser inline assumption labels.
+
+**Round-5 fold-in batch (12 findings):**
+- **D33** (`f784fdb`) — ALIGNMENT mistral `--output streaming` pin correction, deterministic `function_call` ID (cache key stability), `/health` per-provider snapshot, fallback-hop cache-hit X-OLP-Cache correctness, `CLAUDE.md` `phase_rolling_mode` policy formalization, `/v1/models` stable `created` timestamps.
+
+**Round-6 final batch (14 findings; 4 closed, 9 filed as issues):**
+- **D34** (`60570ef`) — ADR 0005 Amendment 6 (streaming singleflight v1.x deferral), array-field cache key normalization (`tools:[]` / `stop:[]` now collide with omitted), QUOTA_EXHAUSTED + RATE_LIMITED dead code removal (ADR 0004 Amendment 3), ADR 0005 Amendment 7 (conservative cache-key v0.1 trade-off).
+
+### ADRs in scope
+
+- **ADR 0001** — Project founding (Phase 1 founding doc; no amendments)
+- **ADR 0002** — Plugin architecture (4 amendments — `maxSpawnTimeMs`, `cacheable`, `contractVersion` ratifications)
+- **ADR 0003** — IR design (1 amendment — `__irRoundTripTest` removal + substitute test strategy)
+- **ADR 0004** — Fallback engine (3 amendments — SPAWN_FAILED salvage, soft trigger deferral, hard-trigger taxonomy narrowing)
+- **ADR 0005** — Cache layer (7 amendments — cache key expansions, cache_control IR-vs-body, cacheable + size cap, Anthropic wire limitation, streaming singleflight deferral, conservative cache-key v0.1 trade-off)
+- **ADR 0006** — Provider inclusion (Tier framework; no amendments)
+- **ALIGNMENT.md** — Speculative-Candidate plugin Rule 4 exception class added (D31)
+- **CLAUDE.md** — `phase_rolling_mode` overlay added (D33)
+- **`docs/openai-spec-pin.md`** — v0.1 baseline pinned (D30)
+
+### Test growth
+
+277 (pre-D10) → 416 (post-D34). 6 cold audit rounds reviewed code against ADR claims. Iron Rule v1.6 § 10.x dual-mode review discipline (Diff Review + Cold Audit) caught 78+ findings of which ~50 closed via implementation and ~28 deferred to GitHub issues.
+
+### Known limitations carried to v1.x
+
+17 GitHub issues filed for follow-up. Notably:
+- **Streaming singleflight** (#16) — multi-concurrent identical streaming requests each spawn fresh CLI; buffered path participates in D4, streaming path doesn't (deferred via ADR 0005 Amendment 6).
+- **maxConcurrent runtime enforcement** (#1) — declarative-only at v0.1.
+- **X-OLP-Fallback-Detail debug header** (#7) — documented in ADR 0004, never emitted.
+- **Soft triggers** (per ADR 0004 Amendment 2) — evaluation code exists but `quotaStatus()` polling not wired; configured thresholds inert at v0.1.
+
+### Migration from OCP
+
+OLP supersedes OCP per ADR 0001. The `scripts/migrate-from-ocp.mjs` migration tool is 📋 Planned (Phase 7).
 
 ## v0.1.0-bootstrap — 2026-05-23
 

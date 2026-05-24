@@ -5310,11 +5310,11 @@ describe('providers.enabled config wiring (Suite 14)', () => {
     const { createOlpServer: createServer14 } = await import('./server.mjs');
     __setProvidersEnabled({});
     const s = createServer14();
-    const p = 22456 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({
         port: p,
@@ -5358,11 +5358,11 @@ describe('providers.enabled config wiring (Suite 14)', () => {
     const { createOlpServer: createServer14d, __clearCache: clearCache14d } = await import('./server.mjs');
     clearCache14d();
     const s = createServer14d();
-    const p = 22860 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
 
     try {
       const r = await fetch({
@@ -5407,11 +5407,11 @@ describe('Streaming cache-miss real-time (Suite 15)', () => {
     const { createOlpServer: s15, __clearCache: cc15 } = await import('./server.mjs');
     cc15();
     server15 = s15();
-    port15 = 23456 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      server15.listen(port15, '127.0.0.1', resolve);
+      server15.listen(0, '127.0.0.1', resolve);
       server15.once('error', reject);
     });
+    port15 = server15.address().port;
   });
 
   after(async () => {
@@ -5844,11 +5844,11 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
   it('17a: /v1/models with anthropic enabled → 200 + 7 entries (3 canonical + 4 aliases) with owned_by="anthropic"', async () => {
     setProviders17({ anthropic: true });
     const s = createServer17();
-    const p = 25456 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
       assert.equal(r.status, 200);
@@ -5871,11 +5871,11 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
   it('17b: /v1/models with no providers enabled → 200 + data:[]', async () => {
     setProviders17({});
     const s = createServer17();
-    const p = 25460 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
       assert.equal(r.status, 200);
@@ -5894,11 +5894,11 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
   it('17c: /v1/models returns canonical IDs and alias IDs for loaded providers', async () => {
     setProviders17({ anthropic: true });
     const s = createServer17();
-    const p = 25464 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
       assert.equal(r.status, 200);
@@ -5928,11 +5928,11 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
   it('17d: /v1/models entries match OpenAI spec shape (id/object/created/owned_by)', async () => {
     setProviders17({ anthropic: true });
     const s = createServer17();
-    const p = 25468 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
       assert.equal(r.status, 200);
@@ -6012,11 +6012,11 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
     codexSetSpawnImpl(makeFailSpawn17());
 
     const s = createServer17();
-    const p = 25472 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
 
     try {
       const r = await fetch({
@@ -6105,11 +6105,11 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
     codexSetSpawnImpl(makeFailSpawn17f());
 
     const s = createServer17();
-    const p = 25876 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
 
     try {
       const r = await fetch({
@@ -6154,11 +6154,11 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
     // is the minimum viable observability for those paths.
     setProviders17({});
     const s = createServer17();
-    const p = 25880 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const result = await new Promise((resolve, reject) => {
         const req = httpRequest({
@@ -6758,11 +6758,11 @@ describe('D26 F19 — streaming truncation marker on stop-less exhaustion', () =
     const { createOlpServer: s19, __clearCache: cc19 } = await import('./server.mjs');
     cc19();
     serverF19 = s19();
-    portF19 = 29456 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      serverF19.listen(portF19, '127.0.0.1', resolve);
+      serverF19.listen(0, '127.0.0.1', resolve);
       serverF19.once('error', reject);
     });
+    portF19 = serverF19.address().port;
   });
 
   after(async () => {
@@ -7078,11 +7078,11 @@ describe('D27 F15 — /v1/models alias surfacing', () => {
   it('F15a: /v1/models with anthropic enabled contains all canonical IDs and all 4 anthropic aliases', async () => {
     setProviders27({ anthropic: true });
     const s = createServer27();
-    const p = 27100 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
       assert.equal(r.status, 200);
@@ -7105,11 +7105,11 @@ describe('D27 F15 — /v1/models alias surfacing', () => {
   it('F15b: each alias entry has owned_by equal to its canonical target provider', async () => {
     setProviders27({ anthropic: true });
     const s = createServer27();
-    const p = 27200 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
       assert.equal(r.status, 200);
@@ -7131,11 +7131,11 @@ describe('D27 F15 — /v1/models alias surfacing', () => {
   it('F15c: /v1/models with no providers enabled returns empty data (no aliases)', async () => {
     setProviders27({});
     const s = createServer27();
-    const p = 27300 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
       assert.equal(r.status, 200);
@@ -7150,11 +7150,11 @@ describe('D27 F15 — /v1/models alias surfacing', () => {
   it('F15d: /v1/models with anthropic+mistral enabled contains both providers\' canonicals and aliases', async () => {
     setProviders27({ anthropic: true, mistral: true });
     const s = createServer27();
-    const p = 27400 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
       assert.equal(r.status, 200);
@@ -7180,11 +7180,11 @@ describe('D27 F15 — /v1/models alias surfacing', () => {
     // Only anthropic enabled — codex aliases (codex, codex-spark, gpt5, gpt5-mini) must NOT appear
     setProviders27({ anthropic: true });
     const s = createServer27();
-    const p = 27500 + Math.floor(Math.random() * 400);
     await new Promise((resolve, reject) => {
-      s.listen(p, '127.0.0.1', resolve);
+      s.listen(0, '127.0.0.1', resolve);
       s.once('error', reject);
     });
+    const p = s.address().port;
     try {
       const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
       assert.equal(r.status, 200);

@@ -238,6 +238,31 @@ function olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus = 'miss', fa
   };
 }
 
+/**
+ * Returns the standard 5-header OLP diagnostic set for pre-chain error paths
+ * (no provider was attempted yet). Used by sendError call sites that occur
+ * before chain construction (415 wrong Content-Type, 400 bad JSON, 400 IR
+ * validation failure, 503 no-enabled-providers).
+ *
+ * Per F8 (D32 round-4 cold-audit): ADR 0004 § Observability requires the full
+ * 5-header set on every response; early error paths must emit canonical
+ * "no provider attempted" defaults.
+ *
+ * @param {object} opts
+ * @param {number} opts.startMs — request start timestamp (Date.now())
+ * @param {string|null|undefined} [opts.model] — ir.model if IR was parsed; undefined/null otherwise
+ * @returns {Record<string,string>}
+ */
+function olpErrorHeaders({ startMs, model }) {
+  return {
+    'X-OLP-Provider-Used': 'none',
+    'X-OLP-Model-Used': model ?? 'unknown',
+    'X-OLP-Fallback-Hops': '0',
+    'X-OLP-Cache': 'bypass',
+    'X-OLP-Latency-Ms': String(Date.now() - startMs),
+  };
+}
+
 // ── Route handlers ────────────────────────────────────────────────────────
 
 /**
@@ -320,7 +345,7 @@ async function handleChatCompletions(req, res) {
   const ct = req.headers['content-type'] ?? '';
   if (!ct.includes('application/json')) {
     return sendError(res, 415, 'Content-Type must be application/json', 'invalid_request_error',
-      { 'X-OLP-Latency-Ms': String(Date.now() - startMs) });
+      olpErrorHeaders({ startMs }));
   }
 
   let body;
@@ -328,7 +353,7 @@ async function handleChatCompletions(req, res) {
     body = await readJSON(req);
   } catch (e) {
     return sendError(res, e.statusCode ?? 400, e.message, 'invalid_request_error',
-      { 'X-OLP-Latency-Ms': String(Date.now() - startMs) });
+      olpErrorHeaders({ startMs }));
   }
 
   // Translate OpenAI → IR (ADR 0003)
@@ -338,7 +363,7 @@ async function handleChatCompletions(req, res) {
   } catch (e) {
     if (e instanceof BadRequestError) {
       return sendError(res, 400, e.message, 'invalid_request_error',
-        { 'X-OLP-Latency-Ms': String(Date.now() - startMs) });
+        olpErrorHeaders({ startMs }));
     }
     throw e;
   }
@@ -365,6 +390,7 @@ async function handleChatCompletions(req, res) {
       res, 503,
       `No enabled providers for model ${ir.model}. See README § Supported Providers.`,
       'no_enabled_provider',
+      olpErrorHeaders({ startMs, model: ir.model }),
     );
   }
 
@@ -558,7 +584,8 @@ async function handleChatCompletions(req, res) {
 
     if (!streamPlugin) {
       // Provider disappeared between chain build and here (edge case).
-      return sendError(res, 503, `Provider ${streamProvider} is not enabled`, 'no_enabled_provider');
+      return sendError(res, 503, `Provider ${streamProvider} is not enabled`, 'no_enabled_provider',
+        olpErrorHeaders({ startMs, model: ir.model }));
     }
 
     const streamHeaders = olpHeaders({
@@ -676,7 +703,8 @@ async function handleChatCompletions(req, res) {
           error: e.message,
         });
         if (!res.headersSent) {
-          sendError(res, 502, e.message ?? 'Provider error', 'provider_error');
+          sendError(res, 502, e.message ?? 'Provider error', 'provider_error',
+            olpHeaders({ providerUsed: streamProvider, modelUsed: streamModel, startMs, cacheStatus: 'miss', fallbackHops: 0 }));
         } else {
           res.end();
         }
@@ -693,7 +721,8 @@ async function handleChatCompletions(req, res) {
   } catch (e) {
     // executeWithFallback throws only on programming errors (empty chain).
     logEvent('error', 'fallback_engine_error', { error: e.message });
-    return sendError(res, 500, 'Internal server error', 'internal_error');
+    return sendError(res, 500, 'Internal server error', 'internal_error',
+      olpErrorHeaders({ startMs, model: ir.model }));
   }
 
   const {

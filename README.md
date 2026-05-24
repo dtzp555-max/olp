@@ -96,14 +96,14 @@ Trigger types, fallback safety, idempotency rules, and the full example config l
 
 _placeholder — full table lands as each endpoint lands._
 
-| Endpoint | Method | Phase | Description |
-|---|---|---|---|
-| `/v1/chat/completions` | POST | 1 | OpenAI-compatible Chat Completions entry. Internally normalized to IR, dispatched to a provider plugin, response shape converted back. |
-| `/v1/models` | GET | 1 | Lists models from `models-registry.json`. |
-| `/health` | GET | 1 | Per-provider health snapshot (owner-only). |
-| `/cache/stats` | GET | 5 | Cache hit rate, by-provider breakdown. |
-| `/v0/management/quota` | GET | 6 | Per-provider quota / credit pool status (best-effort). |
-| `/dashboard` | GET | 6 | Owner-only dashboard (localhost-bound by default). |
+| Endpoint | Method | Phase | Status | Description |
+|---|---|---|---|---|
+| `/v1/chat/completions` | POST | 1 | ✅ Shipped | OpenAI-compatible Chat Completions entry. Internally normalized to IR, dispatched to a provider plugin, response shape converted back. |
+| `/v1/models` | GET | 1 | ✅ Shipped | Lists models from `models-registry.json`. |
+| `/health` | GET | 1 | ✅ Shipped | Per-provider health snapshot (owner-only). |
+| `/cache/stats` | GET | 5 | 📋 Planned | Cache hit rate, by-provider breakdown. |
+| `/v0/management/quota` | GET | 6 | 📋 Planned | Per-provider quota / credit pool status (best-effort). |
+| `/dashboard` | GET | 6 | 📋 Planned | Owner-only dashboard (localhost-bound by default). |
 
 ---
 
@@ -118,11 +118,36 @@ _placeholder — full table lands per-phase as variables are introduced._
 | `OLP_CODEX_BIN` | `codex` (from PATH) | Override path to the `codex` binary (OpenAI provider). |
 | `OLP_VIBE_BIN` | `vibe` (from PATH) | Override path to the `vibe` binary (Mistral provider). |
 
+### Per-provider auth env vars
+
+These variables configure credential discovery for each provider plugin. Setting the correct one for your provider is usually required for OLP to make successful requests.
+
+**Anthropic (`claude -p`)**
+
+| Variable | Default behavior | Description |
+|---|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` | Searches `~/.claude/.credentials.json` first, then macOS keychain (darwin only) | Directly supplies the OAuth access token. Highest-precedence override; bypasses all credential-discovery logic. Useful in CI/headless environments where the keychain is unavailable. |
+
+**OpenAI Codex (`codex exec --json`)**
+
+| Variable | Default behavior | Description |
+|---|---|---|
+| `OPENAI_CODEX_AUTH_PATH` | `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) | Overrides the full path to the Codex auth artifact. When set, no other path is tried; missing or malformed file returns null (no auth). Useful for CI test fixtures. |
+| `CODEX_HOME` | `~/.codex` | Overrides the Codex home directory. `$CODEX_HOME/auth.json` becomes the default auth path. Ignored when `OPENAI_CODEX_AUTH_PATH` is set explicitly. |
+
+**Mistral Vibe (`vibe --prompt`)**
+
+| Variable | Default behavior | Description |
+|---|---|---|
+| `MISTRAL_API_KEY` | Reads `$VIBE_HOME/.env` (default `~/.vibe/.env`) | Directly supplies the Mistral API key. Highest-precedence override per DOCS-2; bypasses `.env` file lookup. |
+| `MISTRAL_VIBE_AUTH_PATH` | `~/.vibe/.env` (or `$VIBE_HOME/.env`) | Overrides the full path to the Vibe `.env` auth file. Evaluated only when `MISTRAL_API_KEY` is not set. When set, no other path is tried; missing or malformed file returns null (no auth). |
+| `VIBE_HOME` | `~/.vibe` | Overrides the Vibe home directory. `$VIBE_HOME/.env` becomes the default auth path. Ignored when `MISTRAL_API_KEY` or `MISTRAL_VIBE_AUTH_PATH` is set explicitly. |
+
 > **📋 Planned (Phase 2) — not yet read by the codebase:**
 > - `OLP_HOME` (`~/.olp`) — Config, providers, keys, cache, logs root. Currently hardcoded to `~/.olp/config.json` in `loadFallbackConfigSync`; the env override path is a Phase 2 config-layer deliverable.
 > - `OLP_LOG_LEVEL` (`info`) — Log level filter (`error`/`warn`/`info`/`debug`). `logEvent` currently writes unconditionally; level filtering is a Phase 2 observability deliverable.
 
-Further variables (per-provider auth path overrides, cache size limits, fallback-engine knobs) land with the relevant phase. See also the [Implementation status](#implementation-status-as-of-2026-05-24) table.
+See also the [Implementation status](#implementation-status-as-of-2026-05-24) table.
 
 ---
 

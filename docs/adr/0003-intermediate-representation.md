@@ -7,6 +7,14 @@
 
 ## Amendments
 
+### Amendment 2 — 2026-05-24: Correct model-mapping example; document verbatim-pass-through design (D32 F2)
+
+- **Finding:** Round-4 cold-audit F2 (P3 ADR example vs implementation drift) — § Decision "Required fields" item `model` reads: "The provider plugin maps this to the provider-native model identifier (e.g., `claude-sonnet-4-6` → `claude-sonnet-4-6-20260301` for Anthropic)." This is WRONG per the D17 SPOT decision (commit `cb86807`): OLP does NOT perform a model-alias mapping inside the provider plugin. `irRequest.model` is passed verbatim to the provider CLI (`claude -p --model <model>`, `codex exec --model <model>`, etc.); each provider's CLI resolves its own aliases natively per its documented behaviour.
+- **Decision:** Update the `model` field description in § Decision to reflect the actual verbatim-pass-through design. The erroneous example (`claude-sonnet-4-6` → `claude-sonnet-4-6-20260301`) implied OLP maintained an explicit alias map, which it does not. See also inline update in § Decision below.
+- **Authority:** D17 SPOT decision (commit `cb86807`) — "provider plugin passes `irRequest.model` verbatim; CLI alias resolution is the provider's responsibility." ADR 0003 § Decision is updated in-place to match; the original v1.0 text is preserved as a struck annotation.
+- **Forward note:** v1.x may add an explicit OLP-side mapping step if any provider's CLI drops alias support or if a unified OLP-owned alias layer is needed across providers. That change requires a further ADR 0003 amendment.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (Round-4 Cold Audit caught it as F2).
+
 ### Amendment 1 — 2026-05-24: Remove __irRoundTripTest() claim; document substitute test strategy (D31 F5)
 
 - **Finding:** Round-3 cold-audit F5 (P2 ADR-claim vs implementation drift) — § Mitigations names a `__irRoundTripTest()` export on every provider plugin as the structural counter-measure against silent lossy translation. ZERO plugins export this function; the export-name was an early-design aspiration that does not fit the actual plugin shape (spawn-wrappers with asymmetric request→CLI-args+stdin and response-stream→IR, not symmetric `irToNative`+`nativeToIR` functions that could be tested in isolation via a round-trip fixture).
@@ -48,7 +56,7 @@ OLP defines an Intermediate Representation (IR) as the canonical internal shape 
 
 **Required fields:**
 - `messages[]` — each with `role`, `content`, optional `name`, optional `tool_calls`, optional `tool_call_id`. Roles supported: `system`, `user`, `assistant`, `tool`.
-- `model` — the user-requested model string. The provider plugin maps this to the provider-native model identifier (e.g., `claude-sonnet-4-6` → `claude-sonnet-4-6-20260301` for Anthropic).
+- `model` — the user-requested model string. v0.1: passed verbatim to the provider CLI (`claude -p --model <model>`, `codex exec --model <model>`, etc.); each provider's CLI accepts its own aliases natively per its docs (D17 SPOT decision, commit `cb86807`). *(The original v1.0 text incorrectly stated the plugin maps this to a provider-native identifier — corrected by Amendment 2.)* v1.x may add an explicit OLP-side mapping step if any provider's CLI drops alias support.
 - `stream` — boolean. SSE expected on the entry side iff true.
 
 **Optional fields:**

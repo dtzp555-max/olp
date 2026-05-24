@@ -7,6 +7,14 @@
 
 ## Amendments
 
+### Amendment 4 — 2026-05-24: Ratify `contractVersion` as a required Provider contract field (D32 F5)
+
+- **Finding:** Round-4 cold-audit F5 (P3 governance omission) — `lib/providers/base.mjs` `validateProvider` enforces `p.contractVersion === '1.0'` and all three shipped plugins declare it, but the Provider contract field list in § Decision (lines ~63-74) does not include `contractVersion`. It was mentioned only in § Mitigations as a forward-looking note ("The contract is versioned. v1.0 is the subset in this ADR; future additions … require ADR amendment plus a contract-version bump. Old provider plugins continue to declare `contractVersion: '1.0'`…"), not as a required field. This is the same class of documentation–implementation gap as Amendment 1 (`maxSpawnTimeMs` retroactive sync).
+- **Change:** Add `contractVersion: '1.0'` as the 10th required field in the Provider contract field list in § Decision. The `hints` block moves from 9th to 10th entry to keep the list logically ordered (name → displayName → models → auth → spawn → estimateCost → quotaStatus → healthCheck → contractVersion → hints). `validateProvider` in `base.mjs` already enforces it; this amendment is a retroactive documentation sync, not a code change.
+- **Semantics:** `contractVersion` is a required string field set to `'1.0'` for all v0.1 plugins. Its purpose is to allow the loader to detect plugins authored against an older or newer contract version when OLP's contract evolves. A future contract revision (v1.1 or v2.0) will increment this value and update this ADR accordingly.
+- **Authority:** `lib/providers/base.mjs` `validateProvider` function — live enforcement as of v0.1 bootstrap. All three shipped plugins (`anthropic.mjs`, `codex.mjs`, `mistral.mjs`) already export `contractVersion: '1.0'`.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (Round-4 Cold Audit caught it as F5). Parallel to Amendment 1 (D11 `maxSpawnTimeMs` retroactive sync).
+
 ### Amendment 3 — 2026-05-24: Add `cacheable` to Provider contract hints (D23)
 
 - **Finding:** Cold-audit round-2 Finding 3 (P2 contract/cache-condition drift) — ADR 0005 § "Cache write conditions" item 3 references `hints.cacheable` but the field was never named in this ADR's Provider contract hints list. `validateProvider` did not enforce it; no plugin declared it; no consumer read it. The field existed only in prose.
@@ -71,6 +79,7 @@ Every provider plugin exports an object conforming to:
 - `estimateCost: (request) => { inputTokens, outputTokensEstimate, currency, usd }` — best-effort, may return null
 - `quotaStatus: async (authContext) => { available, percentUsed, resetsAt, pool }` — best-effort, null if unretrievable
 - `healthCheck: async () => { ok, latencyMs, error? }` — startup and `/health` endpoint use this
+- `contractVersion: '1.0'` — required string identifying the Provider contract version the plugin was authored against. Set to `'1.0'` for all v0.1 plugins. `validateProvider` in `base.mjs` enforces this field. Future contract revisions will increment the value; the loader uses it to detect stale plugins. See Amendment 4. (D32 F5)
 - `hints: { requiresTTY, concurrentSpawnSafe, maxConcurrent, maxSpawnTimeMs, cacheable }` — fingerprint, concurrency, timeout, and cache hints:
   - `requiresTTY` — boolean; whether the provider CLI requires a TTY to produce non-interactive output (e.g., some CLIs suppress JSON output unless forced with a flag or a TTY is present).
   - `concurrentSpawnSafe` — boolean; whether the provider CLI is safe to spawn concurrently under the same auth context without rate-limit or session collisions.

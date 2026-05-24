@@ -3891,10 +3891,8 @@ describe('Fallback engine — trigger taxonomy (D9)', () => {
     assert.equal(evaluateHardTriggers(err), false);
   });
 
-  it('evaluateHardTriggers: ProviderError OUTPUT_PARSE_ERROR → fires', () => {
-    const err = new ProviderError('Parse error', 'OUTPUT_PARSE_ERROR');
-    assert.equal(evaluateHardTriggers(err), true);
-  });
+  // D32 F4: OUTPUT_PARSE_ERROR removed from PROVIDER_ERROR_CODES and
+  // HARD_TRIGGER_CODES — no plugin emits it; it was dead code. Test removed.
 
   it('evaluateHardTriggers: generic Error with no statusCode → does NOT fire', () => {
     const err = new Error('Something went wrong');
@@ -6142,16 +6140,16 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
     }
   });
 
-  // ── 17g: pre-routing 400 (invalid JSON) carries X-OLP-Latency-Ms ─────────
+  // ── 17g: pre-routing 400 (invalid JSON) carries full 5 X-OLP-* headers ──────
+  // Updated by D32 F8: olpErrorHeaders() now emits all 5 headers with
+  // "no provider attempted" defaults (provider='none', model='unknown',
+  // hops=0, cache='bypass') on pre-chain error paths. Test updated to assert
+  // the full set rather than only X-OLP-Latency-Ms.
 
-  it('17g: pre-routing 400 (invalid JSON body) carries X-OLP-Latency-Ms', async () => {
-    // Pre-routing errors inside handleChatCompletions (invalid JSON body, wrong
-    // Content-Type, IR parse failure) have access to startMs and emit
-    // X-OLP-Latency-Ms to allow latency instrumentation even when there is no
-    // provider context. The other 4 X-OLP-* headers are omitted (no provider was
-    // attempted). This is consistent with ADR 0004 § Observability which requires
-    // the full set for chain-exhausted paths; partial emission on pre-route errors
-    // is the minimum viable observability for those paths.
+  it('17g: pre-routing 400 (invalid JSON body) carries all 5 X-OLP-* headers with no-provider defaults', async () => {
+    // Pre-chain errors inside handleChatCompletions now emit the full 5-header set
+    // via olpErrorHeaders() with canonical "no provider attempted" defaults per
+    // ADR 0004 § Observability (D32 F8).
     setProviders17({});
     const s = createServer17();
     await new Promise((resolve, reject) => {
@@ -6177,15 +6175,102 @@ describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
         req.end();
       });
       assert.equal(result.status, 400, `Expected 400 for invalid JSON body`);
-      // X-OLP-Latency-Ms must be present (D18 pre-routing observability)
+      // All 5 X-OLP-* headers must be present (D32 F8 olpErrorHeaders)
       assert.ok(result.headers['x-olp-latency-ms'] !== undefined,
-        'Pre-routing 400 error must carry X-OLP-Latency-Ms for latency instrumentation');
+        'Pre-routing 400 must carry X-OLP-Latency-Ms');
       const latencyMs = parseInt(result.headers['x-olp-latency-ms'], 10);
       assert.ok(!isNaN(latencyMs) && latencyMs >= 0,
-        `X-OLP-Latency-Ms must be a non-negative integer, got: ${result.headers['x-olp-latency-ms']}`);
-      // The other 4 headers are NOT present (no provider context)
-      assert.ok(result.headers['x-olp-provider-used'] === undefined,
-        'Pre-routing 400 must NOT carry X-OLP-Provider-Used (no provider context)');
+        `X-OLP-Latency-Ms must be non-negative integer, got: ${result.headers['x-olp-latency-ms']}`);
+      assert.equal(result.headers['x-olp-provider-used'], 'none',
+        'Pre-routing 400 must carry X-OLP-Provider-Used: none (no provider attempted)');
+      assert.equal(result.headers['x-olp-model-used'], 'unknown',
+        'Pre-routing 400 must carry X-OLP-Model-Used: unknown (IR not parsed yet)');
+      assert.equal(result.headers['x-olp-fallback-hops'], '0',
+        'Pre-routing 400 must carry X-OLP-Fallback-Hops: 0');
+      assert.equal(result.headers['x-olp-cache'], 'bypass',
+        'Pre-routing 400 must carry X-OLP-Cache: bypass');
+    } finally {
+      resetProviders17();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  // ── 17h: 415 wrong Content-Type carries all 5 X-OLP-* headers ────────��─────
+  // D32 F8: olpErrorHeaders on 415 pre-chain path.
+
+  it('17h: 415 wrong Content-Type carries all 5 X-OLP-* headers with no-provider defaults', async () => {
+    setProviders17({});
+    const s = createServer17();
+    await new Promise((resolve, reject) => {
+      s.listen(0, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    const p = s.address().port;
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const req = httpRequest({
+          hostname: '127.0.0.1',
+          port: p,
+          method: 'POST',
+          path: '/v1/chat/completions',
+          headers: { 'Content-Type': 'text/plain', 'Content-Length': '2' },
+        }, res => {
+          let data = '';
+          res.on('data', c => { data += c; });
+          res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+        });
+        req.on('error', reject);
+        req.write('{}');
+        req.end();
+      });
+      assert.equal(result.status, 415, `Expected 415 for wrong Content-Type, got ${result.status}`);
+      assert.equal(result.headers['x-olp-provider-used'], 'none',
+        '415 must carry X-OLP-Provider-Used: none');
+      assert.equal(result.headers['x-olp-model-used'], 'unknown',
+        '415 must carry X-OLP-Model-Used: unknown');
+      assert.equal(result.headers['x-olp-fallback-hops'], '0',
+        '415 must carry X-OLP-Fallback-Hops: 0');
+      assert.equal(result.headers['x-olp-cache'], 'bypass',
+        '415 must carry X-OLP-Cache: bypass');
+      assert.ok(result.headers['x-olp-latency-ms'] !== undefined,
+        '415 must carry X-OLP-Latency-Ms');
+    } finally {
+      resetProviders17();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  // ── 17i: 503 no-enabled-providers carries all 5 X-OLP-* headers ───────────
+  // D32 F8: olpErrorHeaders on 503 no-chain path. X-OLP-Model-Used reflects
+  // the requested model (IR was parsed successfully before chain lookup).
+
+  it('17i: 503 no-enabled-providers carries all 5 X-OLP-* headers with model from IR', async () => {
+    setProviders17({});
+    const s = createServer17();
+    await new Promise((resolve, reject) => {
+      s.listen(0, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    const p = s.address().port;
+    try {
+      const r = await fetch({
+        port: p,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.equal(r.status, 503, `Expected 503 for no enabled providers, got ${r.status}`);
+      assert.equal(r.headers['x-olp-provider-used'], 'none',
+        '503 must carry X-OLP-Provider-Used: none');
+      // Model is known (IR was parsed) so model string is propagated
+      assert.equal(r.headers['x-olp-model-used'], 'claude-sonnet-4-6',
+        '503 must carry X-OLP-Model-Used reflecting the requested model');
+      assert.equal(r.headers['x-olp-fallback-hops'], '0',
+        '503 must carry X-OLP-Fallback-Hops: 0');
+      assert.equal(r.headers['x-olp-cache'], 'bypass',
+        '503 must carry X-OLP-Cache: bypass');
+      assert.ok(r.headers['x-olp-latency-ms'] !== undefined,
+        '503 must carry X-OLP-Latency-Ms');
     } finally {
       resetProviders17();
       await new Promise(r => s.close(r));

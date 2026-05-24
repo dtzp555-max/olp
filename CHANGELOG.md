@@ -17,6 +17,16 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 - **Authority:** ADR 0005 § Cache layer / CacheStore API extension (Part 1); ADR 0004 Amendment 1 (Part 4); GitHub issue #3 — closed by this commit; D16 commit `bafa6d1` non-blocking suggestions — batched here.
 - **Test count:** 447 → 452 (3 unit tests for `CacheStore.delete` + 1 log-event integration test + 1 sticky-cache regression test).
 
+### D40 — `X-OLP-Fallback-Detail` header (issue #7)
+
+- **New debug header on responses with a non-empty failure trail** — `lib/fallback/engine.mjs#executeWithFallback` now returns a `fallbackDetail` array of per-hop tuples on every code path. `server.mjs` emits `X-OLP-Fallback-Detail: <JSON-stringified array>` on any response where at least one hop failed before the chain resolved or exhausted (chain-exhausted, non-trigger-error, client-error, AUTH_MISSING, and success-with-prior-failure paths). Header is absent on clean primary success (no failure trail to report).
+- **Tuple schema** — `{ hop, provider, model, code, error_message, trigger_type }` per failed hop. `code` is the `ProviderError` code or `'UNKNOWN'` for non-`ProviderError` exceptions; `error_message` is truncated to 200 chars with a U+2026 ellipsis on truncation; `trigger_type` matches D28's `classifyTrigger` output (`'hard'` / `'soft'` / `'auth_missing'` / `'client_error'` / `'non_trigger'`). Field shapes reuse D28's per-hop structured log event keys so logs and the header pivot on the same surface.
+- **4KB UTF-8 byte cap** — if the JSON-stringified array exceeds 4096 bytes, tail tuples are dropped and a `{ truncated: true, omitted_hops: N }` sentinel is appended such that the total fits under the cap. Cap calculation uses `Buffer.byteLength('utf8')`, not string length.
+- **RFC 7230 hygiene** — non-ASCII code points (e.g. the em dash in the D38 `CONCURRENCY_LIMIT` synthesised error message) are escaped as `\uXXXX` so the header value is pure ASCII. Node's HTTP header validator rejects multi-byte UTF-8 in field values; without this step, em-dash-bearing error messages would crash `res.writeHead`. `JSON.parse` round-trips the escaped form correctly.
+- **Gating posture — ungated at v0.1** — the original ADR 0004 § Chain advancement step 4 specified owner-only gating. Per the maintainer decision in issue #7, v0.1 ships the header **ungated** (single-tenant family-scale per ALIGNMENT.md; no PII risk in error details). **Phase 2 will re-introduce owner-vs-non-owner gating when `lib/keys.mjs` lands** — explicit follow-up tracked in AGENTS.md § Key files to know and ADR 0004 Amendment 5.
+- **Authority:** ADR 0004 § Decision § Chain advancement step 4 (original promise — D40 fulfils it); ADR 0004 Amendment 5 (D40 ratification); D18 (5 standard X-OLP-* headers; D40 builds on the convention); D28 (per-hop structured log fields; D40 reuses the field shapes); GitHub issue #7 — closed by this commit.
+- **Test count:** 452 → 468 (7 engine-level tuple-shape tests + 6 serialiser unit tests including the 4KB cap + non-ASCII regression + 3 HTTP integration tests).
+
 ## v0.1.0 — 2026-05-24
 
 ### Phase 1 Close — Multi-provider proxy core

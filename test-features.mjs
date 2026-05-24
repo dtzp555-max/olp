@@ -5586,6 +5586,219 @@ describe('Fallback engine — HTTP integration (D9)', () => {
     }
   });
 
+  // ── D40 HTTP integration tests (issue #7): X-OLP-Fallback-Detail on the wire ─
+
+  it('D40: 1-hop chain succeeds → X-OLP-Fallback-Detail header is absent (no failures to report)', async () => {
+    __clearCache();
+    __setSpawnImpl(makeSuccessSpawn('D40 clean success'));
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 10,
+        },
+      });
+      assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+      assert.equal(r.headers['x-olp-fallback-hops'], '0');
+      assert.equal(
+        r.headers['x-olp-fallback-detail'],
+        undefined,
+        `Header must be absent on clean primary success, got: ${r.headers['x-olp-fallback-detail']}`,
+      );
+    } finally {
+      __resetSpawnImpl();
+    }
+  });
+
+  it('D40: 2-hop chain, both fail → response carries X-OLP-Fallback-Detail with 2 tuples', async () => {
+    __clearCache();
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    // Anthropic mock: exits non-zero with stderr message → SPAWN_FAILED
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stderr.emit('data', Buffer.from('anthropic-stderr\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+    // Codex (openai) mock: also fails → exhausted chain
+    codexSetSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stderr.emit('data', Buffer.from('codex-stderr\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 10,
+        },
+      });
+      assert.ok(r.status >= 400 && r.status < 600, `Expected error status, got ${r.status}`);
+      assert.ok(
+        r.headers['x-olp-fallback-detail'] !== undefined,
+        `Expected X-OLP-Fallback-Detail header on exhausted chain, headers: ${JSON.stringify(r.headers)}`,
+      );
+      const parsed = JSON.parse(r.headers['x-olp-fallback-detail']);
+      assert.ok(Array.isArray(parsed), 'Header must JSON-parse to array');
+      assert.equal(parsed.length, 2, `Expected 2 tuples on 2-hop exhaustion, got ${parsed.length}`);
+      assert.equal(parsed[0].hop, 0);
+      assert.equal(parsed[0].provider, 'anthropic');
+      assert.equal(parsed[0].code, 'SPAWN_FAILED');
+      assert.equal(parsed[0].trigger_type, 'hard');
+      assert.equal(parsed[1].hop, 1);
+      assert.equal(parsed[1].provider, 'openai');
+    } finally {
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+    }
+  });
+
+  it('D40: 2-hop chain, primary fails + secondary succeeds → success response carries X-OLP-Fallback-Detail with 1 tuple (the failed primary)', async () => {
+    __clearCache();
+
+    const { writeFileSync, unlinkSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join: pathJoin } = await import('node:path');
+    const tmpAuthFile = pathJoin(tmpdir(), `olp-test-d40-success-with-detail-${Date.now()}.json`);
+    writeFileSync(tmpAuthFile, JSON.stringify({ accessToken: 'fake-d40-codex-token' }), 'utf8');
+    const savedCodexAuthPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = tmpAuthFile;
+
+    __setFallbackConfig({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    // Anthropic mock: SPAWN_FAILED (no chunks)
+    __setSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 1, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    // Codex (openai) mock: succeeds
+    codexSetSpawnImpl(function (_bin, _args, _opts) {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = {
+        write: () => {},
+        end: () => {
+          setImmediate(() => {
+            proc.stdout.emit('data', Buffer.from('{"content":"D40 success-after-fail"}\n'));
+            proc.stdout.emit('data', Buffer.from('{"type":"stop"}\n'));
+            proc.stdout.emit('end');
+            proc.stderr.emit('end');
+            proc.emit('close', 0, null);
+          });
+        },
+      };
+      proc.killed = false;
+      proc.kill = () => {};
+      return proc;
+    });
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 10,
+        },
+      });
+      assert.equal(r.status, 200, `Expected 200 from fallback success, got ${r.status}: ${r.body.slice(0, 300)}`);
+      assert.equal(r.headers['x-olp-fallback-hops'], '1');
+      assert.equal(r.headers['x-olp-provider-used'], 'openai');
+      assert.ok(
+        r.headers['x-olp-fallback-detail'] !== undefined,
+        `Expected X-OLP-Fallback-Detail on success-with-prior-failure, got headers: ${JSON.stringify(r.headers)}`,
+      );
+      const parsed = JSON.parse(r.headers['x-olp-fallback-detail']);
+      assert.equal(parsed.length, 1, `Expected 1 tuple (the failed primary), got ${parsed.length}`);
+      assert.equal(parsed[0].hop, 0);
+      assert.equal(parsed[0].provider, 'anthropic');
+      assert.equal(parsed[0].code, 'SPAWN_FAILED');
+      assert.equal(parsed[0].trigger_type, 'hard');
+    } finally {
+      __resetFallbackConfig();
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+      if (savedCodexAuthPath !== undefined) {
+        process.env.OPENAI_CODEX_AUTH_PATH = savedCodexAuthPath;
+      } else {
+        delete process.env.OPENAI_CODEX_AUTH_PATH;
+      }
+      try { unlinkSync(tmpAuthFile); } catch { /* ignore */ }
+    }
+  });
+
 });
 
 // ── Suite 13g: D28 round-3 F2 — structured log observability fields ─────────
@@ -5897,6 +6110,222 @@ describe('Fallback engine — D28 observability fields (chain_id / ir_request_ha
     const ir1 = makeIR({ tools: [{ type: 'function', function: { name: 'foo' } }] });
     const ir2 = makeIR({ tools: [{ type: 'function', function: { name: 'bar' } }] });
     assert.notEqual(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+});
+
+// ── D40: X-OLP-Fallback-Detail header (issue #7) ─────────────────────────
+//
+// Tests for D40 fold the per-hop fallback failure detail into a response
+// header. Authority: ADR 0004 § Decision § Chain advancement step 4 +
+// § Observability headers.
+
+import {
+  serializeFallbackDetailHeader,
+  FALLBACK_DETAIL_BYTE_CAP,
+} from './server.mjs';
+
+describe('D40 — X-OLP-Fallback-Detail header (issue #7)', () => {
+
+  // ── Engine: fallbackDetail returned in FallbackResult ─────────────────
+
+  it('engine: 2-hop chain, both fail → fallbackDetail has 2 tuples with correct shape', async () => {
+    const errA = new ProviderError('Anthropic spawn failed', 'SPAWN_FAILED');
+    const errB = new ProviderError('Codex spawn timeout', 'SPAWN_TIMEOUT');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw errA;
+      throw errB;
+    };
+    const result = await executeWithFallback(chain, makeIR({ model: 'claude-sonnet-4-6' }), hopFn);
+    assert.equal(result.chunks, null, 'Expected exhausted chain');
+    assert.ok(Array.isArray(result.fallbackDetail), 'fallbackDetail must be array');
+    assert.equal(result.fallbackDetail.length, 2);
+    assert.deepEqual(result.fallbackDetail[0], {
+      hop: 0, provider: 'anthropic', model: 'claude-sonnet-4-6',
+      code: 'SPAWN_FAILED', error_message: 'Anthropic spawn failed', trigger_type: 'hard',
+    });
+    assert.deepEqual(result.fallbackDetail[1], {
+      hop: 1, provider: 'openai', model: 'gpt-5.5',
+      code: 'SPAWN_TIMEOUT', error_message: 'Codex spawn timeout', trigger_type: 'hard',
+    });
+  });
+
+  it('engine: 2-hop chain, primary fails + secondary succeeds → fallbackDetail has 1 tuple (the failed primary)', async () => {
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    const result = await executeWithFallback(chain, makeIR({ model: 'claude-sonnet-4-6' }), hopFn);
+    assert.ok(Array.isArray(result.chunks), 'Expected success chunks');
+    assert.equal(result.fallbackHops, 1);
+    assert.equal(result.fallbackDetail.length, 1);
+    assert.equal(result.fallbackDetail[0].hop, 0);
+    assert.equal(result.fallbackDetail[0].provider, 'anthropic');
+    assert.equal(result.fallbackDetail[0].code, 'SPAWN_FAILED');
+    assert.equal(result.fallbackDetail[0].trigger_type, 'hard');
+  });
+
+  it('engine: 1-hop chain succeeds → fallbackDetail is empty array', async () => {
+    const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
+    const hopFn = async () => [{ type: 'stop', finish_reason: 'stop' }];
+    const result = await executeWithFallback(chain, makeIR({ model: 'claude-sonnet-4-6' }), hopFn);
+    assert.ok(Array.isArray(result.chunks));
+    assert.deepEqual(result.fallbackDetail, [], 'Empty fallbackDetail on clean primary success');
+  });
+
+  it('engine: 1-hop chain fails → fallbackDetail has 1 tuple', async () => {
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
+    const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
+    const hopFn = async () => { throw err; };
+    const result = await executeWithFallback(chain, makeIR({ model: 'claude-sonnet-4-6' }), hopFn);
+    assert.equal(result.chunks, null);
+    assert.equal(result.fallbackDetail.length, 1);
+    assert.equal(result.fallbackDetail[0].hop, 0);
+    assert.equal(result.fallbackDetail[0].code, 'SPAWN_FAILED');
+  });
+
+  it('engine: non-ProviderError exception → tuple code is "UNKNOWN"', async () => {
+    const err = new Error('Something unexpected'); // no .code field
+    const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
+    const hopFn = async () => { throw err; };
+    const result = await executeWithFallback(chain, makeIR({ model: 'claude-sonnet-4-6' }), hopFn);
+    assert.equal(result.fallbackDetail.length, 1);
+    assert.equal(result.fallbackDetail[0].code, 'UNKNOWN');
+    assert.equal(result.fallbackDetail[0].error_message, 'Something unexpected');
+    assert.equal(result.fallbackDetail[0].trigger_type, 'non_trigger');
+  });
+
+  it('engine: 500-char error message → tuple.error_message is truncated to 200 chars ending in ellipsis', async () => {
+    const longMsg = 'x'.repeat(500);
+    const err = new ProviderError(longMsg, 'SPAWN_FAILED');
+    const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
+    const hopFn = async () => { throw err; };
+    const result = await executeWithFallback(chain, makeIR({ model: 'claude-sonnet-4-6' }), hopFn);
+    const tuple = result.fallbackDetail[0];
+    assert.equal(tuple.error_message.length, 200, 'Truncated message must be exactly 200 chars');
+    assert.equal(tuple.error_message.slice(-1), '…', 'Truncated message must end with ellipsis');
+    assert.equal(tuple.error_message.slice(0, 199), 'x'.repeat(199), 'First 199 chars preserved');
+  });
+
+  it('engine: client error 400 → fallbackDetail has 1 tuple with trigger_type "client_error" (no advance)', async () => {
+    const err = Object.assign(new Error('Bad request'), { statusCode: 400 });
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    const result = await executeWithFallback(chain, makeIR({ model: 'claude-sonnet-4-6' }), hopFn);
+    assert.equal(result.fallbackDetail.length, 1, 'Client error stops chain — only 1 tuple');
+    assert.equal(result.fallbackDetail[0].trigger_type, 'client_error');
+  });
+
+  // ── serializeFallbackDetailHeader: cap + RFC 7230 hygiene ─────────────
+
+  it('serialize: empty array → null (no header emitted)', () => {
+    assert.equal(serializeFallbackDetailHeader([]), null);
+  });
+
+  it('serialize: null/undefined → null (no header emitted)', () => {
+    assert.equal(serializeFallbackDetailHeader(null), null);
+    assert.equal(serializeFallbackDetailHeader(undefined), null);
+  });
+
+  it('serialize: small array → JSON.stringified array under cap', () => {
+    const detail = [{
+      hop: 0, provider: 'anthropic', model: 'claude-sonnet-4-6',
+      code: 'SPAWN_FAILED', error_message: 'oops', trigger_type: 'hard',
+    }];
+    const v = serializeFallbackDetailHeader(detail);
+    assert.ok(typeof v === 'string');
+    assert.ok(Buffer.byteLength(v, 'utf8') <= FALLBACK_DETAIL_BYTE_CAP);
+    const parsed = JSON.parse(v);
+    assert.deepEqual(parsed, detail);
+  });
+
+  it('serialize: array exceeding 4KB → truncated with { truncated:true, omitted_hops:N } sentinel; total stays <= 4096 bytes', () => {
+    // Build many tuples each just under the cap individually but cumulatively
+    // over the cap. Each tuple here is roughly 250 bytes serialised.
+    const baseMsg = 'x'.repeat(180); // leaves ~20 chars for JSON braces/key padding
+    const tuples = [];
+    for (let i = 0; i < 50; i++) {
+      tuples.push({
+        hop: i,
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-6',
+        code: 'SPAWN_FAILED',
+        error_message: baseMsg,
+        trigger_type: 'hard',
+      });
+    }
+    const v = serializeFallbackDetailHeader(tuples);
+    assert.ok(typeof v === 'string');
+    assert.ok(
+      Buffer.byteLength(v, 'utf8') <= FALLBACK_DETAIL_BYTE_CAP,
+      `Header value must be <= ${FALLBACK_DETAIL_BYTE_CAP} bytes, got ${Buffer.byteLength(v, 'utf8')}`,
+    );
+    const parsed = JSON.parse(v);
+    assert.ok(Array.isArray(parsed), 'Must JSON-parse to array');
+    const tail = parsed[parsed.length - 1];
+    assert.equal(tail.truncated, true, 'Last entry must be the truncation sentinel');
+    assert.equal(typeof tail.omitted_hops, 'number');
+    assert.ok(tail.omitted_hops > 0, 'omitted_hops must be positive when truncation fired');
+    assert.equal(
+      parsed.length - 1 + tail.omitted_hops,
+      tuples.length,
+      'kept tuples + omitted_hops must equal total original tuples',
+    );
+  });
+
+  it('serialize: JSON.stringify escapes newlines in error_message (RFC 7230 hygiene — no raw CR/LF in header)', () => {
+    const detail = [{
+      hop: 0, provider: 'anthropic', model: 'claude-sonnet-4-6',
+      code: 'UNKNOWN', error_message: 'line1\nline2\rline3', trigger_type: 'non_trigger',
+    }];
+    const v = serializeFallbackDetailHeader(detail);
+    assert.ok(typeof v === 'string');
+    // Raw \n / \r in a header value would break RFC 7230. JSON.stringify escapes them.
+    assert.equal(v.indexOf('\n'), -1, 'Header value must not contain raw newline');
+    assert.equal(v.indexOf('\r'), -1, 'Header value must not contain raw CR');
+    // Parsed back, the original message round-trips correctly
+    assert.equal(JSON.parse(v)[0].error_message, 'line1\nline2\rline3');
+  });
+
+  it('serialize: non-ASCII characters in error_message (e.g. em dash U+2014) → escaped as \\uXXXX so Node HTTP header validator accepts the value', () => {
+    // The D38 CONCURRENCY_LIMIT synthesised error message in server.mjs contains
+    // an em dash. Without \uXXXX escaping, res.writeHead would throw
+    // "Invalid character in header content" because Node's HTTP layer rejects
+    // multi-byte UTF-8 in header values (RFC 7230 §3.2.6 field-vchar = ASCII VCHAR).
+    const detail = [{
+      hop: 0, provider: 'anthropic', model: 'claude-sonnet-4-6',
+      code: 'CONCURRENCY_LIMIT',
+      error_message: 'provider anthropic at maxConcurrent (2) — advancing to next hop',
+      trigger_type: 'hard',
+    }];
+    const v = serializeFallbackDetailHeader(detail);
+    assert.ok(typeof v === 'string');
+    // Every byte must be ASCII (0x00-0x7F) — verified via Buffer round-trip equality.
+    const utf8Len = Buffer.byteLength(v, 'utf8');
+    assert.equal(utf8Len, v.length, 'Header value must be pure ASCII (1 byte per char)');
+    for (let i = 0; i < v.length; i++) {
+      assert.ok(v.charCodeAt(i) < 0x80, `Char at ${i} (${v[i]}) must be ASCII`);
+    }
+    // JSON.parse must still round-trip the original em dash.
+    assert.equal(
+      JSON.parse(v)[0].error_message,
+      'provider anthropic at maxConcurrent (2) — advancing to next hop',
+    );
   });
 
 });

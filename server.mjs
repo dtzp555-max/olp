@@ -272,6 +272,115 @@ function olpErrorHeaders({ startMs, model }) {
   };
 }
 
+// ── X-OLP-Fallback-Detail (D40, issue #7) ─────────────────────────────────
+
+/**
+ * 4KB UTF-8 byte cap on the X-OLP-Fallback-Detail header value. Per RFC 7230 §3.2.5
+ * intermediaries are not obligated to forward arbitrarily large header values;
+ * 4KB matches the conservative upper bound (well below the 8KB total-header
+ * default of common reverse proxies — nginx `large_client_header_buffers`,
+ * Apache `LimitRequestFieldSize`). Tuples beyond the cap are dropped and
+ * a sentinel { truncated:true, omitted_hops:N } is appended.
+ */
+export const FALLBACK_DETAIL_BYTE_CAP = 4096;
+
+/**
+ * Serialises per-hop fallback failure tuples into the X-OLP-Fallback-Detail
+ * header value. Returns null if the input array is empty/missing (header
+ * should not be emitted in that case).
+ *
+ * D40 (issue #7) — see ADR 0004 § Observability headers.
+ *
+ * Cap behaviour:
+ *   - JSON.stringify the tuples; if Buffer.byteLength <= 4096, return as-is.
+ *   - Otherwise, drop tuples from the tail one at a time until the array PLUS
+ *     a trailing { truncated:true, omitted_hops:N } sentinel fits under the cap.
+ *   - If even a single tuple + sentinel cannot fit (extremely long error_message
+ *     beyond engine truncation, e.g. very long provider/model names), return
+ *     just the sentinel { truncated:true, omitted_hops:<all> } — never produce
+ *     a value > 4096 bytes.
+ *
+ * RFC 7230 hygiene: JSON.stringify already escapes raw newlines (\n → \\n),
+ * carriage returns, and other control characters. In addition, we escape all
+ * non-ASCII code points to \uXXXX sequences because Node's HTTP header
+ * validator rejects multi-byte UTF-8 in field values (and RFC 7230 §3.2.6
+ * limits `field-vchar` to ASCII VCHAR / obs-text). Without this step, an
+ * em dash (U+2014) in a synthesised error message — e.g. the CONCURRENCY_LIMIT
+ * message produced in server.mjs `collectAllChunks` — would trigger
+ * `Invalid character in header content` from `res.writeHead`.
+ *
+ * @param {Array<object>|null|undefined} fallbackDetail — from FallbackResult.fallbackDetail
+ * @returns {string|null} — header value, or null to skip emission
+ */
+export function serializeFallbackDetailHeader(fallbackDetail) {
+  if (!Array.isArray(fallbackDetail) || fallbackDetail.length === 0) {
+    return null;
+  }
+  const full = jsonStringifyAscii(fallbackDetail);
+  if (Buffer.byteLength(full, 'utf8') <= FALLBACK_DETAIL_BYTE_CAP) {
+    return full;
+  }
+
+  // Cap exceeded — drop tail tuples until [...kept, sentinel] fits.
+  // Linear scan from the full array down to 0 kept tuples. Worst case O(n^2)
+  // on serialisation length, but n is bounded by chain length (small) so this
+  // is fine in practice.
+  for (let kept = fallbackDetail.length - 1; kept >= 0; kept--) {
+    const omitted = fallbackDetail.length - kept;
+    const sentinel = { truncated: true, omitted_hops: omitted };
+    const candidate = jsonStringifyAscii([...fallbackDetail.slice(0, kept), sentinel]);
+    if (Buffer.byteLength(candidate, 'utf8') <= FALLBACK_DETAIL_BYTE_CAP) {
+      return candidate;
+    }
+  }
+
+  // Even an array containing only the sentinel exceeds the cap — produce the
+  // shortest possible valid sentinel value. This branch should be unreachable
+  // for any realistic chain (the sentinel itself is ~45 bytes for omitted_hops
+  // up to 9999).
+  return jsonStringifyAscii([{ truncated: true, omitted_hops: fallbackDetail.length }]);
+}
+
+/**
+ * JSON.stringify wrapper that escapes every non-ASCII code point as \uXXXX
+ * so the result is safe to embed in an HTTP header value (RFC 7230 §3.2.6
+ * field-vchar). JSON itself accepts both literal Unicode and \uXXXX escapes,
+ * so JSON.parse round-trips correctly.
+ *
+ * Surrogate-pair handling: characters above U+FFFF (emoji etc.) are already
+ * emitted as JS surrogate pairs by the string iterator; each surrogate is
+ * a code unit in range 0xD800–0xDFFF, which our >= 0x80 guard catches.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function jsonStringifyAscii(value) {
+  // The replace pattern is the UTF-8 literal byte range for code points
+  // U+0080..U+FFFF (every non-ASCII BMP character). U+0080 is non-printable,
+  // so the source line can render as the empty character class "[-...]" in
+  // editors that hide it — the range is intentional and load-bearing for
+  // RFC 7230 §3.2.6 compliance.
+  return JSON.stringify(value).replace(/[-￿]/g, (ch) => {
+    return '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0');
+  });
+}
+
+/**
+ * Merges X-OLP-Fallback-Detail into a base header object when the per-hop
+ * failure tuples are non-empty. Returns the base object unchanged otherwise.
+ *
+ * D40 (issue #7).
+ *
+ * @param {Record<string,string>} baseHeaders
+ * @param {Array<object>|null|undefined} fallbackDetail
+ * @returns {Record<string,string>}
+ */
+function withFallbackDetailHeader(baseHeaders, fallbackDetail) {
+  const value = serializeFallbackDetailHeader(fallbackDetail);
+  if (value === null) return baseHeaders;
+  return { ...baseHeaders, 'X-OLP-Fallback-Detail': value };
+}
+
 // ── Route handlers ────────────────────────────────────────────────────────
 
 /**
@@ -894,6 +1003,7 @@ async function handleChatCompletions(req, res) {
     fallbackHops,
     originalError,
     triedProviders,
+    fallbackDetail,  // D40 (issue #7): per-hop failure tuples for X-OLP-Fallback-Detail
   } = fallbackResult;
 
   // ── Chain exhausted or non-trigger error ─────────────────────────────────
@@ -943,18 +1053,23 @@ async function handleChatCompletions(req, res) {
       fallbackHops: fallbackHops ?? 0,
     });
 
-    // Send error with standard OLP headers + optional exhausted header
+    // Send error with standard OLP headers + optional exhausted header +
+    // D40 X-OLP-Fallback-Detail (when any hop attempted to spawn failed).
+    // D40 (issue #7) — ungated v0.1 per maintainer decision; owner-vs-non-owner
+    // gating planned for Phase 2 with lib/keys.mjs.
     const payload = JSON.stringify({
       error: {
         message: originalError?.message ?? 'Provider error',
         type: 'provider_error',
       },
     });
+    const detailHeader = withFallbackDetailHeader({}, fallbackDetail);
     res.writeHead(errStatus, {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(payload),
       ...errorOlpHeaders,
       ...exhaustedHeader,
+      ...detailHeader,
     });
     res.end(payload);
     return;
@@ -974,7 +1089,13 @@ async function handleChatCompletions(req, res) {
   const cacheStatus = bypassCacheForServingHop ? 'bypass'
     : (lastHopWasCached || (preCheckHit && fallbackHops === 0)) ? 'hit'
     : 'miss';
-  const headers = olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus, fallbackHops });
+  // D40 (issue #7): when at least one prior hop failed before this success,
+  // surface X-OLP-Fallback-Detail with the failure trail. Header is omitted
+  // when fallbackDetail is empty (single-hop success).
+  const headers = withFallbackDetailHeader(
+    olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus, fallbackHops }),
+    fallbackDetail,
+  );
 
   if (ir.stream) {
     // Streaming response path: burst replay from buffered chunks.

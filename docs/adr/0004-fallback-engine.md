@@ -7,6 +7,23 @@
 
 ## Amendments
 
+### Amendment 5 — 2026-05-24: `X-OLP-Fallback-Detail` header shipped as ungated v0.1 (D40, issue #7)
+
+- **Finding:** Step 4 of § Decision § Chain advancement (below) promised "per-provider failure detail in a debug header `X-OLP-Fallback-Detail` (JSON, owner-only — gated behind a config flag for non-owner keys)." From D9 through D39 the engine logged per-hop failure events via `fallback_hop_error` / `fallback_hard_trigger` / `fallback_client_error_no_fallback` / `fallback_auth_missing_no_fallback` / `fallback_non_trigger_error` (D28 added the `chain_id` / `trigger_type` / `ir_request_hash` / `next_provider` correlation fields), but the per-hop failure trail was not surfaced on the response. GitHub issue #7 tracked the gap.
+- **Change (D40):**
+  - `lib/fallback/engine.mjs#executeWithFallback` now collects per-hop failure tuples in a new `fallbackDetail` array on the returned `FallbackResult`. Tuple shape reuses D28 log-event field shapes so logs and the header pivot on the same keys:
+    `{ hop, provider, model, code, error_message, trigger_type }`. `code` is the `ProviderError` code, or any string `err.code` (including the engine-synthetic `SOFT_TRIGGER`), or `'UNKNOWN'` for non-`ProviderError` exceptions. `error_message` is truncated to 200 chars (single-character ellipsis `…` appended on truncation). `trigger_type` is the same classification surfaced in the D28 log events.
+  - `server.mjs` emits the new header `X-OLP-Fallback-Detail: <JSON-stringified array>` on any response where `fallbackDetail` is non-empty — i.e., chain-exhausted, non-trigger-error, client-error, AUTH_MISSING, and success-with-prior-failure paths. Header is absent on clean primary success (semantically: no failure trail to report).
+  - 4KB UTF-8 byte cap on the header value: if the serialised array exceeds 4096 bytes, tail tuples are dropped one at a time and a `{ truncated: true, omitted_hops: N }` sentinel is appended such that the total fits under the cap.
+  - Non-ASCII characters in tuple fields (e.g. the em dash in the synthesised `CONCURRENCY_LIMIT` error message) are escaped as `\uXXXX` to satisfy RFC 7230 §3.2.6 `field-vchar` (Node's HTTP header validator rejects multi-byte UTF-8). `JSON.parse` round-trips the escaped form correctly.
+- **Gating — Option A (ungated v0.1):** The original promise specified owner-only gating. Per the maintainer decision recorded in issue #7, v0.1 ships the header **ungated**: the failure detail is surfaced on every response regardless of API key identity. Rationale: OLP v0.1 is single-tenant family-scale (per ALIGNMENT.md § What this project is); no PII risk in error details. **Phase 2 will re-introduce owner-vs-non-owner gating when `lib/keys.mjs` lands** — this is an explicit follow-up tracked in AGENTS.md § Key files to know and in the lib/keys.mjs Phase 2 planning. Until then, the header is informational on every response and operators should not assume per-key visibility differs.
+- **Authority:** § Decision § Chain advancement step 4 (original promise — D40 fulfils it); D18 (5 standard X-OLP-* headers; D40 builds on this convention); D28 (per-hop structured log fields; D40 reuses the field shapes); GitHub issue #7 — closed by this commit.
+- **Tests (test-features.mjs):** New describe block "D40 — X-OLP-Fallback-Detail header (issue #7)" covers: engine-level tuple shape on 2-hop/exhausted, 2-hop/success-with-prior-failure, 1-hop/success (empty array), 1-hop/fail, non-ProviderError-yields-`UNKNOWN`, 500-char-message → 200-char-with-ellipsis, client error → 1 tuple + `client_error` trigger type; serialiser-level empty/null → null, small-array round-trip, >4KB cap with `{truncated:true,omitted_hops:N}` sentinel, RFC 7230 newline/CR escaping, and non-ASCII escaping (em dash regression guard for the D38 `CONCURRENCY_LIMIT` synthesised message); HTTP integration covers clean-1-hop-success (header absent), 2-hop-exhausted (2 tuples on the wire), and 2-hop-success-with-prior-failure (1 tuple on the wire). Test count 452 → 468 (16 new tests).
+- **v1.x re-evaluation triggers:**
+  - When `lib/keys.mjs` lands (Phase 2), re-introduce owner-vs-non-owner gating. Update this amendment + § Observability headers below + AGENTS.md.
+  - If a future debug-header field becomes useful (e.g., `attempts`, `cache_eviction_count`, `last_chunk_index`), add to the tuple schema documented above + bump this amendment + extend the test schema assertions.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (D40 issue #7 implementation; fresh-context opus reviewer to follow per Iron Rule 10).
+
 ### Amendment 4 — 2026-05-24: Add `CONCURRENCY_LIMIT` to v0.1 hard-trigger code taxonomy (D38, issue #1)
 
 - **Finding:** ADR 0002 Amendment 1 (2026-05-23) ratified `hints.maxConcurrent` into the Provider contract as **declarative-only at v0.1** — no runtime enforcement. GitHub issue #1 tracked the gap. D38 lands runtime enforcement (see ADR 0002 Amendment 6 for the implementation details and design rationale). Once a saturation event occurs, the orchestration layer must communicate "this hop is at capacity — advance the chain" to the fallback engine using a code that fits the existing hard-trigger taxonomy in `evaluateHardTriggers`.
@@ -141,7 +158,7 @@ This is non-negotiable for v1.0. Post-first-chunk truncations are surfaced to th
 1. Try A. If A succeeds, return; emit `X-OLP-Fallback-Hops: 0`, `X-OLP-Provider-Used: A`.
 2. If A's failure matches a hard or soft trigger AND no chunks emitted: try B. If B succeeds, return; emit `X-OLP-Fallback-Hops: 1`, `X-OLP-Provider-Used: B`.
 3. If B also fails: try C. Same logic.
-4. If all of A, B, C fail: return **A's original error** (not B's, not C's) with `X-OLP-Fallback-Exhausted: A,B,C` listing the chain order, and per-provider failure detail in a debug header `X-OLP-Fallback-Detail` (JSON, owner-only — gated behind a config flag for non-owner keys).
+4. If all of A, B, C fail: return **A's original error** (not B's, not C's) with `X-OLP-Fallback-Exhausted: A,B,C` listing the chain order, and per-provider failure detail in a debug header `X-OLP-Fallback-Detail` (JSON, ungated at v0.1 per Amendment 5 / D40, issue #7; owner-vs-non-owner gating planned for Phase 2 when `lib/keys.mjs` lands). The header is also emitted on success-with-prior-failure paths (e.g., A fails + B succeeds → response carries the 1-tuple failure trail for A). See § Observability headers below for the tuple schema and cap behaviour.
 
 **Observability headers (per spec §4.7).**
 - `X-OLP-Provider-Used: <provider-name>`
@@ -149,6 +166,12 @@ This is non-negotiable for v1.0. Post-first-chunk truncations are surfaced to th
 - `X-OLP-Fallback-Hops: <integer ≥ 0>`
 - `X-OLP-Cache: hit | miss | bypass`
 - `X-OLP-Latency-Ms: <integer>`
+- `X-OLP-Fallback-Exhausted: <comma-separated provider list>` — emitted only when multiple providers were tried (D18; chain-exhaustion path).
+- `X-OLP-Fallback-Detail: <JSON array>` — **shipped as IMPLEMENTED at v0.1, ungated** per Amendment 5 (D40, issue #7). Emitted on any response where at least one prior hop failed before the chain resolved or exhausted; absent on clean primary success.
+  - **Tuple schema (per failed hop):** `{ hop: <0-indexed integer>, provider: <string>, model: <string>, code: <ProviderError.code or 'UNKNOWN'>, error_message: <string truncated to 200 chars with U+2026 ellipsis on truncation>, trigger_type: 'hard' | 'soft' | 'auth_missing' | 'client_error' | 'non_trigger' }`. Field shapes reuse D28's per-hop log event keys.
+  - **4KB UTF-8 byte cap:** if the JSON-stringified array exceeds 4096 bytes, tail tuples are dropped and a `{ truncated: true, omitted_hops: <count> }` sentinel is appended so the total fits under the cap.
+  - **RFC 7230 hygiene:** all non-ASCII code points are escaped as `\uXXXX` so the header value is pure ASCII (Node's HTTP header validator rejects multi-byte UTF-8). `JSON.parse` still round-trips the escaped form to the original Unicode.
+  - **Phase 2 follow-up:** owner-vs-non-owner gating is planned for when `lib/keys.mjs` lands. Until then, the header is informational on every response. See Amendment 5 for the full rationale and the gating re-introduction trigger.
 
 Each fallback hop emits a structured log event with: timestamp, chain id, hop index, failed provider, trigger type, IR request hash, downstream provider that was tried next.
 

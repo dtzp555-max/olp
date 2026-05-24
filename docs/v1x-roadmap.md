@@ -24,19 +24,22 @@
 - **Trigger to start.** Any of: (a) report of N>1 concurrent identical streaming requests in the wild, (b) v1.x sprint planning kickoff with the maintainer explicitly opening this scope, (c) downstream feature requiring tee-streaming primitive (e.g., browser-side observer attaching to an existing stream).
 - **Estimated effort.** Design ADR ratified (Amendment 8) = 30 min done. Implementation = 200–400 lines + 15-20 tests + fresh-context reviewer pass. ~3-4 hours of subagent runtime with full Iron Rule 10 discipline.
 
-## #2 — Multi-key auth (`lib/keys.mjs`)
+## #2 — Multi-key auth (`lib/keys.mjs`) — **PHASE 2 ACTIVE (no longer deferred)**
 
-- **What.** Per-API-key identity, namespace scoping for the cache, ownership tier (owner vs guest) for header gating, and audit log of which key issued which request.
-- **Why deferred.** Phase 1 ships single-tenant — the cache layer carries `keyId='__anonymous__'` (D5). No real user identity is needed for personal/family use today.
-- **Design ADR (NOT YET RATIFIED).** No design ADR exists yet. v1.x sprint must produce one before implementation.
-- **Tracking.** Not a GitHub issue (no governance event filed for it). Tracked here + in `AGENTS.md § Key files to know` (`lib/keys.mjs` marked 📋 Planned).
-- **Blocks.**
-  - `X-OLP-Fallback-Detail` owner-only gating (D40 / ADR 0004 Amendment 5 — currently ungated).
-  - `/health` per-key visibility (currently anonymous-only).
-- **Code anchors today.**
-  - `lib/cache/store.mjs` per-keyId namespace Map — the data model is already keyed by `keyId`; only the keyId source is hardcoded.
-  - `server.mjs` request handlers — the `keyId='__anonymous__'` constant needs to be replaced by a header/token lookup.
-- **Trigger to start.** First multi-user deployment of OLP (e.g., maintainer + spouse + child accessing the same instance with separate identities).
+- **Status.** Phase 2 active as of 2026-05-25. Design ratified at D43-B. This entry stays for cross-reference but is no longer a v1.x deferral; implementation D-days D44+ execute within Phase 2.
+- **What.** Per-API-key identity, namespace scoping for the cache, ownership tier (owner vs guest) for header gating, and audit log of which key issued which request. Detailed scope in ADR 0007.
+- **Design ADR (ratified).** [`docs/adr/0007-multi-key-auth.md`](./adr/0007-multi-key-auth.md) — Option 2 (filesystem manifest) + opaque token, with explicit forward path to Option 3 hybrid (SQLite-indexed mirror) when Phase 3+ Dashboard / SQL-aggregate quota work justifies. Migratable, manifest-as-SPOT.
+- **Tracking.** Not a GitHub issue. Tracked here + via ADR 0007 acceptance criteria (§ 10) which drive the D44+ test surface.
+- **Resolves.**
+  - `X-OLP-Fallback-Detail` owner-only gating (D40 / ADR 0004 Amendment 5 — currently ungated; Phase 2 re-gates per ADR 0007 § 7).
+  - `/health` per-key visibility (currently anonymous-only — owner / guest / anonymous tiers per ADR 0007 § 7).
+- **Code anchors today (unchanged at ADR ratification; replaced by D44+ implementation).**
+  - `lib/cache/store.mjs:77-79` per-keyId namespace Map — wire is in place.
+  - `lib/cache/store.mjs:287` singleflight composition `${keyId}:${cacheKey}` — wire is in place.
+  - `server.mjs:502, :531` — the two `keyId='__anonymous__'` call sites to replace.
+  - `server.mjs:392` — `/health` handler entry (Phase 2 gate).
+  - `server.mjs:1072, :1101` — `X-OLP-Fallback-Detail` header-write paths (Phase 2 gate).
+- **Trigger (already fired).** Maintainer opened Phase 2 sprint 2026-05-25.
 
 ## #3 — Soft trigger reactivation (ADR 0004 Amendment 2)
 

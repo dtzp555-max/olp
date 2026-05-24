@@ -4,6 +4,17 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D43-B — ADR 0007 multi-key auth design draft (design-only, no code change)
+
+Phase 2 mainline design ADR. Ratifies the storage / token / manifest / atomic-write / owner-gating / bootstrap / Node-baseline decisions ahead of D44+ implementation D-days. Pure design doc — no `.mjs` / no tests / 4 files touched.
+
+- `docs/adr/0007-multi-key-auth.md` (new, ~270 lines): 13 sections covering Context / Decision (Option 2 + opaque key) / Storage layout (`~/.olp/keys/<key-id>/manifest.json` + `~/.olp/logs/audit.ndjson`) / Manifest schema (schema_version, token_hash, owner_tier, providers_enabled) / Token format (`olp_<32-byte base64url>`, SHA-256 hash) / Atomic write & audit append (manifest lifecycle-only atomic via tmpfile+fsync+rename; audit per-request append, warn + 1 retry, no memory buffer at Phase 2) / Owner-vs-guest-vs-anonymous gating (config.json `auth.allow_anonymous` default false, no env auto-detection) / Audit ndjson schema (no PII) / Bootstrap & recovery (minimal keygen command surface + `OLP_OWNER_TOKEN` env override with stable `__env_owner__` keyId) / Acceptance criteria (11 test surfaces for D44+) / Node baseline (Option 1 SQLite port rejection rationale citing `engines >=18` + CI 20/24 vs `node:sqlite` v22.5.0/RC) / Out of scope (Dashboard, quota enforcement, audit query, file locking deferred to Phase 3+) / Future forward (Option 3 hybrid migration trigger + preconditions).
+- `docs/adr/README.md` index: added ADR 0007 row with one-paragraph summary.
+- `docs/v1x-roadmap.md` #2: marked **PHASE 2 ACTIVE (no longer deferred)**; "Design ADR (NOT YET RATIFIED)" → "Design ADR (ratified) → ADR 0007"; trigger updated to "already fired 2026-05-25"; code anchors pinned to exact line numbers (cache/store.mjs:77-79/:287, server.mjs:502/:531/:392/:1072/:1101).
+- `CHANGELOG.md` Unreleased: this entry.
+- **Test count:** 468 → 468 (design-only, no test change).
+- **Authority:** Phase 2 kickoff handoff (`~/.cc-rules/memory/handoffs/2026-05-25-phase-2-kickoff.md` in cc-rules `d9da966`); OLP v0.1 spec § 4.5 (planning authority for `~/.olp/` layout); OCP `keys.mjs` (prior-art for opaque-key + per-key isolation model); Node `node:sqlite` docs (https://nodejs.org/api/sqlite.html — Option 1 rejection rationale per ADR 0007 § 11); CC 开发铁律 v1.6 § 10 — fresh-context opus reviewer required for design ADR per Iron Rule 10.
+
 ### D43-A — Phase 2 doc alignment (no code change)
 
 Phase 1 was closed at v0.1.1; this commit aligns documentation surfaces to the Phase 2 reality before D43-B (ADR 0007 draft) lands. Pure doc cleanup; no `.mjs` or test changes.

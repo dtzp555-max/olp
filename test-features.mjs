@@ -5038,6 +5038,383 @@ describe('Streaming cache-miss real-time (Suite 15)', () => {
 
 });
 
+// ── Suite 17: D18 — /v1/models population + X-OLP-* headers on errors ────────
+//
+// Finding 10: /v1/models returned empty data regardless of loaded providers.
+// Finding 11: chain-exhausted (and other) error responses omitted the standard
+//             X-OLP-* observability headers required by ADR 0004 § Observability.
+//
+// Tests:
+//   17a: /v1/models with anthropic enabled → 200 + 3 entries, owned_by='anthropic'
+//   17b: /v1/models with no providers enabled → 200 + data:[]
+//   17c: /v1/models entries contain only canonical IDs (no alias like 'sonnet')
+//   17d: /v1/models entries match OpenAI spec shape (id/object/created/owned_by only)
+//   17e: chain-exhausted error response carries all 5 X-OLP-* headers
+//   17f: chain-exhausted error X-OLP-Fallback-Hops reflects hops attempted
+//   17g: pre-routing 400 (invalid JSON body) carries X-OLP-Latency-Ms header
+//
+// Authority: OpenAI /v1/models spec (https://platform.openai.com/docs/api-reference/models);
+//            ADR 0004 § Observability headers (5-header set required on every response)
+
+import {
+  createOlpServer as createServer17,
+  __setProvidersEnabled as setProviders17,
+  __resetProvidersEnabled as resetProviders17,
+  __setFallbackConfig as setFallbackConfig17,
+  __resetFallbackConfig as resetFallbackConfig17,
+  __clearCache as clearCache17,
+} from './server.mjs';
+
+describe('/v1/models population + X-OLP-* error headers (Suite 17)', () => {
+
+  // ── 17a: /v1/models with anthropic enabled → 3 model entries ─────────────
+
+  it('17a: /v1/models with anthropic enabled → 200 + 3 entries with owned_by="anthropic"', async () => {
+    setProviders17({ anthropic: true });
+    const s = createServer17();
+    const p = 25456 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.equal(body.object, 'list');
+      assert.ok(Array.isArray(body.data), 'data must be an array');
+      // Anthropic has 3 canonical models in models-registry.json
+      assert.equal(body.data.length, 3, `Expected 3 anthropic models, got ${body.data.length}`);
+      for (const entry of body.data) {
+        assert.equal(entry.owned_by, 'anthropic', `Expected owned_by='anthropic', got '${entry.owned_by}'`);
+      }
+    } finally {
+      resetProviders17();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  // ── 17b: /v1/models with no providers enabled → data:[] ──────────────────
+
+  it('17b: /v1/models with no providers enabled → 200 + data:[]', async () => {
+    setProviders17({});
+    const s = createServer17();
+    const p = 25460 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.equal(body.object, 'list');
+      assert.deepEqual(body.data, [], 'data must be empty when no providers are enabled');
+    } finally {
+      resetProviders17();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  // ── 17c: /v1/models contains only canonical IDs, no aliases ───────────────
+
+  it('17c: /v1/models returns canonical IDs only (no aliases like "sonnet")', async () => {
+    setProviders17({ anthropic: true });
+    const s = createServer17();
+    const p = 25464 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      const ids = body.data.map(e => e.id);
+      // Aliases that must NOT appear
+      const knownAliases = ['sonnet', 'opus', 'haiku', 'claude', 'codex', 'devstral'];
+      for (const alias of knownAliases) {
+        assert.ok(!ids.includes(alias), `Alias '${alias}' must not appear in /v1/models data`);
+      }
+      // The canonical ID must appear
+      assert.ok(ids.includes('claude-sonnet-4-6'), 'claude-sonnet-4-6 must appear in /v1/models data');
+    } finally {
+      resetProviders17();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  // ── 17d: /v1/models entries match OpenAI spec shape ───────────────────────
+
+  it('17d: /v1/models entries match OpenAI spec shape (id/object/created/owned_by)', async () => {
+    setProviders17({ anthropic: true });
+    const s = createServer17();
+    const p = 25468 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port: p, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.ok(body.data.length > 0, 'Expected at least one model entry');
+      for (const entry of body.data) {
+        // Must have spec-defined fields
+        assert.ok(typeof entry.id === 'string' && entry.id.length > 0, 'id must be a non-empty string');
+        assert.equal(entry.object, 'model', "object must be 'model'");
+        assert.ok(typeof entry.created === 'number' && entry.created > 0, 'created must be a positive number (Unix epoch seconds)');
+        assert.ok(typeof entry.owned_by === 'string' && entry.owned_by.length > 0, 'owned_by must be a non-empty string');
+        // Must NOT have invented fields beyond the spec
+        const allowedKeys = new Set(['id', 'object', 'created', 'owned_by']);
+        for (const key of Object.keys(entry)) {
+          assert.ok(allowedKeys.has(key), `Unexpected field '${key}' in /v1/models entry (not in OpenAI spec)`);
+        }
+      }
+    } finally {
+      resetProviders17();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  // ── 17e: chain-exhausted error response carries all 5 X-OLP-* headers ─────
+
+  it('17e: chain-exhausted 502 response carries all 5 standard X-OLP-* observability headers', async () => {
+    // Set up a 2-hop chain where both providers fail (SPAWN_FAILED via exit code 1).
+    // Both providers must be enabled for the chain to be built.
+    setProviders17({ anthropic: true, openai: true });
+    setFallbackConfig17({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+      providersEnabled: { anthropic: true, openai: true },
+    });
+    clearCache17();
+
+    // Fake auth for both providers
+    const savedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-17e-anthropic';
+
+    const { writeFileSync: wfs17e, unlinkSync: uls17e } = await import('node:fs');
+    const { tmpdir: td17e } = await import('node:os');
+    const { join: pj17e } = await import('node:path');
+    const tmpAuth17e = pj17e(td17e(), `olp-test-17e-codex-${Date.now()}.json`);
+    wfs17e(tmpAuth17e, JSON.stringify({ accessToken: 'fake-codex-17e' }), 'utf8');
+    const savedCodexPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = tmpAuth17e;
+
+    // Both providers: exit code 1 → SPAWN_FAILED hard trigger
+    function makeFailSpawn17() {
+      return function (_bin, _args, _opts) {
+        const proc = new EventEmitter();
+        proc.stdout = new EventEmitter();
+        proc.stderr = new EventEmitter();
+        proc.stdin = {
+          write: () => {},
+          end: () => {
+            setImmediate(() => {
+              proc.stdout.emit('end');
+              proc.stderr.emit('end');
+              proc.emit('close', 1, null);
+            });
+          },
+        };
+        proc.killed = false;
+        proc.kill = () => {};
+        return proc;
+      };
+    }
+
+    __setSpawnImpl(makeFailSpawn17());
+    codexSetSpawnImpl(makeFailSpawn17());
+
+    const s = createServer17();
+    const p = 25472 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+
+    try {
+      const r = await fetch({
+        port: p,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.ok(r.status >= 400 && r.status < 600, `Expected error status, got ${r.status}`);
+      // All 5 standard X-OLP-* headers must be present per ADR 0004 § Observability
+      assert.ok(r.headers['x-olp-provider-used'] !== undefined, 'X-OLP-Provider-Used must be present on error response');
+      assert.ok(r.headers['x-olp-model-used'] !== undefined, 'X-OLP-Model-Used must be present on error response');
+      assert.ok(r.headers['x-olp-fallback-hops'] !== undefined, 'X-OLP-Fallback-Hops must be present on error response');
+      assert.ok(r.headers['x-olp-cache'] !== undefined, 'X-OLP-Cache must be present on error response');
+      assert.ok(r.headers['x-olp-latency-ms'] !== undefined, 'X-OLP-Latency-Ms must be present on error response');
+    } finally {
+      resetProviders17();
+      resetFallbackConfig17();
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+      if (savedToken !== undefined) {
+        process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken;
+      } else {
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      }
+      if (savedCodexPath !== undefined) {
+        process.env.OPENAI_CODEX_AUTH_PATH = savedCodexPath;
+      } else {
+        delete process.env.OPENAI_CODEX_AUTH_PATH;
+      }
+      try { uls17e(tmpAuth17e); } catch { /* ignore */ }
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  // ── 17f: chain-exhausted X-OLP-Fallback-Hops reflects hops attempted ─────
+
+  it('17f: chain-exhausted error X-OLP-Fallback-Hops reflects hops attempted (2-hop → "2")', async () => {
+    // 2-hop chain where both fail → fallbackHops should reflect 2 hops tried
+    setProviders17({ anthropic: true, openai: true });
+    setFallbackConfig17({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+      providersEnabled: { anthropic: true, openai: true },
+    });
+    clearCache17();
+
+    const savedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-17f-anthropic';
+
+    const { writeFileSync: wfs17f, unlinkSync: uls17f } = await import('node:fs');
+    const { tmpdir: td17f } = await import('node:os');
+    const { join: pj17f } = await import('node:path');
+    const tmpAuth17f = pj17f(td17f(), `olp-test-17f-codex-${Date.now()}.json`);
+    wfs17f(tmpAuth17f, JSON.stringify({ accessToken: 'fake-codex-17f' }), 'utf8');
+    const savedCodexPath17f = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = tmpAuth17f;
+
+    function makeFailSpawn17f() {
+      return function (_bin, _args, _opts) {
+        const proc = new EventEmitter();
+        proc.stdout = new EventEmitter();
+        proc.stderr = new EventEmitter();
+        proc.stdin = {
+          write: () => {},
+          end: () => {
+            setImmediate(() => {
+              proc.stdout.emit('end');
+              proc.stderr.emit('end');
+              proc.emit('close', 1, null);
+            });
+          },
+        };
+        proc.killed = false;
+        proc.kill = () => {};
+        return proc;
+      };
+    }
+
+    __setSpawnImpl(makeFailSpawn17f());
+    codexSetSpawnImpl(makeFailSpawn17f());
+
+    const s = createServer17();
+    const p = 25876 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+
+    try {
+      const r = await fetch({
+        port: p,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.ok(r.status >= 400, `Expected error status, got ${r.status}`);
+      // fallbackHops is set to chain.length (2) when chain exhausted per engine.mjs
+      assert.equal(r.headers['x-olp-fallback-hops'], '2',
+        `Expected X-OLP-Fallback-Hops: 2 (both hops tried), got: ${r.headers['x-olp-fallback-hops']}`);
+    } finally {
+      resetProviders17();
+      resetFallbackConfig17();
+      __resetSpawnImpl();
+      codexResetSpawnImpl();
+      if (savedToken !== undefined) {
+        process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken;
+      } else {
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      }
+      if (savedCodexPath17f !== undefined) {
+        process.env.OPENAI_CODEX_AUTH_PATH = savedCodexPath17f;
+      } else {
+        delete process.env.OPENAI_CODEX_AUTH_PATH;
+      }
+      try { uls17f(tmpAuth17f); } catch { /* ignore */ }
+      await new Promise(r => s.close(r));
+    }
+  });
+
+  // ── 17g: pre-routing 400 (invalid JSON) carries X-OLP-Latency-Ms ─────────
+
+  it('17g: pre-routing 400 (invalid JSON body) carries X-OLP-Latency-Ms', async () => {
+    // Pre-routing errors inside handleChatCompletions (invalid JSON body, wrong
+    // Content-Type, IR parse failure) have access to startMs and emit
+    // X-OLP-Latency-Ms to allow latency instrumentation even when there is no
+    // provider context. The other 4 X-OLP-* headers are omitted (no provider was
+    // attempted). This is consistent with ADR 0004 § Observability which requires
+    // the full set for chain-exhausted paths; partial emission on pre-route errors
+    // is the minimum viable observability for those paths.
+    setProviders17({});
+    const s = createServer17();
+    const p = 25880 + Math.floor(Math.random() * 400);
+    await new Promise((resolve, reject) => {
+      s.listen(p, '127.0.0.1', resolve);
+      s.once('error', reject);
+    });
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const req = httpRequest({
+          hostname: '127.0.0.1',
+          port: p,
+          method: 'POST',
+          path: '/v1/chat/completions',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': '5' },
+        }, res => {
+          let data = '';
+          res.on('data', c => { data += c; });
+          res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+        });
+        req.on('error', reject);
+        req.write('{bad}');
+        req.end();
+      });
+      assert.equal(result.status, 400, `Expected 400 for invalid JSON body`);
+      // X-OLP-Latency-Ms must be present (D18 pre-routing observability)
+      assert.ok(result.headers['x-olp-latency-ms'] !== undefined,
+        'Pre-routing 400 error must carry X-OLP-Latency-Ms for latency instrumentation');
+      const latencyMs = parseInt(result.headers['x-olp-latency-ms'], 10);
+      assert.ok(!isNaN(latencyMs) && latencyMs >= 0,
+        `X-OLP-Latency-Ms must be a non-negative integer, got: ${result.headers['x-olp-latency-ms']}`);
+      // The other 4 headers are NOT present (no provider context)
+      assert.ok(result.headers['x-olp-provider-used'] === undefined,
+        'Pre-routing 400 must NOT carry X-OLP-Provider-Used (no provider context)');
+    } finally {
+      resetProviders17();
+      await new Promise(r => s.close(r));
+    }
+  });
+
+});
+
 // ── Suite 16: Spawn timeout (P1.3) ───────────────────────────────────────────
 //
 // Tests that:

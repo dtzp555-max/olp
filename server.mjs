@@ -190,9 +190,10 @@ function sendJSON(res, status, body, extraHeaders = {}) {
  * @param {number} status
  * @param {string} message
  * @param {string} type
+ * @param {Record<string,string>} [extraHeaders] — optional extra headers (e.g. X-OLP-Latency-Ms)
  */
-function sendError(res, status, message, type) {
-  sendJSON(res, status, { error: { message, type } });
+function sendError(res, status, message, type, extraHeaders = {}) {
+  sendJSON(res, status, { error: { message, type } }, extraHeaders);
 }
 
 // ── OLP response headers ──────────────────────────────────────────────────
@@ -241,11 +242,31 @@ function handleHealth(req, res) {
 
 /**
  * GET /v1/models
- * Returns an empty data array at D3.
- * Will be populated from models-registry.json + loaded providers in Phase 1 Day 2.
+ * Returns the list of models served by all currently loaded (enabled) providers.
+ * Per ADR 0002 § "Loading model" + OpenAI spec /v1/models:
+ *   Each entry: { id, object: 'model', created, owned_by }
+ *   - id:        canonical model ID from the provider's models[] array
+ *   - object:    literal 'model' (OpenAI spec)
+ *   - created:   Unix epoch seconds (stable per request; computed once from Date.now())
+ *   - owned_by:  provider.name (e.g. 'anthropic', 'openai', 'mistral')
+ * Only canonical IDs are emitted (no aliases — per D17 SPOT decision).
+ * Order: insertion order of loadedProviders, then insertion order of each provider's models[].
+ * Empty case: if no providers are enabled, data: [] is returned naturally.
  */
 function handleModels(req, res) {
-  sendJSON(res, 200, { object: 'list', data: [] });
+  const createdTs = Math.floor(Date.now() / 1000);
+  const data = [];
+  for (const [providerName, provider] of loadedProviders) {
+    for (const modelId of provider.models) {
+      data.push({
+        id: modelId,
+        object: 'model',
+        created: createdTs,
+        owned_by: providerName,
+      });
+    }
+  }
+  sendJSON(res, 200, { object: 'list', data });
 }
 
 /**
@@ -267,14 +288,16 @@ async function handleChatCompletions(req, res) {
   // Require JSON content-type
   const ct = req.headers['content-type'] ?? '';
   if (!ct.includes('application/json')) {
-    return sendError(res, 415, 'Content-Type must be application/json', 'invalid_request_error');
+    return sendError(res, 415, 'Content-Type must be application/json', 'invalid_request_error',
+      { 'X-OLP-Latency-Ms': String(Date.now() - startMs) });
   }
 
   let body;
   try {
     body = await readJSON(req);
   } catch (e) {
-    return sendError(res, e.statusCode ?? 400, e.message, 'invalid_request_error');
+    return sendError(res, e.statusCode ?? 400, e.message, 'invalid_request_error',
+      { 'X-OLP-Latency-Ms': String(Date.now() - startMs) });
   }
 
   // Translate OpenAI → IR (ADR 0003)
@@ -283,7 +306,8 @@ async function handleChatCompletions(req, res) {
     ir = openAIToIR(body);
   } catch (e) {
     if (e instanceof BadRequestError) {
-      return sendError(res, 400, e.message, 'invalid_request_error');
+      return sendError(res, 400, e.message, 'invalid_request_error',
+        { 'X-OLP-Latency-Ms': String(Date.now() - startMs) });
     }
     throw e;
   }
@@ -626,7 +650,27 @@ async function handleChatCompletions(req, res) {
       }
     }
 
-    // Send error with exhausted header
+    // Per ADR 0004 § Observability headers: all responses (including errors) carry
+    // the standard 5-header set. On the exhausted/error path the engine returns
+    // values per ADR 0004 step 4 ("preserve A's identity — return the FIRST hop's
+    // provider/model and original error to the user"):
+    //   - providerUsed: chain[0].provider on chain-exhausted (the primary that
+    //                   first failed); set to 'none' only if engine somehow returned null
+    //   - modelUsed:    chain[0].model on chain-exhausted, or the original request
+    //                   model if engine state is unknown
+    //   - cacheStatus:  'miss' — all hops were attempted (bypass is per-hop, not relevant
+    //                   when the whole chain exhausted)
+    //   - fallbackHops: number of hops actually attempted before exhaustion
+    // X-OLP-Fallback-Exhausted is preserved as an additional flag on top of these.
+    const errorOlpHeaders = olpHeaders({
+      providerUsed: providerUsed ?? 'none',
+      modelUsed: modelUsed ?? ir.model,
+      startMs,
+      cacheStatus: 'miss',
+      fallbackHops: fallbackHops ?? 0,
+    });
+
+    // Send error with standard OLP headers + optional exhausted header
     const payload = JSON.stringify({
       error: {
         message: originalError?.message ?? 'Provider error',
@@ -636,6 +680,7 @@ async function handleChatCompletions(req, res) {
     res.writeHead(errStatus, {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(payload),
+      ...errorOlpHeaders,
       ...exhaustedHeader,
     });
     res.end(payload);

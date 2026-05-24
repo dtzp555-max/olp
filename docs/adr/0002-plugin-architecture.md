@@ -5,6 +5,15 @@
 - **Authors:** project maintainer (with AI drafting assistance)
 - **Related:** OLP v0.1 spec §4.2; ADR 0001 (project founding); ADR 0003 (IR design); ADR 0006 (provider inclusion framework)
 
+## Amendments
+
+### Amendment 1 — 2026-05-23: Add `maxSpawnTimeMs` to Provider contract hints (retroactive sync)
+
+- **Finding:** Cold-audit Finding 4 (P2 governance violation) — commit `2cfd0b1` (D10) added `maxSpawnTimeMs` to all three provider plugins (`anthropic.mjs`, `codex.mjs`, `mistral.mjs`) and the fallback engine's spawn-timeout enforcement loop, but the Provider contract documentation in this ADR was not updated in the same merge.
+- **Code already landed:** The corresponding implementation is live in commit `2cfd0b1` (D10). This amendment is a retroactive contract sync to restore documentation–implementation alignment per ALIGNMENT.md Rule 1 (Cite First) and `CLAUDE.md` § "Hard requirements for plugin / server.mjs / IR changes" item 1 (Authority citation) — both of which require contract additions to be authority-cited at landing. ALIGNMENT.md Rule 2(c)'s literal wording covers IR fields; its spirit extends to Provider-contract additions.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (Diff Review vs Cold Audit mode). The diff-review pass that approved D10 missed this omission; the subsequent cold-audit run on 2026-05-23 caught it as Finding 4. This amendment is the required remediation.
+- **Authority:** ADR 0004 § Trigger taxonomy — Hard triggers bullet 4: "Provider CLI spawn timeout (configurable per-provider via `hints.maxSpawnTimeMs`)."
+
 ## Context
 
 OLP declares a curated set of candidate providers — three anticipated Tier D (Anthropic, OpenAI Codex, Mistral Vibe), two anticipated Tier C (xAI Grok, Moonshot Kimi), and three anticipated Tier B (MiniMax, Zhipu GLM, Alibaba Qwen). Per ALIGNMENT.md § Provider Inventory, all 8 ship as **Candidate** at v0.1 founding; transition to **Enabled** requires authority pin filled + plugin landed + Phase audit passed. Each provider has its own CLI binary, its own auth artifact location, its own request shape, its own response shape, its own quota-reporting endpoint (or none), and its own rate-limit posture. The maintainer's strong prior is that this set grows over the project's lifetime — provider economics will continue to shift, and "the right five providers" in 2027 will not be identical to today's five.
@@ -54,7 +63,11 @@ Every provider plugin exports an object conforming to:
 - `estimateCost: (request) => { inputTokens, outputTokensEstimate, currency, usd }` — best-effort, may return null
 - `quotaStatus: async (authContext) => { available, percentUsed, resetsAt, pool }` — best-effort, null if unretrievable
 - `healthCheck: async () => { ok, latencyMs, error? }` — startup and `/health` endpoint use this
-- `hints: { requiresTTY, concurrentSpawnSafe, maxConcurrent }` — fingerprint and concurrency hints
+- `hints: { requiresTTY, concurrentSpawnSafe, maxConcurrent, maxSpawnTimeMs }` — fingerprint, concurrency, and timeout hints:
+  - `requiresTTY` — boolean; whether the provider CLI requires a TTY to produce non-interactive output (e.g., some CLIs suppress JSON output unless forced with a flag or a TTY is present).
+  - `concurrentSpawnSafe` — boolean; whether the provider CLI is safe to spawn concurrently under the same auth context without rate-limit or session collisions.
+  - `maxConcurrent` — integer; maximum simultaneous spawn count OLP will allow for this provider. **Declarative hint only at v0.1**: the value is type-validated at startup (`lib/providers/base.mjs`) but no runtime enforcement (semaphore / in-flight counter / spawn queue) is wired in `server.mjs` yet. Tracking issue to be filed for a follow-up that lands the runtime guard.
+  - `maxSpawnTimeMs` — optional integer, milliseconds; maximum wall-clock time OLP allows for a single provider spawn before treating it as a hard fallback trigger. Defaults to `600000` (10 minutes) if absent. Used by the fallback engine's spawn-timeout enforcement loop; see ADR 0004 § Trigger taxonomy — Hard triggers bullet 4.
 
 **Loading model.** `lib/providers/index.mjs` is a hand-maintained static enumeration. There is no filesystem scan, no `require.context`, no dynamic discovery. Adding a provider requires:
 1. Write `lib/providers/<name>.mjs` conforming to the contract.

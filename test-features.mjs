@@ -4955,6 +4955,319 @@ describe('Fallback engine — HTTP integration (D9)', () => {
 
 });
 
+// ── Suite 13g: D28 round-3 F2 — structured log observability fields ─────────
+//
+// Tests that all executeWithFallback logEvent calls carry the 4 new fields:
+//   chain_id, ir_request_hash, trigger_type, next_provider
+//
+// Also tests computeIRRequestHash (stability, provider-agnosticism, per-field sensitivity).
+//
+// Authority: ADR 0004 § Observability headers
+
+import { computeIRRequestHash } from './lib/cache/keys.mjs';
+
+describe('Fallback engine — D28 observability fields (chain_id / ir_request_hash / trigger_type / next_provider)', () => {
+
+  // ── Helper: capture all logEvent calls ────────────────────────────────────
+
+  function makeLogCapture() {
+    const events = [];
+    return {
+      logEvent: (level, event, data) => events.push({ level, event, data }),
+      events,
+    };
+  }
+
+  // ── chain_id: present + 16-char hex + consistent across all hops ──────────
+
+  it('chain_id is present in all events and is 16-char hex', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    assert.ok(events.length >= 2, 'Expected at least 2 log events');
+    for (const e of events) {
+      assert.ok(typeof e.data.chain_id === 'string', `chain_id must be string, event: ${e.event}`);
+      assert.match(e.data.chain_id, /^[0-9a-f]{16}$/, `chain_id must be 16-char hex, event: ${e.event}`);
+    }
+  });
+
+  it('chain_id is consistent across all hops from one executeWithFallback call', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const chain = [
+      { provider: 'a', model: 'model-a' },
+      { provider: 'b', model: 'model-b' },
+      { provider: 'c', model: 'model-c' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'a') throw err;
+      if (provider === 'b') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    assert.ok(events.length >= 3, 'Expected at least 3 log events');
+    const ids = new Set(events.map(e => e.data.chain_id));
+    assert.equal(ids.size, 1, `All events in one call must share the same chain_id, got: ${[...ids]}`);
+  });
+
+  it('chain_id differs between separate executeWithFallback calls', async () => {
+    const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
+    const hopFn = async () => [{ type: 'stop', finish_reason: 'stop' }];
+    const { logEvent: log1, events: events1 } = makeLogCapture();
+    const { logEvent: log2, events: events2 } = makeLogCapture();
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent: log1 });
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent: log2 });
+    assert.ok(events1.length >= 1);
+    assert.ok(events2.length >= 1);
+    // With overwhelming probability two random 8-byte values are different
+    assert.notEqual(events1[0].data.chain_id, events2[0].data.chain_id,
+      'Separate calls must have different chain_ids');
+  });
+
+  // ── ir_request_hash: provider-agnostic + consistent across hops ───────────
+
+  it('ir_request_hash is the same across all hops within one chain', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    await executeWithFallback(chain, makeIR({ model: 'some-model' }), hopFn, { logEvent });
+    const hashes = new Set(events.map(e => e.data.ir_request_hash));
+    assert.equal(hashes.size, 1, `All hops must share the same ir_request_hash, got: ${[...hashes]}`);
+  });
+
+  it('ir_request_hash does not change when provider or model changes but content is same', async () => {
+    const ir = makeIR({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'Hello' }] });
+    const hash1 = computeIRRequestHash(ir);
+    // Same IR, different model field (computeIRRequestHash is provider-agnostic)
+    const ir2 = makeIR({ model: 'gpt-5.5', messages: [{ role: 'user', content: 'Hello' }] });
+    const hash2 = computeIRRequestHash(ir2);
+    // model is NOT in the computeIRRequestHash subset, so hashes must be equal
+    assert.equal(hash1, hash2, 'ir_request_hash must be provider/model-agnostic');
+  });
+
+  // ── trigger_type: classification per error type ───────────────────────────
+
+  it('trigger_type is "hard" for QUOTA_EXHAUSTED (fallback_hard_trigger event)', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = new ProviderError('Quota exhausted', 'QUOTA_EXHAUSTED');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    const hardEvent = events.find(e => e.event === 'fallback_hard_trigger');
+    assert.ok(hardEvent, 'Expected fallback_hard_trigger event');
+    assert.equal(hardEvent.data.trigger_type, 'hard');
+  });
+
+  it('trigger_type is "auth_missing" for AUTH_MISSING (fallback_auth_missing_no_fallback event)', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = new ProviderError('Auth missing', 'AUTH_MISSING');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    const authEvent = events.find(e => e.event === 'fallback_auth_missing_no_fallback');
+    assert.ok(authEvent, 'Expected fallback_auth_missing_no_fallback event');
+    assert.equal(authEvent.data.trigger_type, 'auth_missing');
+  });
+
+  it('trigger_type is "client_error" for HTTP 400 (fallback_client_error_no_fallback event)', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = Object.assign(new Error('Bad request'), { statusCode: 400 });
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    const clientEvent = events.find(e => e.event === 'fallback_client_error_no_fallback');
+    assert.ok(clientEvent, 'Expected fallback_client_error_no_fallback event');
+    assert.equal(clientEvent.data.trigger_type, 'client_error');
+  });
+
+  it('trigger_type is "non_trigger" for generic error (fallback_non_trigger_error event)', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = new Error('Unexpected generic error');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    const nonTriggerEvent = events.find(e => e.event === 'fallback_non_trigger_error');
+    assert.ok(nonTriggerEvent, 'Expected fallback_non_trigger_error event');
+    assert.equal(nonTriggerEvent.data.trigger_type, 'non_trigger');
+  });
+
+  it('trigger_type is null on success (fallback_hop_success event)', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
+    const hopFn = async () => [{ type: 'stop', finish_reason: 'stop' }];
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    const successEvent = events.find(e => e.event === 'fallback_hop_success');
+    assert.ok(successEvent, 'Expected fallback_hop_success event');
+    assert.equal(successEvent.data.trigger_type, null);
+  });
+
+  // ── next_provider: lookahead routing ──────────────────────────────────────
+
+  it('next_provider is chain[i+1].provider when chain advances on hard trigger', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    const hardEvent = events.find(e => e.event === 'fallback_hard_trigger');
+    assert.ok(hardEvent, 'Expected fallback_hard_trigger event');
+    assert.equal(hardEvent.data.next_provider, 'openai', 'next_provider must be the next chain hop');
+  });
+
+  it('next_provider is null on the last hop (chain exhausted)', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+    ];
+    const hopFn = async () => { throw err; };
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    const exhaustedEvent = events.find(e => e.event === 'fallback_chain_exhausted');
+    assert.ok(exhaustedEvent, 'Expected fallback_chain_exhausted event');
+    assert.equal(exhaustedEvent.data.next_provider, null, 'next_provider must be null when chain is exhausted');
+  });
+
+  it('next_provider is null on client error stop (no advancement)', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const err = Object.assign(new Error('Bad request'), { statusCode: 422 });
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async (provider) => {
+      if (provider === 'anthropic') throw err;
+      return [{ type: 'stop', finish_reason: 'stop' }];
+    };
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    const clientEvent = events.find(e => e.event === 'fallback_client_error_no_fallback');
+    assert.ok(clientEvent, 'Expected fallback_client_error_no_fallback event');
+    assert.equal(clientEvent.data.next_provider, null, 'next_provider must be null when not advancing');
+  });
+
+  it('next_provider is null on success (no advancement needed)', async () => {
+    const { logEvent, events } = makeLogCapture();
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' },
+    ];
+    const hopFn = async () => [{ type: 'stop', finish_reason: 'stop' }];
+    await executeWithFallback(chain, makeIR({ model: 'test-model' }), hopFn, { logEvent });
+    const successEvent = events.find(e => e.event === 'fallback_hop_success');
+    assert.ok(successEvent, 'Expected fallback_hop_success event');
+    assert.equal(successEvent.data.next_provider, null, 'next_provider must be null on success');
+  });
+
+  // ── computeIRRequestHash: stability + per-field sensitivity ───────────────
+
+  it('computeIRRequestHash: identical IR inputs → identical hash', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'Hello' }], model: 'model-a' });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'Hello' }], model: 'model-a' });
+    assert.equal(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+  it('computeIRRequestHash: returns 16-char hex string', () => {
+    const ir = makeIR({ messages: [{ role: 'user', content: 'Hello' }] });
+    const hash = computeIRRequestHash(ir);
+    assert.equal(typeof hash, 'string');
+    assert.equal(hash.length, 16);
+    assert.match(hash, /^[0-9a-f]{16}$/);
+  });
+
+  it('computeIRRequestHash: changes when messages content changes', () => {
+    const ir1 = makeIR({ messages: [{ role: 'user', content: 'Hello' }] });
+    const ir2 = makeIR({ messages: [{ role: 'user', content: 'Goodbye' }] });
+    assert.notEqual(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+  it('computeIRRequestHash: changes when temperature changes', () => {
+    const ir1 = makeIR({ temperature: 0.5 });
+    const ir2 = makeIR({ temperature: 1.0 });
+    assert.notEqual(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+  it('computeIRRequestHash: changes when max_tokens changes', () => {
+    const ir1 = makeIR({ max_tokens: 100 });
+    const ir2 = makeIR({ max_tokens: 200 });
+    assert.notEqual(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+  it('computeIRRequestHash: changes when top_p changes', () => {
+    const ir1 = makeIR({ top_p: 0.9 });
+    const ir2 = makeIR({ top_p: 0.5 });
+    assert.notEqual(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+  it('computeIRRequestHash: changes when stop changes', () => {
+    const ir1 = makeIR({ stop: ['END'] });
+    const ir2 = makeIR({ stop: ['STOP'] });
+    assert.notEqual(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+  it('computeIRRequestHash: changes when tool_choice changes', () => {
+    const ir1 = makeIR({ tool_choice: 'auto' });
+    const ir2 = makeIR({ tool_choice: 'none' });
+    assert.notEqual(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+  it('computeIRRequestHash: changes when response_format changes', () => {
+    const ir1 = makeIR({ response_format: { type: 'text' } });
+    const ir2 = makeIR({ response_format: { type: 'json_object' } });
+    assert.notEqual(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+  it('computeIRRequestHash: changes when tools changes', () => {
+    const ir1 = makeIR({ tools: [{ type: 'function', function: { name: 'foo' } }] });
+    const ir2 = makeIR({ tools: [{ type: 'function', function: { name: 'bar' } }] });
+    assert.notEqual(computeIRRequestHash(ir1), computeIRRequestHash(ir2));
+  });
+
+});
+
 // ── Suite 14: providers.enabled config wiring ──────────────────────────────
 //
 // Tests that:

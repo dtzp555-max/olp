@@ -65,7 +65,7 @@ for await (const irChunk of irResponseStream) {
 }
 ```
 
-**Lossy-translation documentation requirement.** When a provider plugin's `irToNative` or `nativeToIR` cannot losslessly carry an IR field (e.g., Mistral Vibe does not support `tool_choice: "required"`), the lossy edge is documented in the provider plugin's header comment AND in `docs/provider-caveats.md`. The caveats document is referenced from `/v1/models` response metadata so clients can see provider-specific limits without reading source.
+**Lossy-translation documentation requirement.** When a provider plugin's `irToNative` or `nativeToIR` cannot losslessly carry an IR field (e.g., Mistral Vibe does not support `tool_choice: "required"`), the lossy edge is documented in the provider plugin's header comment AND in `docs/provider-caveats.md` (📋 planned — not yet authored; until it exists, lossy translations are recorded only in the provider plugin header comments). The caveats document is referenced from `/v1/models` response metadata so clients can see provider-specific limits without reading source.
 
 **IR is versioned.** This ADR ratifies IR v1.0. Future additions (e.g., a `reasoning_effort` field if reasoning-model behavior diverges enough across providers to warrant explicit modeling) require an amendment ADR. Removals are breaking changes and require a major-version bump of OLP.
 
@@ -76,7 +76,7 @@ for await (const irChunk of irResponseStream) {
 **Positive**
 - Adding a provider is N translation functions (one IR→native, one native→IR), not 2N (one openai→native, one native→openai for every provider). The maintenance burden of "OpenAI shipped a new field" is one entry-adapter change, not one change per provider.
 - The fallback engine (ADR 0004) replays the same IR object across providers in a chain. Replay correctness depends on IR being a fixed-shape data structure; there is no per-provider state leaking through that the next chain hop has to re-derive.
-- Lossy translations are documented per-provider and surfaced to clients via `docs/provider-caveats.md` + `/v1/models` metadata. A client choosing a fallback chain can see "this chain's third hop is Mistral, which does not support tool_choice=required" *before* they hit the failure mode.
+- Lossy translations are documented per-provider and surfaced to clients via `docs/provider-caveats.md` (📋 planned) + `/v1/models` metadata. A client choosing a fallback chain can see "this chain's third hop is Mistral, which does not support tool_choice=required" *before* they hit the failure mode.
 - The IR is OLP's source of truth for "what was actually requested" for cache-key generation (ADR 0005). Caching on OpenAI shape would couple cache keys to OpenAI field naming; caching on IR makes the cache key provider-agnostic.
 
 **Negative**

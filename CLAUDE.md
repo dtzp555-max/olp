@@ -106,4 +106,6 @@ release_kit:
     - new file / SPOT / schema → Architecture or contributor § with link
   bootstrap_quirk_policy:
     - any first-run migration quirk (e.g., from OCP) → README § "Troubleshooting" + scripts/migrate-from-ocp.mjs if applicable
+    # NOTE: scripts/migrate-from-ocp.mjs is planned (Phase 7), not yet authored. The scripts/ directory
+    # does not currently exist. References here are forward-looking; do not attempt to run this script.
 ```

@@ -53,7 +53,7 @@ OCP ADR 0005 receives a header amendment on merge of this ADR: *"Superseded in p
 
 **Negative**
 - OCP's `cli.js`-alignment moat (ADR 0002 + 0005) does not transfer. OLP proxies multiple CLIs, each with its own protocol authority; the `cli.js` byte-for-byte discipline becomes per-provider per-CLI discipline (see ADR 0002 and the new OLP ALIGNMENT.md). This is more surface area to keep honest, not less.
-- Migration cost for the user: stop OCP, install OLP, point clients at the new port, migrate auth tokens. Spec §7 budgets this at <5 minutes via `scripts/migrate-from-ocp.mjs`. Real-world time will be higher on the first machine.
+- Migration cost for the user: stop OCP, install OLP, point clients at the new port, migrate auth tokens. Spec §7 budgets this at <5 minutes via `scripts/migrate-from-ocp.mjs` (📋 planned, Phase 7 — not yet authored). Real-world time will be higher on the first machine.
 - The maintainer now operates two repos during OLP's pre-v1.0 phase: OCP in maintenance, OLP under active development. This is intentional — OCP serves real traffic today and cannot be deleted in advance — but doubles the release surface temporarily.
 
 **Mitigations**

@@ -61,11 +61,13 @@ key = sha256(JSON.stringify({
 
 **Per-model isolation.** Cache entries are keyed on `(provider, model)` pair. `anthropic/claude-sonnet-4-6` and `openai/gpt-5-codex` produce distinct cache entries for identical IR messages. There is no cross-model cache sharing in v1.0; this is intentional and correct.
 
-**D1 — per-key isolation (ported from OCP v3.13.0).** Each OLP API key has an independent cache namespace. Cache directory structure:
+**D1 — per-key isolation (ported from OCP v3.13.0).** Each OLP API key has an independent cache namespace. Designed file-backed layout (target for Phase 2 storage adapter):
 ```
 ~/.olp/cache/<olp-key-id>/<hash-prefix>/<hash>.json
 ```
 The `<olp-key-id>` segment ensures per-key isolation; the `<hash-prefix>` is the first two hex chars of the key for filesystem-fanout sanity at high cache counts.
+
+> **Implementation note (as of 2026-05-24):** The v0.1 implementation in `lib/cache/store.mjs` uses an in-memory `Map` as the backing store — no files are written to `~/.olp/cache/`. The file-backed layout described above is the designed shape; it transitions in via a Phase 2 storage adapter. Per-key isolation and singleflight (D4) are live; file persistence is not.
 
 **D2 — `cache_control` bypass (ported, scope-expanded).** If the IR request contains Anthropic `cache_control` markers AND the active provider in the current chain hop is Anthropic, the OLP response cache is bypassed (Anthropic's own prompt cache is consulted at the provider). If the active provider is not Anthropic, the `cache_control` markers are stripped from the IR before provider translation (so they don't get passed to providers that wouldn't understand them) and a debug log entry is emitted. Future provider-specific bypass markers extend this rule by adding their own provider-conditional bypass logic.
 

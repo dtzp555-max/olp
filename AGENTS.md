@@ -37,13 +37,15 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - `lib/ir/` — Intermediate Representation definition + serializers. Governed by ADR 0003.
 - `lib/cache/` — content-addressed cache layer (per-key isolation, `cache_control` bypass, chunked stream replay, singleflight). Governed by ADR 0005.
 - `lib/fallback/` — fallback engine (trigger detection, chain advancement, idempotent-failure safety, header annotation). Governed by ADR 0004.
-- `lib/keys.mjs` — multi-key auth, per-key namespacing, audit log. Carries OCP's per-key isolation model into OLP.
-- `dashboard.html` — owner-only multi-provider dashboard (quota panels, fallback rate, cache hit rate).
+- `lib/keys.mjs` — multi-key auth, per-key namespacing, audit log. Carries OCP's per-key isolation model into OLP. **📋 Planned (Phase 2) — not yet authored.**
+- `dashboard.html` — owner-only multi-provider dashboard (quota panels, fallback rate, cache hit rate). **📋 Planned (Phase 6) — not yet authored.**
 - `models-registry.json` — single source of truth for `(provider, model) → metadata`. SPOT.
 - `ALIGNMENT.md` — the constitution. Binding for any plugin / entry-surface / IR change.
 - `docs/adr/` — Architecture Decision Records. Read the index in `docs/adr/README.md` before proposing governance, SPOT, or contract changes.
 - `.github/workflows/alignment.yml` — CI blacklist grep + per-provider citation soft check; fails the build on known-hallucinated tokens.
 - `CLAUDE.md` — Claude-Code-specific session instructions + `release_kit` overlay (Iron Rule 5.5).
+
+**Implementation status note (as of 2026-05-24):** Files marked 📋 above are designed and documented but not yet on disk. For the full status table see `README.md § "Implementation status"`. Do not attempt to read or import these files — they will not be found. The shipped set as of Phase 1 is: `server.mjs`, `lib/ir/`, `lib/providers/{anthropic,codex,mistral}.mjs`, `lib/cache/{keys,store}.mjs`, `lib/fallback/engine.mjs`, `models-registry.json`, `test-features.mjs`.
 
 ---
 
@@ -52,7 +54,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - **`ALIGNMENT.md` is binding.** Any PR touching a provider plugin, the entry surface, or the IR must cite the relevant authority (provider CLI documentation / OpenAI spec URL / ADR number) in the commit body and PR description. See `CLAUDE.md` § "Hard requirements for plugin / server.mjs changes" and `ALIGNMENT.md` Rules 1, 2, 5.
 - **Alignment CI is not suppressible.** The `alignment.yml` workflow greps for known-hallucinated tokens (currently carrying OCP's `api.anthropic.com/api/oauth/usage` as a transitive guardrail) and runs per-provider sanity checks. Adding new blacklist tokens is done via PR amendment to `alignment.yml`; removing entries requires an `ALIGNMENT.md` amendment PR.
 - **No self-approval.** Implementation author cannot merge their own PR (Iron Rule 10). A fresh-context reviewer must open the cited authority and confirm in the review comment.
-- **`models-registry.json` is the only place to add/edit `(provider, model)` metadata.** Do not touch hardcoded model maps in `server.mjs`, `lib/providers/*.mjs`, or `setup.mjs`. The OLP ADR that codifies this SPOT discipline lands in Phase 1 (OCP's ADR 0003 — `models.json` SPOT — is the precedent; OLP needs its own SPOT ADR because the registry shape differs).
+- **`models-registry.json` is the only place to add/edit `(provider, model)` metadata.** Do not touch hardcoded model maps in `server.mjs`, `lib/providers/*.mjs`, or `setup.mjs` (📋 `setup.mjs` is planned, not yet authored). The OLP ADR that codifies this SPOT discipline lands in Phase 1 (OCP's ADR 0003 — `models.json` SPOT — is the precedent; OLP needs its own SPOT ADR because the registry shape differs).
 - **Provider plugins follow the contract in ADR 0002.** A new provider plugin must implement every method on the Provider contract (`name`, `displayName`, `models`, `auth`, `spawn`, `estimateCost`, `quotaStatus`, `healthCheck`, `hints`). Partial implementations are unalignable per `ALIGNMENT.md` Rule 4.
 - **No anti-fingerprinting.** OLP is honest about spawning the real CLI. If a provider detects subscription-spawn proxying and bans it, the response is to drop the provider per ADR 0006, not to mask the spawn.
 - **No conversation state.** OLP is a stateless proxy. Memory / continuity is the client's responsibility (see ADR 0001 § Non-mission).

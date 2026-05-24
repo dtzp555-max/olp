@@ -105,7 +105,7 @@ Each fallback hop emits a structured log event with: timestamp, chain id, hop in
 
 **Mitigations**
 - The first-chunk rule applies at the byte level (any data written to the response stream blocks fallback), not at the semantic level (where it would require parsing). Implementation is a single boolean flag tracking whether anything has been written; the rule is auditable in a few lines of code.
-- Provider plugins that cannot retrieve quota (`quotaStatus` returns null) are documented in their plugin header and in `docs/provider-caveats.md`. Soft triggers configured against such providers issue a startup warning so the user knows the trigger will never fire.
+- Provider plugins that cannot retrieve quota (`quotaStatus` returns null) are documented in their plugin header and in `docs/provider-caveats.md` (📋 planned — not yet authored; until it exists, this information lives in the plugin header comment). Soft triggers configured against such providers issue a startup warning so the user knows the trigger will never fire.
 - The deferred trigger types (deterministic, cost-aware) are tracked in spec §8 with explicit Q-tags. Adding them later is an ADR amendment plus a contract addition to the trigger taxonomy, not a redesign.
 
 ## Alternatives considered

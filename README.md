@@ -133,6 +133,32 @@ If a fallback chain is exhausted, `X-OLP-Fallback-Exhausted` lists the tried pro
 
 ---
 
+## Implementation status (as of 2026-05-24)
+
+Phase 1 is in progress. This table reflects what is currently shipped vs. what is designed for later phases.
+
+| File / artifact | Status | Notes |
+|---|---|---|
+| `server.mjs` | ✅ Shipped | HTTP listener + dispatcher |
+| `lib/ir/` | ✅ Shipped | IR definition + serializers (ADR 0003) |
+| `lib/providers/anthropic.mjs` | ✅ Shipped | `claude -p` spawn-binary plugin |
+| `lib/providers/codex.mjs` | ✅ Shipped | `codex exec --json` plugin |
+| `lib/providers/mistral.mjs` | ✅ Shipped | `vibe --prompt` plugin |
+| `lib/cache/keys.mjs` | ✅ Shipped | Content-addressed key computation |
+| `lib/cache/store.mjs` | ✅ Shipped | In-memory Map (file-backed layout: 📋 Phase 2 storage adapter) |
+| `lib/fallback/engine.mjs` | ✅ Shipped | Trigger evaluation + chain advancement (ADR 0004) |
+| `models-registry.json` | ✅ Shipped | SPOT for `(provider, model)` metadata |
+| `test-features.mjs` | ✅ Shipped | 328-test suite (CI: `test.yml`) |
+| `lib/keys.mjs` | 📋 Planned (Phase 2) | Multi-key auth, per-key namespacing, audit log |
+| `dashboard.html` | 📋 Planned (Phase 6) | Owner-only multi-provider dashboard |
+| `docs/provider-caveats.md` | 📋 Planned (Phase 3+) | Lossy-translation reference; for now documented inline in each plugin header |
+| `docs/openai-spec-pin.md` | 📋 Planned (Phase 1 gate) | OpenAI spec snapshot for annual audit; deferred from v0.1 bootstrap |
+| `docs/alignment-audits/` | 📋 Planned | Output directory for annual alignment audits (first audit: 2027-05-14) |
+| `scripts/migrate-from-ocp.mjs` | 📋 Planned (Phase 7) | OCP → OLP migration tool |
+| `setup.mjs` | 📋 Planned | Setup wizard / initial config |
+
+---
+
 ## Architecture
 
 OLP is a Node.js (ESM, `.mjs`) HTTP proxy with no build step and minimal dependencies. The high-level shape:
@@ -140,9 +166,9 @@ OLP is a Node.js (ESM, `.mjs`) HTTP proxy with no build step and minimal depende
 - **Entry surface** — `server.mjs` handles `/v1/chat/completions` and the administrative endpoints. Governed by OpenAI's `/v1/chat/completions` specification as the wire authority. See [`ALIGNMENT.md` § Authorities](./ALIGNMENT.md#authorities).
 - **Intermediate Representation (IR)** — `lib/ir/` normalizes between the entry surface and provider-native shapes. The IR is the lingua franca; any extension is an [ADR 0003](./docs/adr/0003-intermediate-representation.md) amendment.
 - **Provider plugins** — `lib/providers/<name>.mjs`. Each plugin implements the contract in [ADR 0002 (Plugin Architecture for Providers)](./docs/adr/0002-plugin-architecture.md), spawns its CLI, and translates between IR and provider-native IO.
-- **Cache layer** — `lib/cache/` is a content-addressed cache keyed on `(provider, model, messages, tools, temperature, response_format, cache_control)`. Per-key isolation, prompt-caching bypass, chunked stream replay, and singleflight. See [ADR 0005 (Cache Layer Cross-Provider Design)](./docs/adr/0005-cache-cross-provider.md).
+- **Cache layer** — `lib/cache/` is a content-addressed cache keyed on `(provider, model, messages, tools, temperature, response_format, cache_control)`. Per-key isolation, prompt-caching bypass, chunked stream replay, and singleflight. See [ADR 0005 (Cache Layer Cross-Provider Design)](./docs/adr/0005-cache-cross-provider.md). Current backing store is an in-memory Map; file-backed storage is planned for Phase 2.
 - **Fallback engine** — `lib/fallback/` advances a configured chain one provider at a time on configured triggers, never retrying after the first response chunk has been emitted to the client. See [ADR 0004](./docs/adr/0004-fallback-engine.md).
-- **Multi-key auth** — `lib/keys.mjs` carries OCP's per-OLP-key namespace isolation forward. Each OLP API key has independent quota, cache namespace, and audit log; each key declares which providers it can access.
+- **Multi-key auth** — `lib/keys.mjs` (📋 planned, Phase 2) will carry OCP's per-OLP-key namespace isolation forward. Each OLP API key will have independent quota, cache namespace, and audit log; each key declares which providers it can access.
 
 Read the ADRs in `docs/adr/` in order before proposing structural changes.
 
@@ -168,7 +194,7 @@ Full spec (decision rationale, open questions, risks): `~/.cc-rules/memory/proje
 
 ## Migration from OCP
 
-_placeholder — `scripts/migrate-from-ocp.mjs` lands with Phase 7._
+_placeholder — `scripts/migrate-from-ocp.mjs` lands with Phase 7 (📋 planned, not yet authored)._
 
 Anticipated user-facing flow (target: <5 minutes):
 

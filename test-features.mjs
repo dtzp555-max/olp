@@ -1500,6 +1500,47 @@ describe('Cache layer — computeCacheKey (Suite 9)', () => {
     const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir2);
     assert.equal(k1, k2);
   });
+
+  // ── F4 regression (D34): tools:[] vs tools:undefined must produce identical keys ─
+  // ADR 0005 Amendment 2 claims: "tools: [] (explicit empty array) and tools omitted
+  // (undefined) both mean 'no tools available' and produce identical model output,
+  // so they correctly share a cache entry."
+  // computeCacheKey now normalizes [] → null before serialization so this claim holds.
+  it('F4 regression: tools:[] and tools:undefined produce the same cache key (D34)', () => {
+    const base = makeIR({ messages: [{ role: 'user', content: 'hello' }] });
+    const irEmpty = { ...base, tools: [] };
+    const irUndef = { ...base, tools: undefined };
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', irEmpty);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', irUndef);
+    assert.equal(k1, k2, 'tools:[] and tools:undefined must produce identical cache keys');
+  });
+
+  it('F4 regression: stop:[] and stop:undefined produce the same cache key (D34)', () => {
+    const base = makeIR({ messages: [{ role: 'user', content: 'hello' }] });
+    const irEmpty = { ...base, stop: [] };
+    const irUndef = { ...base, stop: undefined };
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', irEmpty);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', irUndef);
+    assert.equal(k1, k2, 'stop:[] and stop:undefined must produce identical cache keys');
+  });
+
+  it('F4 regression: tools:[] and tools:null produce the same cache key (D34)', () => {
+    const base = makeIR({ messages: [{ role: 'user', content: 'hello' }] });
+    const irEmpty = { ...base, tools: [] };
+    const irNull = { ...base, tools: null };
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', irEmpty);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', irNull);
+    assert.equal(k1, k2, 'tools:[] and tools:null must produce identical cache keys');
+  });
+
+  it('F4 regression: non-empty tools array still differs from tools:undefined (D34)', () => {
+    const base = makeIR({ messages: [{ role: 'user', content: 'hello' }] });
+    const irWithTools = { ...base, tools: [{ type: 'function', function: { name: 'foo' } }] };
+    const irNoTools = { ...base, tools: undefined };
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', irWithTools);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', irNoTools);
+    assert.notEqual(k1, k2, 'non-empty tools array must produce a different cache key from no tools');
+  });
 });
 
 describe('Cache layer — extractCacheControlMarkers + hasCacheControl (Suite 9 cont.)', () => {
@@ -3866,15 +3907,9 @@ describe('Fallback engine — trigger taxonomy (D9)', () => {
     assert.equal(evaluateHardTriggers(err), true);
   });
 
-  it('evaluateHardTriggers: ProviderError QUOTA_EXHAUSTED → fires', () => {
-    const err = new ProviderError('Quota exhausted', 'QUOTA_EXHAUSTED');
-    assert.equal(evaluateHardTriggers(err), true);
-  });
-
-  it('evaluateHardTriggers: ProviderError RATE_LIMITED → fires', () => {
-    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
-    assert.equal(evaluateHardTriggers(err), true);
-  });
+  // QUOTA_EXHAUSTED and RATE_LIMITED tests removed (D34 F7): those codes were
+  // removed from PROVIDER_ERROR_CODES and HARD_TRIGGER_CODES — no v0.1 plugin
+  // emits them. Re-add tests via ADR 0004 amendment when HTTP-status parsing lands.
 
   it('evaluateHardTriggers: ProviderError SPAWN_FAILED → fires', () => {
     const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
@@ -4014,7 +4049,7 @@ describe('Fallback engine — executeWithFallback (D9)', () => {
   });
 
   it('single-hop chain with hard-triggered error → exhausted, returns originalError', async () => {
-    const err = new ProviderError('Quota exhausted', 'QUOTA_EXHAUSTED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
     const result = await executeWithFallback(chain, dummyIR, makeHopFn({ anthropic: err }));
     assert.equal(result.chunks, null, 'Expected null chunks on exhausted chain');
@@ -4038,7 +4073,7 @@ describe('Fallback engine — executeWithFallback (D9)', () => {
   });
 
   it('three-hop chain, primary + secondary fail → tertiary returns chunks, fallbackHops=2', async () => {
-    const errA = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const errA = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const errB = Object.assign(new Error('Service unavailable'), { statusCode: 503 });
     const chain = [
       { provider: 'anthropic', model: 'claude-sonnet-4-6' },
@@ -4057,8 +4092,8 @@ describe('Fallback engine — executeWithFallback (D9)', () => {
   });
 
   it('three-hop chain, all fail → exhausted, originalError is from FIRST hop (not last)', async () => {
-    const errA = new ProviderError('Rate limited', 'RATE_LIMITED');
-    const errB = new ProviderError('Spawn failed', 'SPAWN_FAILED');
+    const errA = new ProviderError('Spawn failed', 'SPAWN_FAILED');
+    const errB = new ProviderError('Spawn timeout', 'SPAWN_TIMEOUT');
     const errC = new ProviderError('CLI not found', 'CLI_NOT_FOUND');
     const chain = [
       { provider: 'anthropic', model: 'claude-sonnet-4-6' },
@@ -4158,7 +4193,7 @@ describe('Fallback engine — first-chunk safety (D9)', () => {
 
   it('error from executeHopFn (hard trigger) means zero chunks emitted — advance is safe', async () => {
     // Simulate: anthropic throws (no bytes emitted), openai succeeds
-    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [
       { provider: 'anthropic', model: 'claude-sonnet-4-6' },
       { provider: 'openai', model: 'gpt-5.5' },
@@ -4273,7 +4308,7 @@ describe('Fallback engine — observability / header annotation (D9)', () => {
   });
 
   it('success on fallback: providerUsed + modelUsed match the serving hop', async () => {
-    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [
       { provider: 'anthropic', model: 'claude-sonnet-4-6' },
       { provider: 'openai', model: 'gpt-5.5' },
@@ -4289,9 +4324,9 @@ describe('Fallback engine — observability / header annotation (D9)', () => {
   });
 
   it('chain exhausted: originalError is from FIRST hop, not second or third', async () => {
-    const errA = new ProviderError('Rate limited', 'RATE_LIMITED');
-    const errB = new ProviderError('Spawn failed', 'SPAWN_FAILED');
-    const errC = new ProviderError('CLI not found', 'CLI_NOT_FOUND');
+    const errA = new ProviderError('Spawn failed', 'SPAWN_FAILED');
+    const errB = new ProviderError('CLI not found', 'CLI_NOT_FOUND');
+    const errC = new ProviderError('Spawn timeout', 'SPAWN_TIMEOUT');
     const chain = [
       { provider: 'a', model: 'model-a' },
       { provider: 'b', model: 'model-b' },
@@ -4310,7 +4345,7 @@ describe('Fallback engine — observability / header annotation (D9)', () => {
   });
 
   it('triedProviders lists all attempted hops in chain order', async () => {
-    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [
       { provider: 'a', model: 'model-a' },
       { provider: 'b', model: 'model-b' },
@@ -4980,7 +5015,7 @@ describe('Fallback engine — D28 observability fields (chain_id / ir_request_ha
 
   it('chain_id is present in all events and is 16-char hex', async () => {
     const { logEvent, events } = makeLogCapture();
-    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [
       { provider: 'anthropic', model: 'claude-sonnet-4-6' },
       { provider: 'openai', model: 'gpt-5.5' },
@@ -4999,7 +5034,7 @@ describe('Fallback engine — D28 observability fields (chain_id / ir_request_ha
 
   it('chain_id is consistent across all hops from one executeWithFallback call', async () => {
     const { logEvent, events } = makeLogCapture();
-    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [
       { provider: 'a', model: 'model-a' },
       { provider: 'b', model: 'model-b' },
@@ -5034,7 +5069,7 @@ describe('Fallback engine — D28 observability fields (chain_id / ir_request_ha
 
   it('ir_request_hash is the same across all hops within one chain', async () => {
     const { logEvent, events } = makeLogCapture();
-    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [
       { provider: 'anthropic', model: 'claude-sonnet-4-6' },
       { provider: 'openai', model: 'gpt-5.5' },
@@ -5060,9 +5095,9 @@ describe('Fallback engine — D28 observability fields (chain_id / ir_request_ha
 
   // ── trigger_type: classification per error type ───────────────────────────
 
-  it('trigger_type is "hard" for QUOTA_EXHAUSTED (fallback_hard_trigger event)', async () => {
+  it('trigger_type is "hard" for SPAWN_FAILED (fallback_hard_trigger event)', async () => {
     const { logEvent, events } = makeLogCapture();
-    const err = new ProviderError('Quota exhausted', 'QUOTA_EXHAUSTED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [
       { provider: 'anthropic', model: 'claude-sonnet-4-6' },
       { provider: 'openai', model: 'gpt-5.5' },
@@ -5142,7 +5177,7 @@ describe('Fallback engine — D28 observability fields (chain_id / ir_request_ha
 
   it('next_provider is chain[i+1].provider when chain advances on hard trigger', async () => {
     const { logEvent, events } = makeLogCapture();
-    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [
       { provider: 'anthropic', model: 'claude-sonnet-4-6' },
       { provider: 'openai', model: 'gpt-5.5' },
@@ -5159,7 +5194,7 @@ describe('Fallback engine — D28 observability fields (chain_id / ir_request_ha
 
   it('next_provider is null on the last hop (chain exhausted)', async () => {
     const { logEvent, events } = makeLogCapture();
-    const err = new ProviderError('Rate limited', 'RATE_LIMITED');
+    const err = new ProviderError('Spawn failed', 'SPAWN_FAILED');
     const chain = [
       { provider: 'anthropic', model: 'claude-sonnet-4-6' },
     ];
@@ -7486,7 +7521,7 @@ describe('D33 round-5 cold-audit cleanup', () => {
   describe('F8_fallback — fallback-hop cache-hit reports X-OLP-Cache: hit', () => {
 
     it('F8_fallback: 2-hop chain, primary fails, secondary cache-hit → X-OLP-Cache: hit', async () => {
-      // Two providers: primary (alpha) always fails with QUOTA_EXHAUSTED; secondary
+      // Two providers: primary (alpha) always fails with SPAWN_FAILED (hard trigger); secondary
       // (beta) succeeds. On second request, secondary serves from cache.
       // The X-OLP-Cache header must be 'hit' on the second request.
       //
@@ -7497,12 +7532,12 @@ describe('D33 round-5 cold-audit cleanup', () => {
       setProviders33({ anthropic: true, mistral: true });
       clearCache33();
 
-      // Override anthropic spawn to always throw QUOTA_EXHAUSTED
+      // Override anthropic spawn to always throw SPAWN_FAILED (hard trigger)
       const savedAnthropic = loadedProviders33.get('anthropic');
       const failingPrimary = {
         ...savedAnthropic,
         spawn: async function* () {
-          throw new ProviderError('quota exhausted (test)', 'QUOTA_EXHAUSTED');
+          throw new ProviderError('spawn failed (test)', 'SPAWN_FAILED');
         },
       };
       loadedProviders33.set('anthropic', failingPrimary);

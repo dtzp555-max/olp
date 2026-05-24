@@ -7,6 +7,18 @@
 
 ## Amendments
 
+### Amendment 3 — 2026-05-24: Narrow v0.1 hard-trigger code taxonomy (D34 F7)
+
+- **Finding:** Round-6 cold-audit F7 (P2) — `PROVIDER_ERROR_CODES` in `lib/providers/base.mjs` and `HARD_TRIGGER_CODES` in `lib/fallback/engine.mjs` both listed `QUOTA_EXHAUSTED` and `RATE_LIMITED` as live hard-trigger codes. No v0.1 plugin emits either code. The Anthropic, Codex, and Mistral plugins all use `claude -p`, `codex exec --json`, and `vibe --prompt` respectively — none parse the underlying-API HTTP response status code or surface a structured quota/rate error; they only throw `SPAWN_FAILED`, `SPAWN_TIMEOUT`, `CLI_NOT_FOUND`, or `AUTH_MISSING`. The two `Hard triggers` bullets in § Trigger taxonomy ("HTTP 5xx from provider's underlying API" and "HTTP 4xx quota exhaustion") are therefore unreachable through the `ProviderError` code path at v0.1.
+- **Also found:** `evaluateHardTriggers` in `engine.mjs` has HTTP `statusCode` branches (`>= 500` and `>= 400`) that are also unreachable at v0.1 — plugins never attach `statusCode` to thrown errors. These branches are left in place as forward-compatible intent-signal code (option (b) per D34 discussion), with a prominent comment. Removing them would require corresponding ADR revision; keeping them preserves the design intent for when a future plugin gains HTTP-status parsing.
+- **Change (D34 F7):**
+  - `QUOTA_EXHAUSTED` and `RATE_LIMITED` removed from `PROVIDER_ERROR_CODES` (base.mjs) and `HARD_TRIGGER_CODES` (engine.mjs). Dead code removal.
+  - A comment block added in `evaluateHardTriggers` labeling the HTTP-status branches as "forward-compat reserved — v0.1 plugins never attach statusCode."
+  - Test coverage: the two unit tests for `evaluateHardTriggers: ProviderError QUOTA_EXHAUSTED/RATE_LIMITED → fires` are removed (tombstoned with a removal comment). All other hard-trigger tests that used these codes as convenient test vectors are rewritten to use `SPAWN_FAILED` / `SPAWN_TIMEOUT`.
+- **v0.1 live hard-trigger codes after this amendment:** `SPAWN_FAILED`, `CLI_NOT_FOUND`, `SPAWN_TIMEOUT`. `AUTH_MISSING` remains in the table as an explicit `false` entry (deliberate non-trigger per ADR 0004 § "No fallback for client-side errors" analogue).
+- **v1.x re-activation path:** When a plugin gains HTTP-status parsing (e.g., an Anthropic plugin variant that makes direct Messages API calls rather than spawning `claude -p`), add the plugin-layer HTTP parsing, re-add `QUOTA_EXHAUSTED` and `RATE_LIMITED` to both tables, and amend this entry. The `evaluateHardTriggers` HTTP-status branches will then activate naturally with no further engine changes.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (Round-6 Cold Audit).
+
 ### Amendment 1 — 2026-05-24: Buffered-path SPAWN_FAILED with usable chunks must NOT trigger fallback (D16)
 
 - **Finding:** Cold-audit Finding 17 (P2 fallback correctness) — Hard triggers bullet 3 in the Decision section below reads: "Provider CLI exit code ≠ 0 **with no usable response chunks streamed**." The qualifier "with no usable response chunks streamed" is load-bearing. Pre-D16 code in `server.mjs` `collectAllChunks` had no catch block: if the provider generator threw `ProviderError(SPAWN_FAILED)` after yielding N>0 IR delta/stop chunks, the throw propagated out of the `for await` loop, discarding the accumulated chunks. The fallback engine then treated SPAWN_FAILED as a hard trigger unconditionally, advanced the chain, and served the next provider's response. The original provider's actual partial output — content the user had already paid for — was silently dropped.

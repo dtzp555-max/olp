@@ -578,7 +578,7 @@ async function handleChatCompletions(req, res) {
 
     for (const irChunk of chunks) {
       res.write(irChunkToOpenAISSE(irChunk, requestId, ir.model));
-      if (irChunk.type === 'stop' || irChunk.type === 'error') break;
+      if (irChunk.type === 'stop') break;
     }
     res.write(SSE_DONE);
     res.end();

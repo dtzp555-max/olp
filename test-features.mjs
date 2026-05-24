@@ -357,17 +357,19 @@ describe('irChunkToOpenAISSE format', () => {
     assert.deepEqual(payload.choices[0].delta, {});
   });
 
-  it('formats an error chunk with finish_reason within the OpenAI enum', () => {
-    // ALIGNMENT.md Rule 2 (b): finish_reason must stay within the OpenAI spec
-    // enum (stop|length|tool_calls|content_filter|function_call|null).
-    // Provider errors surface via the top-level `error` object, not via an
-    // invented finish_reason value.
+  it('does not invent a top-level error field on error chunks (ALIGNMENT.md Rule 2(b))', () => {
+    // ALIGNMENT.md Rule 2 (b): OLP must not introduce OpenAI-spec fields that
+    // OpenAI's /v1/chat/completions specification does not document.
+    // OpenAI chat.completion.chunk objects have no top-level `error` field.
+    // Provider errors surface via HTTP 4xx/5xx, not as in-band SSE fields.
+    // Error chunks should not reach the translator in normal operation —
+    // server.mjs converts them to thrown ProviderError before translation.
+    // If one somehow does reach here, no `error` field must be invented.
     const sse = irChunkToOpenAISSE({ type: 'error', error: 'spawn failed' }, ID, MODEL);
     const payload = JSON.parse(sse.slice(6).trim());
-    assert.ok(payload.error);
-    assert.equal(payload.error.type, 'provider_error');
+    assert.equal(payload.error, undefined, 'translator must not invent top-level error field');
+    assert.equal(payload.object, 'chat.completion.chunk');
     assert.ok(['stop', 'length', 'tool_calls', 'content_filter', 'function_call', null].includes(payload.choices[0].finish_reason));
-    assert.equal(payload.choices[0].finish_reason, 'stop');
   });
 
   it('SSE_DONE is the [DONE] terminator', () => {

@@ -425,6 +425,26 @@ async function handleChatCompletions(req, res) {
   const hasCacheControlMarkers =
     hasCacheControl(ir) || extractCacheControlMarkers(body?.messages ?? []).length > 0;
 
+  // D36 #2 (ADR 0005 § D2): when cache_control markers are present AND at least one
+  // hop in the chain is non-Anthropic, the markers are noop'd for those hops.
+  // Per ADR 0005 § Context: "for non-Anthropic targets, the bypass markers are
+  // noop'd (logged once per request at debug level so users can see they were
+  // ignored)." Fires at most once per request, gated on (markers AND mixed/non-anthropic
+  // chain). No log when no markers, or when every chain hop is Anthropic.
+  if (hasCacheControlMarkers && chain.some(hop => hop.provider !== 'anthropic')) {
+    // marker_count sums body-side and IR-side markers. At v0.1 the IR term is
+    // structurally 0 (openAIToIR strips cache_control). When a future ADR 0003
+    // amendment activates cache_control in the IR whitelist, both terms will be
+    // non-zero for the same logical marker set → revisit to avoid 2× counting.
+    const markerCount =
+      extractCacheControlMarkers(body?.messages ?? []).length +
+      extractCacheControlMarkers(ir.messages ?? []).length;
+    logEvent('debug', 'cache_control_partial_noop', {
+      chain: chain.map(hop => hop.provider),
+      marker_count: markerCount,
+    });
+  }
+
   /**
    * Returns true if OLP's response cache should be bypassed for the given hop.
    * Per ADR 0005 § D2: bypass only when provider is Anthropic AND markers present.

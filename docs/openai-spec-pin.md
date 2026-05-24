@@ -136,6 +136,38 @@ Each entry: `{ "id": "<model-id>", "object": "model", "created": <ts>, "owned_by
 no invented fields (per D27 F15). Alias entries are also surfaced as separate list members
 (per D27 F15 alias surfacing).
 
+**Alias surfacing — controlled deviation (D36 #13).** OpenAI's `/v1/models` spec
+enumerates one entry per canonical model ID; OLP additionally surfaces alias entries
+(e.g. `claude`, `sonnet`, `opus`, `haiku` alongside their canonical Anthropic targets).
+This is a documented deviation from strict spec parity. It is governed by
+`ALIGNMENT.md § Class-specific Exceptions → Controlled deviations (entry-surface scope)`,
+which references this section as the formal contract.
+
+The alias-entry contract:
+
+| Field | Value for alias entry |
+|---|---|
+| `id` | the alias string (e.g. `'sonnet'`) — same shape as canonical entries |
+| `object` | `'model'` — same as canonical entries |
+| `created` | identical to the canonical target's `created` timestamp (per F12) |
+| `owned_by` | identical to the canonical target's `owned_by` (i.e. the provider key) |
+
+The alias list is sourced from `models-registry.json` via `getAliasMap()` in
+`lib/providers/index.mjs` — the SPOT for alias-aware routing. `server.mjs handleModels`
+appends alias entries to the canonical list only when the alias's canonical target's
+provider is currently in `loadedProviders`. No fields beyond the four OpenAI-spec fields
+are added on alias entries.
+
+**Rationale (D27 F15):** Onboarding gap. Clients configured with `model: 'sonnet'` (a
+common alias used by Anthropic's own CLI and OpenClaw-class tools) previously received
+an empty `/v1/models` response that did not surface the alias as a callable model id.
+Surfacing the alias makes the discovery loop usable for OpenAI-compatible clients with
+alias-aware UX.
+
+**Forward path:** Annual audit (14 May) re-checks whether OpenAI has shipped a formal
+alias-listing extension to `/v1/models`. If so, OLP migrates the alias surface to that
+shape. If not, the deviation continues unchanged.
+
 **`created` field stability (F12 round-5 cold-audit):** OpenAI spec treats `created` as a
 stable per-model attribute, not a request-time value. `server.mjs handleModels` uses
 `getModelCreated(modelId)` (from `lib/providers/index.mjs`) which reads the per-entry

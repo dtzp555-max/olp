@@ -1543,6 +1543,160 @@ describe('Cache layer — computeCacheKey (Suite 9)', () => {
   });
 });
 
+// ── D36 #14: cache_control slot determinism regression ─────────────────────
+//
+// Context (issue #14 + ADR 0005 Amendment 4):
+//   computeCacheKey at lib/cache/keys.mjs:~224 calls extractCacheControlMarkers
+//   on ir.messages. openAIToIR (lib/ir/openai-to-ir.mjs translateMessage) does
+//   NOT whitelist cache_control, so v0.1 IRs constructed from OpenAI requests
+//   always have markers stripped → the slot is structurally null. D27 F10
+//   Amendment 4 acknowledged this is forward-compatible: when a future ADR 0003
+//   amendment adds cache_control to the IR field set, the slot starts carrying
+//   meaningful data without a cache-key schema change.
+//
+// What this suite guards:
+//   1. The cache_control slot IS populated when markers are present on the IR
+//      (forward-compat scenario — markers attached directly to an IR object
+//      bypassing the openAIToIR translation).
+//   2. Computing the key twice with the same marker payload yields identical
+//      keys (determinism — bedrock invariant per ADR 0005 § cache key stability).
+//   3. The slot is included in the composition — two IRs differing ONLY in
+//      cache_control markers produce different keys.
+//
+// Future activation contract (when ADR 0003 adds cache_control to the IR
+// whitelist and openAIToIR starts preserving markers):
+//   - extractCacheControlMarkers must continue to return markers in messages-
+//     iteration order; nested-in-content markers follow the outer message in
+//     positional order (see lib/cache/keys.mjs:126-148).
+//   - The current implementation JSON.stringifies the marker array verbatim
+//     (no pre-sort) — determinism relies on messages-array order being stable
+//     across translations and on per-marker object key insertion order being
+//     stable (which it is for objects authored at one source site).
+//   - If a future amendment introduces semantic equivalences across marker
+//     orderings (e.g., "two markers in different positions should still hit
+//     the same cache entry"), the implementation must add a sortMarkers helper
+//     before serialization. This test would then need an update to assert the
+//     normalized-order behavior. As of D36, no such equivalence is claimed; the
+//     test asserts the strict "same input → same output" determinism only.
+//
+// Risk path chosen: option (a) test-only (no code change in lib/cache/keys.mjs).
+// Rationale: the dead-code path is unreachable from openAIToIR at v0.1, so a
+// helper added now would have zero callers; preferred to defer the helper until
+// the IR amendment actually activates the slot. Per ALIGNMENT.md Rule 2 (No
+// Invention), shipping a sortMarkers helper today would be invention without a
+// caller authority. Adding tests is risk-free; adding helpers is not.
+
+describe('D36 #14 — cache_control slot determinism regression', () => {
+
+  // Construct an IR with synthetic cache_control markers attached directly
+  // (bypass openAIToIR which strips them at v0.1).
+  function makeIRWithMarkers(markers, opts = {}) {
+    const messages = opts.messages ?? [
+      { role: 'user', content: 'sample-prompt' },
+    ];
+    // Attach the first marker to the first message; if a second marker is
+    // provided, attach it to the second message (or to message 0 nested in a
+    // content array, depending on opts.nestSecond).
+    const annotated = messages.map((m, idx) => {
+      if (idx === 0 && markers[0]) {
+        return { ...m, cache_control: markers[0] };
+      }
+      if (idx === 1 && markers[1]) {
+        return { ...m, cache_control: markers[1] };
+      }
+      return m;
+    });
+    return makeIR({ messages: annotated, ...opts.irOverrides });
+  }
+
+  it('D36 #14a: cache_control slot is populated when markers are present on the IR', () => {
+    // The slot is normally null at v0.1 (openAIToIR strips). When markers ARE
+    // present (e.g. an IR constructed directly with markers, or after a future
+    // ADR 0003 amendment preserves them), the slot carries the markers.
+    const irNoMarkers = makeIR({ messages: [{ role: 'user', content: 'hi' }] });
+    const irWithMarker = makeIRWithMarkers([{ type: 'ephemeral' }], {
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+    const kNo = computeCacheKey('anthropic', 'claude-haiku-4-5', irNoMarkers);
+    const kYes = computeCacheKey('anthropic', 'claude-haiku-4-5', irWithMarker);
+
+    // Different keys: marker presence is observable in the cache key.
+    assert.notEqual(kNo, kYes,
+      'IR with cache_control markers must produce a different cache key from IR without markers');
+    assert.equal(typeof kYes, 'string');
+    assert.equal(kYes.length, 64);
+  });
+
+  it('D36 #14b: cache key is deterministic across two computations on the same IR with markers', () => {
+    // The bedrock invariant: same inputs → same key. The cache_control slot
+    // must not introduce nondeterminism (e.g., timestamp, random, iteration
+    // order from a Map).
+    const ir = makeIRWithMarkers([{ type: 'ephemeral' }], {
+      messages: [
+        { role: 'user', content: 'first turn' },
+        { role: 'assistant', content: 'first reply' },
+      ],
+    });
+    const k1 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir);
+    const k2 = computeCacheKey('anthropic', 'claude-haiku-4-5', ir);
+    assert.equal(k1, k2, 'cache key must be deterministic for the same IR with markers');
+  });
+
+  it('D36 #14c: same markers in the same positional order produce the same key', () => {
+    // Two IRs constructed independently with the same marker payload at the
+    // same positions must produce the same key. This is the forward-activation
+    // contract: when openAIToIR preserves markers, two identical OpenAI
+    // requests must produce identical cache keys.
+    const irA = makeIRWithMarkers([{ type: 'ephemeral' }], {
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+    const irB = makeIRWithMarkers([{ type: 'ephemeral' }], {
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+    const kA = computeCacheKey('anthropic', 'claude-haiku-4-5', irA);
+    const kB = computeCacheKey('anthropic', 'claude-haiku-4-5', irB);
+    assert.equal(kA, kB,
+      'two independently-constructed IRs with identical marker payloads must share a cache key');
+  });
+
+  it('D36 #14d: markers nested in content array participate in the cache key (extractCacheControlMarkers contract)', () => {
+    // extractCacheControlMarkers (lib/cache/keys.mjs:126-148) finds markers at
+    // both message top-level AND nested inside content array parts. The cache
+    // key must reflect both surfaces. This is the slot's full forward-compat
+    // contract — when the IR carries cache_control, OLP must observe it on the
+    // wire shape the IR provides, including the OpenAI-style content-array
+    // nesting that Anthropic prompt-caching uses in production.
+    const irTopLevel = makeIR({
+      messages: [
+        { role: 'user', content: 'hi', cache_control: { type: 'ephemeral' } },
+      ],
+    });
+    const irNested = makeIR({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } },
+          ],
+        },
+      ],
+    });
+    const irNoMarkers = makeIR({
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+    const kTop = computeCacheKey('anthropic', 'claude-haiku-4-5', irTopLevel);
+    const kNested = computeCacheKey('anthropic', 'claude-haiku-4-5', irNested);
+    const kNone = computeCacheKey('anthropic', 'claude-haiku-4-5', irNoMarkers);
+
+    // Both marker surfaces must register against the key (be observably distinct
+    // from the no-markers case).
+    assert.notEqual(kTop, kNone, 'top-level cache_control marker must affect cache key');
+    assert.notEqual(kNested, kNone, 'nested cache_control marker must affect cache key');
+  });
+});
+
 describe('Cache layer — extractCacheControlMarkers + hasCacheControl (Suite 9 cont.)', () => {
 
   // ── Test 9: extractCacheControlMarkers — top-level ───────────────────
@@ -2422,6 +2576,222 @@ describe('D13 — cache_control per-hop bypass correctness (Suite 9d)', () => {
       __resetSpawnImpl();
       codexResetSpawnImpl();
     }
+  });
+});
+
+// ── Suite 9f: D36 #2 cache_control partial-noop debug log ────────────────
+//
+// Authority: ADR 0005 § Context — "for non-Anthropic targets, the bypass
+//   markers are noop'd (logged once per request at debug level so users can
+//   see they were ignored)."
+//
+// Contract: at request entry in handleChatCompletions, after hasCacheControlMarkers
+// is computed, emit ONE logEvent('debug', 'cache_control_partial_noop', { chain, marker_count })
+// IF AND ONLY IF (a) markers are present AND (b) at least one chain hop is
+// non-Anthropic. The log is suppressed when no markers, or when every hop is
+// Anthropic.
+//
+// Implementation strategy: monkeypatch process.stdout.write (debug events go
+// to stdout per the logEvent helper in server.mjs:56-63) and grep for the
+// event name across the captured writes.
+
+describe('D36 #2 — cache_control partial-noop debug log (Suite 9f)', () => {
+  let serverD36;
+  let portD36;
+  let savedAnthropicTokenD36;
+  let savedCodexAuthPathD36;
+  let suiteCodexAuthFileD36;
+
+  // ── stdout capture helpers ───────────────────────────────────────────
+  let stdoutWrites = [];
+  let origStdoutWrite = null;
+
+  function startStdoutCapture() {
+    stdoutWrites = [];
+    origStdoutWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk, ...rest) => {
+      const s = typeof chunk === 'string'
+        ? chunk
+        : (Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk));
+      stdoutWrites.push(s);
+      return origStdoutWrite(chunk, ...rest);
+    };
+  }
+
+  function stopStdoutCapture() {
+    if (origStdoutWrite) {
+      process.stdout.write = origStdoutWrite;
+      origStdoutWrite = null;
+    }
+  }
+
+  /** Returns array of parsed JSON events whose `event` field === eventName. */
+  function findEvents(eventName) {
+    const found = [];
+    for (const w of stdoutWrites) {
+      for (const line of w.split('\n')) {
+        if (!line.trim()) continue;
+        if (!line.includes(`"event":"${eventName}"`)) continue;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed?.event === eventName) found.push(parsed);
+        } catch { /* not JSON — ignore */ }
+      }
+    }
+    return found;
+  }
+
+  before(async () => {
+    savedAnthropicTokenD36 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-anthropic-token-for-d36-suite';
+
+    const { writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join: pathJoin } = await import('node:path');
+    suiteCodexAuthFileD36 = pathJoin(tmpdir(), `olp-test-d36-codex-auth-${Date.now()}.json`);
+    writeFileSync(suiteCodexAuthFileD36, JSON.stringify({ accessToken: 'fake-codex-token-for-d36-suite' }), 'utf8');
+    savedCodexAuthPathD36 = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = suiteCodexAuthFileD36;
+
+    const testProviders = loadProviders({ enabled: { anthropic: true, openai: true } });
+    const { loadedProviders: lp, cacheStore: cs } = await import('./server.mjs');
+    for (const [name, p] of testProviders) {
+      lp.set(name, p);
+    }
+    cs.clear();
+
+    serverD36 = createOlpServer();
+    portD36 = 22000 + Math.floor(Math.random() * 500);
+    await new Promise((resolve, reject) => {
+      serverD36.listen(portD36, '127.0.0.1', resolve);
+      serverD36.once('error', (e) => {
+        if (e.code === 'EADDRINUSE') {
+          portD36++;
+          serverD36.listen(portD36, '127.0.0.1', resolve);
+          serverD36.once('error', reject);
+        } else reject(e);
+      });
+    });
+  });
+
+  after(async () => {
+    stopStdoutCapture();
+    __resetSpawnImpl();
+    codexResetSpawnImpl();
+
+    if (savedAnthropicTokenD36 !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedAnthropicTokenD36;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    if (savedCodexAuthPathD36 !== undefined) {
+      process.env.OPENAI_CODEX_AUTH_PATH = savedCodexAuthPathD36;
+    } else {
+      delete process.env.OPENAI_CODEX_AUTH_PATH;
+    }
+    if (suiteCodexAuthFileD36) {
+      const { unlinkSync } = await import('node:fs');
+      try { unlinkSync(suiteCodexAuthFileD36); } catch { /* ignore */ }
+    }
+
+    if (!serverD36) return;
+    return new Promise(r => serverD36.close(r));
+  });
+
+  it('D36 #2a: markers + non-Anthropic chain → cache_control_partial_noop log fires once', async () => {
+    // Route to openai (gpt-5.5) with cache_control markers present. Per ADR 0005
+    // § Context, the partial-noop log must fire because the chain contains a
+    // non-Anthropic hop and markers are present.
+    codexSetSpawnImpl(makeMockCodexSpawn([
+      JSON.stringify({ content: 'codex-out-d36-2a' }),
+      JSON.stringify({ type: 'stop' }),
+    ]));
+
+    startStdoutCapture();
+    try {
+      const r = await fetch({
+        port: portD36,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'gpt-5.5',
+          messages: [
+            { role: 'user', content: 'hello-d36-2a', cache_control: { type: 'ephemeral' } },
+          ],
+        },
+      });
+      assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+    } finally {
+      stopStdoutCapture();
+    }
+
+    const events = findEvents('cache_control_partial_noop');
+    assert.equal(events.length, 1, `Expected exactly 1 cache_control_partial_noop event, got ${events.length}`);
+    const ev = events[0];
+    assert.equal(ev.level, 'debug', `event level should be 'debug', got '${ev.level}'`);
+    assert.ok(Array.isArray(ev.chain), 'chain must be an array');
+    assert.ok(ev.chain.includes('openai'),
+      `chain should include 'openai', got: ${JSON.stringify(ev.chain)}`);
+    assert.equal(typeof ev.marker_count, 'number', 'marker_count must be a number');
+    assert.ok(ev.marker_count >= 1, `marker_count must be >= 1, got ${ev.marker_count}`);
+  });
+
+  it('D36 #2b: no markers + non-Anthropic chain → cache_control_partial_noop does NOT fire', async () => {
+    codexSetSpawnImpl(makeMockCodexSpawn([
+      JSON.stringify({ content: 'codex-out-d36-2b' }),
+      JSON.stringify({ type: 'stop' }),
+    ]));
+
+    startStdoutCapture();
+    try {
+      const r = await fetch({
+        port: portD36,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'gpt-5.5',
+          messages: [
+            { role: 'user', content: 'hello-d36-2b' }, // no cache_control
+          ],
+        },
+      });
+      assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+    } finally {
+      stopStdoutCapture();
+    }
+
+    const events = findEvents('cache_control_partial_noop');
+    assert.equal(events.length, 0,
+      `Expected 0 cache_control_partial_noop events when no markers; got ${events.length}: ${JSON.stringify(events)}`);
+  });
+
+  it('D36 #2c: markers + anthropic-only chain → cache_control_partial_noop does NOT fire', async () => {
+    // anthropic single-hop chain — every hop is anthropic, so the partial-noop
+    // log must be suppressed. The cache_bypass log (already documented) is the
+    // correct signal for this case, not partial_noop.
+    __setSpawnImpl(makeMockSpawn(['anthropic-out-d36-2c']));
+
+    startStdoutCapture();
+    try {
+      const r = await fetch({
+        port: portD36,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-haiku-4-5',
+          messages: [
+            { role: 'user', content: 'hello-d36-2c', cache_control: { type: 'ephemeral' } },
+          ],
+        },
+      });
+      assert.equal(r.status, 200, `Expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+    } finally {
+      stopStdoutCapture();
+    }
+
+    const events = findEvents('cache_control_partial_noop');
+    assert.equal(events.length, 0,
+      `Expected 0 cache_control_partial_noop events when chain is anthropic-only; got ${events.length}: ${JSON.stringify(events)}`);
   });
 });
 

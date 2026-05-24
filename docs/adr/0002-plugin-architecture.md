@@ -7,6 +7,15 @@
 
 ## Amendments
 
+### Amendment 5 — 2026-05-24: Correct § Decision filesystem layout — `vibe.mjs` → `mistral.mjs` (D36 #5)
+
+- **Finding:** Issue #5 (D36) — § Decision filesystem layout (around line 47 of the original ADR) listed the Mistral provider plugin as `vibe.mjs` (named after the CLI binary `vibe`). The shipped file at `lib/providers/mistral.mjs` (D8) is named after the provider key, matching the established convention from the other two plugins: `anthropic.mjs` (provider key `anthropic`, CLI `claude`) and `codex.mjs` (provider key `openai`, CLI `codex`). The ADR's `vibe.mjs` entry was a drafting-time placeholder that did not get corrected when D8 landed `lib/providers/mistral.mjs`.
+- **Change:** Replace `vibe.mjs # spawn `vibe --prompt --output json`` with `mistral.mjs # spawn `vibe --prompt --output streaming`` in the filesystem layout. The `--output streaming` correction also aligns the example with the actual D8 implementation (`mistral.mjs` line 377 uses `--output streaming`, not `--output json` — see D8 review-2 finding inside the plugin header).
+- **Naming convention reaffirmed:** Provider plugin files are named after the **provider key** (`anthropic`, `openai`, `mistral`), not the CLI binary (`claude`, `codex`, `vibe`). Future provider plugins must follow this convention. The provider key is the load-bearing identifier — it appears in `models-registry.json`, cache keys, fallback chain configs, and ADR 0006 inclusion tables. The CLI binary name is an implementation detail that may change (e.g., a vendor rename) without affecting the rest of the system.
+- **Authority:** Issue #5 (D36); naming convention established by `lib/providers/anthropic.mjs` (D4) and `lib/providers/codex.mjs` (D6) which both shipped before `lib/providers/mistral.mjs` (D8).
+- **No code change:** D36 #5 is a docs-only correction. The plugin file already lives at the correct path.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 10.x (D36 batch — ADR drift caught by issue-triage review of bootstrap ADRs).
+
 ### Amendment 4 — 2026-05-24: Ratify `contractVersion` as a required Provider contract field (D32 F5)
 
 - **Finding:** Round-4 cold-audit F5 (P3 governance omission) — `lib/providers/base.mjs` `validateProvider` enforces `p.contractVersion === '1.0'` and all three shipped plugins declare it, but the Provider contract field list in § Decision (lines ~63-74) does not include `contractVersion`. It was mentioned only in § Mitigations as a forward-looking note ("The contract is versioned. v1.0 is the subset in this ADR; future additions … require ADR amendment plus a contract-version bump. Old provider plugins continue to declare `contractVersion: '1.0'`…"), not as a required field. This is the same class of documentation–implementation gap as Amendment 1 (`maxSpawnTimeMs` retroactive sync).
@@ -60,7 +69,9 @@ lib/providers/
   index.mjs             # static registry (enumeration of in-tree providers)
   anthropic.mjs         # spawn `claude -p` — port of OCP server.mjs spawn logic
   codex.mjs             # spawn `codex exec --json`
-  vibe.mjs              # spawn `vibe --prompt --output json`
+  mistral.mjs           # spawn `vibe --prompt --output streaming` (file named after
+                        # provider key per the convention established by
+                        # anthropic.mjs / codex.mjs — see Amendment 5)
   grok.mjs              # spawn `grok -p --output-format streaming-json` (optional)
   kimi.mjs              # spawn `kimi -p --output-format stream-json` (optional)
   minimax.mjs           # tier-2 optional, default-disabled

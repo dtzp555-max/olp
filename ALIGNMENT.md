@@ -56,7 +56,7 @@ A plugin satisfying all five conditions is a **Speculative-Candidate**. It is Ru
 | Plugin file | Phase | Labelled UNPINNED assumptions |
 |---|---|---|
 | `lib/providers/codex.mjs` (D6) | Phase 2 | A3 (auth token field name), A4 (NDJSON event schema) |
-| `lib/providers/mistral.mjs` (D8) | Phase 3 | A4 (JSON output event schema), A5 (model flag), A6 (exact model IDs), A7 (streaming vs json output mode), A8 (stdin prompt passing) |
+| `lib/providers/mistral.mjs` (D8) | Phase 3 | A4 (JSON output event schema), A6 (exact model IDs), A7 (streaming vs json output mode), A8 (stdin prompt passing) |
 
 The Anthropic plugin (`lib/providers/anthropic.mjs`, D4–D5) is NOT in this class — its CLI authority is pinned (`@anthropic-ai/claude-code` v2.1.89 per the Provider Authority Pins table above). It conforms to the standard Rule 4 path.
 
@@ -76,7 +76,7 @@ Each provider plugin in `lib/providers/<name>.mjs` is governed by the underlying
 
 | Provider key | Provider CLI | Audit pin (TBD on Phase-1 spawn) | Risk Tier (see § Risk Tier Framework) |
 |---|---|---|---|
-| `anthropic` | `claude -p` from `@anthropic-ai/claude-code` | inherits OCP's `cli.js` 2.1.89 audit pin at fork; OLP-side pin: `@anthropic-ai/claude-code` v2.1.89 (observed at D4 — `lib/providers/anthropic.mjs` header). Re-evaluate post-2026-06-15 per One-shot Triggered Audit above. | D (pre-2026-06-15) / re-evaluate post-2026-06-15 |
+| `anthropic` | `claude -p` from `@anthropic-ai/claude-code` | inherits OCP's `cli.js` 2.1.89 audit pin at fork; OLP-side pin: `@anthropic-ai/claude-code` v2.1.89 (observed at D4 — `lib/providers/anthropic.mjs` header); transcript artifact: `docs/provider-audits/anthropic.md` (captured 2026-05-24). Re-evaluate post-2026-06-15 per One-shot Triggered Audit above. | D (pre-2026-06-15) / re-evaluate post-2026-06-15 |
 | `openai` | `codex exec --json` from OpenAI Codex CLI | Codex CLI reference page: https://developers.openai.com/codex/cli/reference (retrieved 2026-05-23 — §§ "codex exec [flags] PROMPT", "--json / --experimental-json", "--model, -m"; D6 WebFetch-verified reachable). Secondary authority: https://developers.openai.com/codex/cli/features §§ "Supported Models", "Automation". | D |
 | `mistral` | `vibe --prompt --output streaming` from Mistral Vibe CLI | Mistral Vibe terminal quickstart: https://docs.mistral.ai/mistral-vibe/terminal/quickstart (retrieved 2026-05-23 — § "--prompt flag triggers programmatic mode; --output selects format (text, json, streaming)"; D8 WebFetch-verified reachable). `--output streaming` selected (not `--output json`) because DOCS-1 § "Output Format Options" explicitly states `json` emits a single blob at the end — incompatible with the line-buffered NDJSON parser in `lib/providers/mistral.mjs`. `streaming` emits newline-delimited JSON per message, which the parser requires. See plugin header (lines 360-369). Configuration authority: https://docs.mistral.ai/mistral-vibe/terminal/configuration (§§ auth file `~/.vibe/.env`, `MISTRAL_API_KEY` env var). | D |
 | `grok` | `grok -p --output-format streaming-json` (xAI Build) | TBD at Phase 8+ enable | C |
@@ -197,6 +197,16 @@ In addition to the recurring 14 May audit below, the following one-shot audits a
 (none at project founding)
 
 Any future Rule 3 deviation lands here as a numbered exception with PR link, reviewer, and rationale.
+
+### Controlled deviations (entry-surface scope)
+
+This subsection enumerates entry-surface behaviours that intentionally extend beyond the OpenAI `/v1/chat/completions` and `/v1/models` specifications. Each entry is a **controlled deviation**: a documented, reviewed extension that ships under Rule 2(b)'s spirit (no invention without an authority) by treating `docs/openai-spec-pin.md` as the formal contract for the deviation. The contract there is binding; this list is the index.
+
+1. **`/v1/models` alias entries** — *Issue #13 (D36)*. The OpenAI `/v1/models` specification (https://platform.openai.com/docs/api-reference/models/list) enumerates one entry per canonical model ID. OLP's `/v1/models` response additionally surfaces alias entries (e.g. `claude`, `sonnet`, `opus`, `haiku` alongside the canonical `claude-opus-4-7` / `claude-sonnet-4-6` / `claude-haiku-4-5`). Alias entries use `id: <alias-string>`, `object: 'model'`, `owned_by: <same provider key as canonical>`, and `created: <same timestamp as canonical target>` per D27 F15.
+   - **Rationale:** D27 F15 — onboarding friction when clients configured with `model: 'sonnet'` (a common alias used by Anthropic's own CLI and many OpenClaw-class tools) received an empty `/v1/models` response that did not surface the alias as a callable model id. Surfacing the alias makes the discovery loop usable for OpenAI-compatible clients with alias-aware UX.
+   - **Formal contract:** `docs/openai-spec-pin.md § GET /v1/models` is the authoritative shape for this deviation. The deviation is bounded by: (a) `owned_by` matches the canonical target's `owned_by`; (b) `created` matches the canonical target's `created`; (c) no fields are invented beyond the four OpenAI-spec entry fields (`id`, `object`, `created`, `owned_by`); (d) alias enumeration is sourced from `models-registry.json` via `getAliasMap()` — the SPOT — not hard-coded in `server.mjs`.
+   - **Compliance posture:** The deviation extends the response listing but does not invent fields or change field semantics. The risk vector is a hypothetical OpenAI-compatible client that asserts "one entry per canonical model" and trips on the extras; this risk is mitigated by the fact that aliases use the same `object: 'model'` shape, and any client iterating `data[]` simply sees more entries — none of which are malformed. No invention beyond what OpenAI's own `id` field already accepts as a free-form string.
+   - **Re-evaluation trigger:** Annual audit (14 May) re-checks whether OpenAI has shipped a formal alias-listing extension to `/v1/models` (in which case OLP migrates to it), or whether the deviation should be retired (in which case clients with alias-aware UX must migrate to the canonical IDs via the alias table).
 
 ---
 

@@ -36,6 +36,44 @@ jobs:
           fi
           echo "Tag v${TAG_VERSION} matches package.json version ${PKG_VERSION}."
 
+      - name: Enforce phase_rolling_mode (Unreleased must be promoted)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::warning::CHANGELOG.md not found; skipping phase_rolling_mode gate."
+            exit 0
+          fi
+          # Per CLAUDE.md release_kit.phase_rolling_mode: a Phase-close PR must
+          # promote "## Unreleased" → "## v<version>" before the tag is pushed.
+          # This gate catches the failure mode where someone tags without
+          # promoting — release.yml would otherwise extract a stale
+          # "## v<version>" section and ignore D-day work folded into Unreleased.
+          #
+          # An "Unreleased" section is considered trivial (acceptable) when its
+          # body is empty or contains only blank lines and parenthetical sentinels
+          # like "(empty — Phase N entries land here once Phase N opens)". Any
+          # other line (bullet, paragraph, sub-heading) is treated as unpromoted
+          # content → the gate fires.
+          UNRELEASED_BODY="$(awk '
+            /^## Unreleased$/ { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)"
+          if [ -z "$UNRELEASED_BODY" ]; then
+            echo "No ## Unreleased section found — gate passes."
+            exit 0
+          fi
+          # Strip blank lines and parenthetical-sentinel-only lines.
+          NON_TRIVIAL="$(printf '%s\n' "$UNRELEASED_BODY" \
+            | sed -E '/^[[:space:]]*$/d; /^[[:space:]]*\(.*\)[[:space:]]*$/d')"
+          if [ -n "$NON_TRIVIAL" ]; then
+            echo "::error::CHANGELOG.md ## Unreleased section is non-trivial but tag v${{ steps.ver.outputs.version }} was pushed. Per CLAUDE.md release_kit.phase_rolling_mode, promote Unreleased → ## v<version> before tagging. Offending content:"
+            printf '%s\n' "$NON_TRIVIAL" | sed 's/^/    /'
+            exit 1
+          fi
+          echo "## Unreleased section is empty or sentinel-only — gate passes."
+
       - name: Extract CHANGELOG section
         id: notes
         shell: bash

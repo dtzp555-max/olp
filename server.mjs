@@ -29,7 +29,16 @@ import {
   generateRequestId,
   SSE_DONE,
 } from './lib/ir/ir-to-openai.mjs';
-import { loadProviders, listAllProviderNames, getAliasMap, getModelCreated } from './lib/providers/index.mjs';
+import {
+  loadProviders,
+  listAllProviderNames,
+  getAliasMap,
+  getModelCreated,
+  tryAcquireSpawn,
+  releaseSpawn,
+  getActiveSpawnCount,
+  DEFAULT_MAX_CONCURRENT_SPAWNS,
+} from './lib/providers/index.mjs';
 import { ProviderError } from './lib/providers/base.mjs';
 import { computeCacheKey, hasCacheControl, extractCacheControlMarkers } from './lib/cache/keys.mjs';
 import { CacheStore } from './lib/cache/store.mjs';
@@ -503,43 +512,80 @@ async function handleChatCompletions(req, res) {
     // conditions item 1 requires no truncation). A non-enumerable __truncated marker
     // is set on the returned array so executeHopFn can evict the cache entry below.
     async function collectAllChunks() {
-      const chunks = [];
-      try {
-        for await (const irChunk of hopProviderPlugin.spawn(irReq, authContext)) {
-          // D16: check error chunks BEFORE pushing — preserves the invariant that
-          // chunks array contains only delta/stop chunks. Without this, the catch
-          // block's `chunks.length > 0` would mistake a single error chunk for
-          // "usable content streamed" (Case B) and synthesize a stop + return,
-          // sending an empty body to the client when the correct behavior is to
-          // re-throw and let the fallback engine advance the chain.
-          if (irChunk.type === 'error') {
-            throw new ProviderError(
-              irChunk.error ?? 'Provider emitted error chunk',
-              'SPAWN_FAILED',
-            );
-          }
-          chunks.push(irChunk);
-          if (irChunk.type === 'stop') break;
-        }
-      } catch (spawnErr) {
-        if (spawnErr instanceof ProviderError && spawnErr.code === 'SPAWN_FAILED' && chunks.length > 0) {
-          // Case B (ADR 0004 Amendment 1): provider emitted usable chunks then exited
-          // non-zero. Synthesize a truncated stop and surface the partial response.
-          chunks.push({ type: 'stop', finish_reason: 'length' });
-          logEvent('warn', 'spawn_failed_after_usable_chunks', {
-            chunks_count: chunks.length - 1, // exclude the synthesized stop
-            provider: hopProvider,
-            model: hopModel,
-          });
-          // Mark as truncated so the caller can evict this entry from cache.
-          Object.defineProperty(chunks, '__truncated', { value: true, enumerable: false });
-          return chunks;
-        }
-        // Case A (SPAWN_FAILED with no chunks) or any other error: re-throw.
-        // Fallback engine fires hard trigger and advances chain as before.
-        throw spawnErr;
+      // D38 (issue #1): maxConcurrent runtime enforcement.
+      // Authority: ADR 0002 Amendment 6 + ADR 0004 Amendment 4.
+      //
+      // Try to acquire a spawn slot for this provider BEFORE invoking spawn().
+      // If at limit, synthesise ProviderError(CONCURRENCY_LIMIT) which the
+      // fallback engine treats as a hard trigger — the chain advances to the
+      // next hop. validateProvider guarantees hints.maxConcurrent is present;
+      // DEFAULT_MAX_CONCURRENT_SPAWNS is a defense-in-depth fallback.
+      const maxConcurrent = hopProviderPlugin.hints?.maxConcurrent ?? DEFAULT_MAX_CONCURRENT_SPAWNS;
+      if (!tryAcquireSpawn(hopProvider, maxConcurrent)) {
+        const concurrencyErr = new ProviderError(
+          `provider ${hopProvider} at maxConcurrent (${maxConcurrent}) — advancing to next hop`,
+          'CONCURRENCY_LIMIT',
+        );
+        concurrencyErr.providerName = hopProvider;
+        concurrencyErr.maxConcurrent = maxConcurrent;
+        // activeSpawns reflects the live counter at the rejection moment,
+        // queried directly. Since tryAcquireSpawn returned false the value
+        // equals maxConcurrent — read it explicitly for diagnostic clarity
+        // rather than echoing the limit (avoids future-reader confusion).
+        concurrencyErr.activeSpawns = getActiveSpawnCount(hopProvider);
+        throw concurrencyErr;
       }
-      return chunks;
+
+      const chunks = [];
+      // try/finally: releaseSpawn MUST fire on every exit path — success
+      // (return at end), spawn throw (caught and re-thrown below), or the
+      // D16 truncation-salvage return. The finally is the only mechanism
+      // that guarantees release across all three.
+      try {
+        try {
+          for await (const irChunk of hopProviderPlugin.spawn(irReq, authContext)) {
+            // D16: check error chunks BEFORE pushing — preserves the invariant that
+            // chunks array contains only delta/stop chunks. Without this, the catch
+            // block's `chunks.length > 0` would mistake a single error chunk for
+            // "usable content streamed" (Case B) and synthesize a stop + return,
+            // sending an empty body to the client when the correct behavior is to
+            // re-throw and let the fallback engine advance the chain.
+            if (irChunk.type === 'error') {
+              throw new ProviderError(
+                irChunk.error ?? 'Provider emitted error chunk',
+                'SPAWN_FAILED',
+              );
+            }
+            chunks.push(irChunk);
+            if (irChunk.type === 'stop') break;
+          }
+        } catch (spawnErr) {
+          if (spawnErr instanceof ProviderError && spawnErr.code === 'SPAWN_FAILED' && chunks.length > 0) {
+            // Case B (ADR 0004 Amendment 1): provider emitted usable chunks then exited
+            // non-zero. Synthesize a truncated stop and surface the partial response.
+            chunks.push({ type: 'stop', finish_reason: 'length' });
+            logEvent('warn', 'spawn_failed_after_usable_chunks', {
+              chunks_count: chunks.length - 1, // exclude the synthesized stop
+              provider: hopProvider,
+              model: hopModel,
+            });
+            // Mark as truncated so the caller can evict this entry from cache.
+            Object.defineProperty(chunks, '__truncated', { value: true, enumerable: false });
+            return chunks;
+          }
+          // Case A (SPAWN_FAILED with no chunks) or any other error: re-throw.
+          // Fallback engine fires hard trigger and advances chain as before.
+          throw spawnErr;
+        }
+        return chunks;
+      } finally {
+        // D38: spawn lifecycle ended (drain completed, stop chunk received,
+        // SPAWN_FAILED salvage returned, or any unexpected throw). Release
+        // the slot so the next caller can acquire it. Single-threaded JS
+        // guarantees no other caller has incremented this provider's count
+        // between our tryAcquireSpawn() above and this releaseSpawn().
+        releaseSpawn(hopProvider);
+      }
     }
 
     // D23: cacheable opt-out check (ADR 0002 Amendment 3 + ADR 0005 Amendment 3).
@@ -626,7 +672,24 @@ async function handleChatCompletions(req, res) {
   //
   // On success: write chunks to res AND cache so subsequent identical requests
   // hit the burst-replay path.
+  // D38 (issue #1): pre-acquire a concurrency slot for the streaming path so
+  // saturation here behaves identically to saturation on the buffered path.
+  // If acquire fails, fall through (skip this branch) — the buffered path
+  // below also gates via tryAcquireSpawn and will surface a chain-exhausted
+  // error through executeWithFallback (correct behaviour: a single-hop chain
+  // at maxConcurrent has no other hop to advance to).
+  //
+  // Acquired here, released in the `finally` below. The gate intentionally
+  // lives BEFORE the streaming-branch entry check so the buffered fallthrough
+  // can re-attempt acquire from a clean slate.
+  let streamingAcquired = false;
   if (ir.stream && chain.length === 1 && !bypassCacheForFirstHop && !preCheckHit && cacheableForFirstHop) {
+    const candidatePlugin = loadedProviders.get(chain[0].provider);
+    const candidateMax = candidatePlugin?.hints?.maxConcurrent ?? DEFAULT_MAX_CONCURRENT_SPAWNS;
+    streamingAcquired = candidatePlugin ? tryAcquireSpawn(chain[0].provider, candidateMax) : false;
+  }
+
+  if (ir.stream && chain.length === 1 && !bypassCacheForFirstHop && !preCheckHit && cacheableForFirstHop && streamingAcquired) {
     const streamProvider = chain[0].provider;
     const streamModel = chain[0].model;
     const streamCacheKey = computeCacheKey(streamProvider, streamModel, ir);
@@ -634,6 +697,8 @@ async function handleChatCompletions(req, res) {
 
     if (!streamPlugin) {
       // Provider disappeared between chain build and here (edge case).
+      // Release the slot we acquired above so the counter stays balanced.
+      releaseSpawn(streamProvider);
       return sendError(res, 503, `Provider ${streamProvider} is not enabled`, 'no_enabled_provider',
         olpErrorHeaders({ startMs, model: ir.model }));
     }
@@ -783,6 +848,13 @@ async function handleChatCompletions(req, res) {
           res.end();
         }
       }
+    } finally {
+      // D38 (issue #1): streaming spawn lifecycle ended — drain completed,
+      // stop chunk seen, generator exhausted without stop, or any catch
+      // path returned via res.end(). Release the slot acquired before
+      // entering the streaming branch. The finally fires on every JS exit
+      // path including the `return;` statements inside the try/catch body.
+      releaseSpawn(streamProvider);
     }
     return;
   }

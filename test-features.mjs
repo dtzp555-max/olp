@@ -28,7 +28,20 @@ import {
   SSE_DONE,
 } from './lib/ir/ir-to-openai.mjs';
 import { validateProvider, ProviderError, withTimeout } from './lib/providers/base.mjs';
-import { loadProviders, getProviderForModel, getProviderByName, listAllProviderNames, getAliasMap, getModelCreated, REGISTRY_BOOTSTRAP_CREATED } from './lib/providers/index.mjs';
+import {
+  loadProviders,
+  getProviderForModel,
+  getProviderByName,
+  listAllProviderNames,
+  getAliasMap,
+  getModelCreated,
+  REGISTRY_BOOTSTRAP_CREATED,
+  tryAcquireSpawn,
+  releaseSpawn,
+  getActiveSpawnCount,
+  __resetSpawnCounters,
+  DEFAULT_MAX_CONCURRENT_SPAWNS,
+} from './lib/providers/index.mjs';
 import anthropic, {
   irToAnthropic,
   anthropicChunkToIR,
@@ -8345,5 +8358,483 @@ describe('D33 round-5 cold-audit cleanup', () => {
   });
 
 });
+
+});
+
+// ── Suite 18: D38 — maxConcurrent runtime enforcement (issue #1) ──────────
+//
+// Authority:
+//   - ADR 0002 Amendment 6 (D38): maxConcurrent runtime enforcement landed.
+//   - ADR 0004 Amendment 4 (D38): CONCURRENCY_LIMIT added to hard-trigger taxonomy.
+//   - GitHub issue #1 (maxConcurrent: declarative-only at v0.1).
+//
+// Tests:
+//   18a: CONCURRENCY_LIMIT is in PROVIDER_ERROR_CODES.
+//   18b: CONCURRENCY_LIMIT is a hard trigger (evaluateHardTriggers true).
+//   18c: classifyTrigger returns 'hard' for CONCURRENCY_LIMIT.
+//   18d: tryAcquireSpawn / releaseSpawn / getActiveSpawnCount unit behaviour.
+//   18e: tryAcquireSpawn returns false at the limit.
+//   18f: releaseSpawn throws when called without a matching acquire.
+//   18g: DEFAULT_MAX_CONCURRENT_SPAWNS applies when maxConcurrent omitted.
+//   18h: __resetSpawnCounters clears all in-flight counts.
+//   18i: HTTP — 5 concurrent buffered requests against a maxConcurrent:2 mock →
+//        peak in-flight == 2; requests 3-5 hit chain-exhausted error.
+//   18j: HTTP — counter releases after request completes (single-hop, sequential).
+//   18k: Fallback — saturated primary (maxConcurrent:1) → secondary serves the 2nd.
+//   18l: HTTP streaming — counter releases at end of stream, not at start.
+
+describe('D38 — maxConcurrent runtime enforcement (Suite 18)', () => {
+
+  // ── 18a: PROVIDER_ERROR_CODES contains CONCURRENCY_LIMIT ──────────────────
+
+  it('18a: CONCURRENCY_LIMIT is in PROVIDER_ERROR_CODES', () => {
+    assert.ok(
+      PROVIDER_ERROR_CODES.includes('CONCURRENCY_LIMIT'),
+      'CONCURRENCY_LIMIT must be in PROVIDER_ERROR_CODES per ADR 0004 Amendment 4',
+    );
+  });
+
+  // ── 18b: CONCURRENCY_LIMIT triggers hard fallback ─────────────────────────
+
+  it('18b: evaluateHardTriggers(ProviderError CONCURRENCY_LIMIT) → true', () => {
+    const err = new ProviderError('provider stub at maxConcurrent (2)', 'CONCURRENCY_LIMIT');
+    assert.equal(
+      evaluateHardTriggers(err), true,
+      'CONCURRENCY_LIMIT must be classified as a hard trigger',
+    );
+  });
+
+  // ── 18c: AUTH_MISSING regression guard ───────────────────────────────────
+  // CONCURRENCY_LIMIT hard-trigger classification is covered by 18b;
+  // 18c guards that D38 did NOT accidentally flip AUTH_MISSING (a soft signal
+  // for v0.1 — see ADR 0004 Amendment 2) to hard alongside CONCURRENCY_LIMIT.
+
+  it('18c: evaluateHardTriggers still false for AUTH_MISSING (regression guard)', () => {
+    // Regression guard: D38 didn't accidentally flip AUTH_MISSING to a hard trigger.
+    const err = new ProviderError('auth missing', 'AUTH_MISSING');
+    assert.equal(evaluateHardTriggers(err), false);
+  });
+
+  // ── 18d: semaphore unit tests ─────────────────────────────────────────────
+
+  describe('18d — tryAcquireSpawn / releaseSpawn / getActiveSpawnCount unit', () => {
+
+    // Use a unique provider name to avoid colliding with other tests' state.
+    // __resetSpawnCounters() runs after each unit test to keep them isolated.
+
+    it('18d.1: tryAcquireSpawn increments count from 0 → 1', () => {
+      __resetSpawnCounters();
+      assert.equal(getActiveSpawnCount('unit-d1'), 0);
+      const ok = tryAcquireSpawn('unit-d1', 4);
+      assert.equal(ok, true, 'first acquire should succeed');
+      assert.equal(getActiveSpawnCount('unit-d1'), 1);
+      __resetSpawnCounters();
+    });
+
+    it('18d.2: releaseSpawn decrements count back to 0', () => {
+      __resetSpawnCounters();
+      tryAcquireSpawn('unit-d2', 4);
+      assert.equal(getActiveSpawnCount('unit-d2'), 1);
+      releaseSpawn('unit-d2');
+      assert.equal(getActiveSpawnCount('unit-d2'), 0);
+      __resetSpawnCounters();
+    });
+
+    it('18d.3: each provider has independent counters', () => {
+      __resetSpawnCounters();
+      tryAcquireSpawn('unit-d3-a', 4);
+      tryAcquireSpawn('unit-d3-a', 4);
+      tryAcquireSpawn('unit-d3-b', 4);
+      assert.equal(getActiveSpawnCount('unit-d3-a'), 2);
+      assert.equal(getActiveSpawnCount('unit-d3-b'), 1);
+      __resetSpawnCounters();
+    });
+
+    it('18d.4: counter is removed from map when it reaches 0', () => {
+      __resetSpawnCounters();
+      tryAcquireSpawn('unit-d4', 4);
+      releaseSpawn('unit-d4');
+      // After release-to-zero, getActiveSpawnCount still returns 0 (Map.delete'd).
+      assert.equal(getActiveSpawnCount('unit-d4'), 0);
+      __resetSpawnCounters();
+    });
+  });
+
+  // ── 18e: tryAcquireSpawn returns false at the limit ───────────────────────
+
+  it('18e: tryAcquireSpawn returns false when count == maxConcurrent', () => {
+    __resetSpawnCounters();
+    assert.equal(tryAcquireSpawn('unit-e', 2), true);
+    assert.equal(tryAcquireSpawn('unit-e', 2), true);
+    // At the limit now — third acquire must fail without incrementing.
+    assert.equal(tryAcquireSpawn('unit-e', 2), false,
+      'acquire must fail when current count equals limit');
+    // Counter must not have incremented on the failed acquire.
+    assert.equal(getActiveSpawnCount('unit-e'), 2,
+      'failed acquire must not increment the counter');
+    __resetSpawnCounters();
+  });
+
+  // ── 18f: releaseSpawn without acquire throws ──────────────────────────────
+
+  it('18f: releaseSpawn without matching acquire throws', () => {
+    __resetSpawnCounters();
+    assert.throws(
+      () => releaseSpawn('unit-f-never-acquired'),
+      /releaseSpawn.*counter would go negative/,
+      'release without acquire must throw to surface the bug loudly',
+    );
+    __resetSpawnCounters();
+  });
+
+  // ── 18g: DEFAULT_MAX_CONCURRENT_SPAWNS fallback ───────────────────────────
+
+  it('18g: DEFAULT_MAX_CONCURRENT_SPAWNS applies when maxConcurrent argument omitted', () => {
+    __resetSpawnCounters();
+    assert.ok(Number.isInteger(DEFAULT_MAX_CONCURRENT_SPAWNS) && DEFAULT_MAX_CONCURRENT_SPAWNS > 0,
+      'DEFAULT_MAX_CONCURRENT_SPAWNS must be a positive integer');
+    // Acquire up to the default limit without arg — all should succeed.
+    for (let i = 0; i < DEFAULT_MAX_CONCURRENT_SPAWNS; i++) {
+      assert.equal(tryAcquireSpawn('unit-g'), true, `acquire #${i + 1} should succeed`);
+    }
+    // Next acquire (still no arg) should fail at the default boundary.
+    assert.equal(tryAcquireSpawn('unit-g'), false,
+      `acquire #${DEFAULT_MAX_CONCURRENT_SPAWNS + 1} should fail at default limit`);
+    __resetSpawnCounters();
+  });
+
+  it('18g.2: non-integer maxConcurrent coerces to DEFAULT_MAX_CONCURRENT_SPAWNS', () => {
+    __resetSpawnCounters();
+    // Defensive coercion: a plugin path that bypasses validateProvider could
+    // produce undefined/null/NaN. The gate must not blow up; it must use the default.
+    assert.equal(tryAcquireSpawn('unit-g2', undefined), true);
+    assert.equal(tryAcquireSpawn('unit-g2', null), true);
+    assert.equal(tryAcquireSpawn('unit-g2', NaN), true);
+    assert.equal(tryAcquireSpawn('unit-g2', 'four'), true);
+    // After 4 acquires (matching default), 5th should fail.
+    assert.equal(getActiveSpawnCount('unit-g2'), 4);
+    assert.equal(tryAcquireSpawn('unit-g2', undefined), false);
+    __resetSpawnCounters();
+  });
+
+  // ── 18h: __resetSpawnCounters clears state ────────────────────────────────
+
+  it('18h: __resetSpawnCounters clears all in-flight counts', () => {
+    tryAcquireSpawn('unit-h-1', 4);
+    tryAcquireSpawn('unit-h-2', 4);
+    assert.equal(getActiveSpawnCount('unit-h-1'), 1);
+    assert.equal(getActiveSpawnCount('unit-h-2'), 1);
+    __resetSpawnCounters();
+    assert.equal(getActiveSpawnCount('unit-h-1'), 0);
+    assert.equal(getActiveSpawnCount('unit-h-2'), 0);
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // HTTP integration tests
+  // ────────────────────────────────────────────────────────────────────────────
+  //
+  // Strategy: install a controllable mock spawn on the anthropic plugin that
+  // exposes a Promise-based "release gate" — the mock yields no data until
+  // the test explicitly resolves the gate. This lets us hold multiple spawns
+  // in-flight at the same time deterministically (no timing races).
+  //
+  // For the maxConcurrent:N tests we override anthropic.hints.maxConcurrent
+  // for the duration of the test, then restore. ProviderError synthesised by
+  // the gate carries CONCURRENCY_LIMIT and the fallback engine treats it as
+  // a hard trigger. With a single-hop chain the chain exhausts and the
+  // client receives a 502/non-200.
+
+  describe('18 HTTP integration', () => {
+    let server18;
+    let port18;
+    let savedToken18;
+    let savedMaxConcurrent;
+
+    before(async () => {
+      savedToken18 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-suite-18';
+      __setProvidersEnabled({ anthropic: true });
+      __resetSpawnCounters();
+
+      const { createOlpServer: s18, __clearCache: cc18 } = await import('./server.mjs');
+      cc18();
+      server18 = s18();
+      await new Promise((resolve, reject) => {
+        server18.listen(0, '127.0.0.1', resolve);
+        server18.once('error', reject);
+      });
+      port18 = server18.address().port;
+    });
+
+    after(async () => {
+      __resetProvidersEnabled();
+      __resetSpawnImpl();
+      __resetSpawnCounters();
+      if (savedToken18 !== undefined) {
+        process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken18;
+      } else {
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      }
+      if (!server18) return;
+      return new Promise(r => server18.close(r));
+    });
+
+    /**
+     * Makes a controllable mock spawn that completes only when the given
+     * gate Promise resolves. Records peak in-flight via `peakRef`.
+     */
+    function makeGatedMockSpawn(gatePromise, content, peakRef, activeRef) {
+      return function gatedSpawn(_bin, _args, _opts) {
+        const proc = new EventEmitter();
+        proc.stdout = new EventEmitter();
+        proc.stderr = new EventEmitter();
+        proc.stdin = {
+          write: () => {},
+          end: async () => {
+            // Track this spawn as in-flight from the moment stdin closes.
+            activeRef.count++;
+            if (activeRef.count > peakRef.peak) peakRef.peak = activeRef.count;
+            // Wait for the gate to resolve before emitting any data.
+            await gatePromise;
+            // Decrement on exit.
+            setImmediate(() => {
+              proc.stdout.emit('data', Buffer.from(content));
+              proc.stdout.emit('end');
+              proc.stderr.emit('end');
+              proc.emit('close', 0, null);
+              activeRef.count--;
+            });
+          },
+        };
+        proc.killed = false;
+        proc.kill = () => {};
+        return proc;
+      };
+    }
+
+    // ── 18i: 5 concurrent requests, maxConcurrent:2 ────────────────────────
+
+    it('18i: 5 concurrent buffered requests with maxConcurrent:2 → peak in-flight == 2', async () => {
+      // Override anthropic's maxConcurrent for this test.
+      savedMaxConcurrent = anthropic.hints.maxConcurrent;
+      anthropic.hints.maxConcurrent = 2;
+
+      const { __clearCache: cc18i } = await import('./server.mjs');
+      cc18i();
+
+      // Gate that we'll resolve to let mock spawns complete.
+      let releaseGate;
+      const gatePromise = new Promise(resolve => { releaseGate = resolve; });
+      const peakRef = { peak: 0 };
+      const activeRef = { count: 0 };
+      __setSpawnImpl(makeGatedMockSpawn(gatePromise, 'concurrency-test-response', peakRef, activeRef));
+
+      try {
+        // Fire 5 concurrent buffered requests with DIFFERENT message content
+        // so cache lookups don't collapse them.
+        const reqs = [];
+        for (let i = 0; i < 5; i++) {
+          reqs.push(fetch({
+            port: port18,
+            method: 'POST',
+            path: '/v1/chat/completions',
+            body: {
+              model: 'claude-sonnet-4-6',
+              messages: [{ role: 'user', content: `concurrency-test-msg-${i}-${Date.now()}` }],
+            },
+          }));
+        }
+
+        // Give the server a moment to receive all requests and attempt acquires
+        // (the requests that succeed acquire will wait on gatePromise; the
+        // ones that fail acquire will return immediately with an error).
+        // The wait must be long enough for all 5 to either enter the spawn or
+        // be rejected by the gate, but short enough to keep the test fast.
+        await new Promise(r => setTimeout(r, 100));
+
+        // Peak in-flight count must equal exactly 2 (== maxConcurrent).
+        assert.equal(peakRef.peak, 2,
+          `peak in-flight must be exactly 2 (== maxConcurrent), observed ${peakRef.peak}`);
+        // Also assert via the exported getActiveSpawnCount helper (covers a
+        // different path — the module-level _activeSpawns map vs the mock-side
+        // counter). Both must agree.
+        assert.equal(getActiveSpawnCount('anthropic'), 2,
+          'module-level active-spawn counter must report 2 in-flight');
+
+        // Release the gate so the 2 in-flight spawns can complete.
+        releaseGate();
+
+        // Wait for all 5 requests to settle.
+        const results = await Promise.all(reqs);
+
+        // 2 successes (requests that acquired), 3 errors (CONCURRENCY_LIMIT).
+        const successes = results.filter(r => r.status === 200);
+        const failures = results.filter(r => r.status !== 200);
+        assert.equal(successes.length, 2,
+          `expected exactly 2 successful responses, got ${successes.length} (statuses: ${results.map(r => r.status).join(', ')})`);
+        assert.equal(failures.length, 3,
+          `expected exactly 3 failed responses (chain-exhausted on CONCURRENCY_LIMIT), got ${failures.length}`);
+      } finally {
+        // Restore original maxConcurrent.
+        anthropic.hints.maxConcurrent = savedMaxConcurrent;
+        __resetSpawnImpl();
+        __resetSpawnCounters();
+      }
+    });
+
+    // ── 18j: counter releases after request completes ─────────────────────
+
+    it('18j: counter releases to 0 after buffered request completes', async () => {
+      savedMaxConcurrent = anthropic.hints.maxConcurrent;
+      anthropic.hints.maxConcurrent = 2;
+      const { __clearCache: cc18j } = await import('./server.mjs');
+      cc18j();
+
+      // Plain mock that completes immediately.
+      __setSpawnImpl(makeMockSpawn(['release-test-response']));
+
+      try {
+        // Fire request 1 and wait for completion.
+        const r1 = await fetch({
+          port: port18,
+          method: 'POST',
+          path: '/v1/chat/completions',
+          body: {
+            model: 'claude-sonnet-4-6',
+            messages: [{ role: 'user', content: `release-test-msg-1-${Date.now()}` }],
+          },
+        });
+        assert.equal(r1.status, 200);
+        // Counter must be back to 0 after the request completes.
+        assert.equal(getActiveSpawnCount('anthropic'), 0,
+          'counter must release to 0 after request completes');
+
+        // Fire request 2 (different content for cache miss) — must also succeed,
+        // proving the slot is reusable.
+        const r2 = await fetch({
+          port: port18,
+          method: 'POST',
+          path: '/v1/chat/completions',
+          body: {
+            model: 'claude-sonnet-4-6',
+            messages: [{ role: 'user', content: `release-test-msg-2-${Date.now()}` }],
+          },
+        });
+        assert.equal(r2.status, 200);
+        assert.equal(getActiveSpawnCount('anthropic'), 0,
+          'counter must release after second request too');
+      } finally {
+        anthropic.hints.maxConcurrent = savedMaxConcurrent;
+        __resetSpawnImpl();
+        __resetSpawnCounters();
+      }
+    });
+
+    // ── 18l: streaming counter release ────────────────────────────────────
+
+    it('18l: streaming request — counter releases at end of stream', async () => {
+      savedMaxConcurrent = anthropic.hints.maxConcurrent;
+      anthropic.hints.maxConcurrent = 2;
+      const { __clearCache: cc18l } = await import('./server.mjs');
+      cc18l();
+
+      __setSpawnImpl(makeMockSpawn(['stream-release-content']));
+
+      try {
+        // Make a streaming request and consume the full stream.
+        const port = port18;
+        const body = await new Promise((resolve, reject) => {
+          const req = httpRequest({
+            hostname: '127.0.0.1',
+            port,
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: { 'Content-Type': 'application/json' },
+          }, res => {
+            let data = '';
+            res.on('data', c => { data += c; });
+            res.on('end', () => resolve(data));
+            res.on('error', reject);
+          });
+          req.on('error', reject);
+          req.write(JSON.stringify({
+            model: 'claude-sonnet-4-6',
+            messages: [{ role: 'user', content: `stream-release-${Date.now()}` }],
+            stream: true,
+          }));
+          req.end();
+        });
+        assert.ok(body.includes('data:'), 'streaming body must contain SSE data lines');
+
+        // After the stream completes (res.on('end') resolved), the counter must
+        // be back to 0. Tests the streaming-branch finally{} fired.
+        assert.equal(getActiveSpawnCount('anthropic'), 0,
+          'counter must release after streaming response completes');
+      } finally {
+        anthropic.hints.maxConcurrent = savedMaxConcurrent;
+        __resetSpawnImpl();
+        __resetSpawnCounters();
+      }
+    });
+  });
+
+  // ── 18k: fallback test — saturated primary advances to secondary ──────────
+  //
+  // Uses a 2-hop chain executed via executeWithFallback (unit-level, not HTTP).
+  // Primary has maxConcurrent:1 and is already saturated by a synthetic
+  // pre-acquire; second request must advance to the fallback hop.
+
+  describe('18k — fallback advances on saturation', () => {
+    after(() => __resetSpawnCounters());
+
+    it('18k: saturated primary (maxConcurrent:1) → fallback hop serves the request', async () => {
+      // Pre-saturate the 'anthropic' counter (1/1) so the next acquire fails.
+      __resetSpawnCounters();
+      tryAcquireSpawn('anthropic', 1);
+      assert.equal(getActiveSpawnCount('anthropic'), 1);
+
+      // Build a 2-hop chain: anthropic (saturated) → openai (will serve).
+      // executeHopFn for this test calls tryAcquireSpawn itself, mirroring
+      // the production gate semantics. On failure: throws ProviderError
+      // CONCURRENCY_LIMIT; fallback engine advances to next hop.
+      const chain = [
+        { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+        { provider: 'openai', model: 'gpt-5.5' },
+      ];
+      const ir = makeIR({ model: 'claude-sonnet-4-6', stream: false });
+
+      async function testHopFn(hopProvider, hopModel, _ir) {
+        const max = hopProvider === 'anthropic' ? 1 : 4;
+        if (!tryAcquireSpawn(hopProvider, max)) {
+          const err = new ProviderError(
+            `provider ${hopProvider} at maxConcurrent (${max})`,
+            'CONCURRENCY_LIMIT',
+          );
+          err.providerName = hopProvider;
+          err.maxConcurrent = max;
+          err.activeSpawns = max;
+          throw err;
+        }
+        try {
+          // Yield a single stop chunk so the hop "succeeds".
+          return [{ type: 'delta', content: `served-by-${hopProvider}` }, { type: 'stop', finish_reason: 'stop' }];
+        } finally {
+          releaseSpawn(hopProvider);
+        }
+      }
+
+      const result = await executeWithFallback(chain, ir, testHopFn, { logEvent: () => {} });
+      assert.ok(result.chunks !== null, 'fallback should have produced chunks');
+      assert.equal(result.fallbackHops, 1, 'must have advanced to second hop');
+      assert.equal(result.providerUsed, 'openai',
+        'secondary (openai) must serve when primary (anthropic) is saturated');
+      const content = result.chunks.filter(c => c.type === 'delta').map(c => c.content).join('');
+      assert.ok(content.includes('served-by-openai'), 'content must come from fallback hop');
+
+      // Cleanup: release the synthetic pre-saturation slot.
+      releaseSpawn('anthropic');
+      assert.equal(getActiveSpawnCount('anthropic'), 0);
+    });
+  });
 
 });

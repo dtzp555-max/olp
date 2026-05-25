@@ -4,7 +4,25 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-(empty — Phase 3 entries land here once Phase 3 opens)
+### D48 — ADR 0008 Phase 3 design draft (Dashboard + audit query layer)
+
+First Phase 3 D-day. Design-only. Ratifies the storage / query model / rotation / dashboard / refresh / scope decisions ahead of D49+ implementation D-days. Opens ADR 0007 § 12 deferral for Dashboard + audit query layer + rotation.
+
+- **New file `docs/adr/0008-dashboard-and-audit-query.md`** (~390 lines): 13 sections + Consequences + Authority citations. Decisions per maintainer-pinned lanes:
+  - Lane 1 (tech stack): static HTML + vanilla JS + fetch (no build step; matches OLP "no bundler" ethos)
+  - Lane 2 (query model): in-memory scan of audit ndjson per request (defers SQLite hybrid per ADR 0007 § 13)
+  - Lane 3 (rotation): daily rotation, `audit-YYYY-MM-DD.ndjson` on first append after UTC midnight + optional `bin/olp-audit-rotate.mjs` external cron
+  - Lane 4 (refresh): 30s page poll (no SSE infra at v0.3.0)
+  - Lane 5 (dashboard scope): full per spec § 4.6 — 4 panels (quota / per-provider 24h counts / 30d spend trend / top fallback chains)
+- **`docs/adr/README.md` index**: added ADR 0008 row with one-paragraph summary.
+- **CHANGELOG.md** Unreleased: this entry.
+- **Phase 3 sprint shape:** D49 `lib/audit-query.mjs` + Suite 23 → D50 `/v0/management/*` endpoints + Suite 24 → D51 `dashboard.html` → D52 daily audit rotation + Suite 25 → D53 `tried_providers` schema fix (D45 P2 deferral) → D54 E2E + docs → D55 Phase 3 close → v0.3.0 (maintainer-triggered).
+- **Fold-in (fresh-context opus reviewer findings — 1 P2 + 2 P3, all ADR-text polish):**
+  - **P2 § 8 + § 10 #9 gating-mode wording** — original § 8 implied a new "block non-owner identities" behaviour without naming it; § 10 #9 tested only the universal `allow_anonymous: false` 401 case. Fix: § 8 now formalizes two gating modes — `owner_only_trim` (Phase 2 /health pattern) vs `owner_only_block` (new Phase 3 management-endpoints pattern) — and explains the management endpoints are `owner_only_block` because the entire payload is sensitive. § 10 #9 now covers both 401 paths (with `allow_anonymous: true` + no header → anonymous identity → still 401 because management endpoints are `owner_only_block`; AND with `allow_anonymous: false` + no header → 401 at the authenticate middleware itself).
+  - **P3 `/cache/stats` citation accuracy** — original § 7.4 + Authority block cited "ADR 0005 § Cache stats" which is not a real section. Corrected: planning authority is OLP v0.1 spec § 4.6; ADR 0005 references the endpoint in `Consequences/Mitigations` (~line 279) for the per-`(provider, model)` cache-hit-rate breakdown surface.
+  - **P3 `cacheStore.stats()` shape gap** — § 7.4 now explicitly acknowledges the current shape (`{ hits, misses, size, inflightCount }` global aggregate) lacks the per-`(provider, model)` breakdown spec § 4.6 implies; Phase 3 Panel 2 sources per-provider counts from `aggregateRequests` (audit-side) instead. If a future panel needs the breakdown, D50 amends the store shape + an ADR 0005 amendment fires at that time. Phase 3 acceptance criteria do not require the breakdown.
+- **Test count:** 544 → 544 (design-only, no test change).
+- **Authority:** ADR 0007 § 12 (opens deferral) + § 13 (rejects SQLite at Phase 3 per Node baseline); v0.1 spec § 4.6 / § 4.7 (Dashboard + observability endpoints planning authority); OCP `dashboard.html` (prior art); CC 开发铁律 v1.6 § 10 — fresh-context opus reviewer required for design ADR; Phase 3 kickoff via maintainer "go" 2026-05-25 + standing-autopilot grant; PR #25 fresh-context opus reviewer findings (3 polish items).
 
 ## v0.2.0 — 2026-05-25
 

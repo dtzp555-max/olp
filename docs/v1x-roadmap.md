@@ -8,21 +8,23 @@
 3. **Where** does the work live in the tree today (file + anchor).
 4. **When** does it need to land (trigger: load profile, security event, governance amendment).
 
-**Reading order for a v1.x sprint kickoff.** Items #1–#3 are the most architecturally consequential and should be designed in dependency order: #2 (multi-key auth) blocks header gating in #1 and observability ownership in #4. #1 (streaming SF) blocks #5 (soft trigger reactivation) only if soft triggers are wired on streaming requests.
+**Reading order for a v1.x sprint kickoff.** As of 2026-05-25, #1 (streaming SF, D57+D58) and #2 (multi-key auth, Phase 2) are CLOSED, and #4 and #7 closed in D56. Remaining v1.x scope: #3 (soft trigger reactivation), #5 (provider cacheKeyFields mask), #6 (streaming SPAWN_FAILED salvage — unbundled from #1 at #1 close). All three remaining items have explicit "trigger to start" gates that have not fired.
 
 ---
 
-## #1 — Streaming-path singleflight + TOCTOU close
+## #1 — Streaming-path singleflight + TOCTOU close — ✅ **SHIPPED (D57 + D58, 2026-05-25)**
 
-- **What.** `cacheStore.getOrComputeStreaming(keyId, cacheKey, sourceFactory)` API replacing the current `peek + spawn` pattern in `server.mjs`. Per-(keyId, cacheKey) inflight Map with tee fan-out, bounded per-client backpressure queues, late-joiner replay buffer, AbortController propagation on all-disconnect.
-- **Why deferred.** Personal/family-scale single-tenant load — N concurrent identical streaming requests is an edge case that has not been reported. Each concurrent caller receives the correct response; the waste is N CLI processes instead of one.
-- **Design ADR (ratified).** [`docs/adr/0005-cache-cross-provider.md` Amendment 8](./adr/0005-cache-cross-provider.md) — full design including the inflight Map shape, tee policy, late-joiner replay, backpressure cap, D38 semaphore coordination, abort policy, cache TTL race handling, observability event set, and X-OLP-Streaming-Inflight header. Implementation acceptance criteria are in Amendment 8 §13.
-- **Tracking issue.** GitHub issue [#16](https://github.com/dtzp555-max/olp/issues/16) — STAYS OPEN as v1.x tracker. Sibling: the closed-but-not-implemented Amendment 6 deferral (D34 F1).
-- **Code anchors today.**
-  - `server.mjs` lines ~782 (`preCheckHit = await cacheStore.peek(...)`) and ~811–817 (streaming branch entry) — these are the lines the new API replaces.
-  - `lib/cache/store.mjs` `getOrCompute` — sibling API; the new one mirrors its shape on the streaming path.
-- **Trigger to start.** Any of: (a) report of N>1 concurrent identical streaming requests in the wild, (b) v1.x sprint planning kickoff with the maintainer explicitly opening this scope, (c) downstream feature requiring tee-streaming primitive (e.g., browser-side observer attaching to an existing stream).
-- **Estimated effort.** Design ADR ratified (Amendment 8) = 30 min done. Implementation = 200–400 lines + 15-20 tests + fresh-context reviewer pass. ~3-4 hours of subagent runtime with full Iron Rule 10 discipline.
+- **Status.** Closed. Trigger (b) fired 2026-05-25 — maintainer "go" after v0.3.1. Shipped across three D-days:
+  - **D57** (PR #36) — cache layer: `cacheStore.getOrComputeStreaming(keyId, cacheKey, sourceFactory, opts) → { stream, isFirst, role }` with `_streamingInflight` Map, tee fan-out, late-joiner replay buffer, per-client backpressure (`PER_CLIENT_QUEUE_CAP=1MB`), replay cap (`ACCUMULATED_REPLAY_CAP=10MB`), AbortController propagation, synchronous Map check+insert (closes TOCTOU). Suite 27 = 12 unit tests.
+  - **D58** (PR #37) — server.mjs wiring: streaming branch swap; `tryAcquireSpawn`/`releaseSpawn` moved inside `sourceFactory` closure (D38 §7 coordination); `CONCURRENCY_LIMIT` fallthrough preserved; `X-OLP-Streaming-Inflight: source | attached` header; `cache_status: 'streaming_attached'` audit value + audit-query gauge reconciliation; `res.on('close') → stream.return()` for client disconnect; D16 truncated-not-cached invariant preserved via `cacheStore.delete` on stop-less exhaustion. Suite 28 = 8 HTTP integration tests.
+  - **D59** (this commit) — docs polish: README known-limitations entry inverted; this roadmap entry closed; issue #16 closed.
+- **Design authority.** [`docs/adr/0005-cache-cross-provider.md` Amendment 8](./adr/0005-cache-cross-provider.md) — implemented per spec §§1–14 across D57+D58.
+- **Tracking issue.** GitHub issue [#16](https://github.com/dtzp555-max/olp/issues/16) — CLOSED at D59 with refs to D57+D58 PRs.
+- **Final test count delta.** 603 (v0.3.1) → 623 (v0.3.2/v0.4.0). +20 tests across the SF arc.
+- **Deferred sub-items** (left here as future-work pointers, NOT blocking #1 closure):
+  - `X-OLP-Streaming-Inflight: solo` value not emitted on the wire (Amendment 8 §11). It's observable only post-stream via the `streaming_inflight_source_done` log event's `attached_count: 0`. Future ADR amendment may expose via HTTP trailer.
+  - `streaming_inflight_join` log event from `_attachClient` cache-layer path (carries no provider/model context). D58 emits the event from the server-layer wrapper instead; cache-layer emission would need a provider/model plumb (TODO marker at `lib/cache/store.mjs:~620`).
+  - `isFirst` field returned by `getOrComputeStreaming` is currently unused by server.mjs (`role` supersedes). Could be removed in a future cache-layer API cleanup.
 
 ## #2 — Multi-key auth (`lib/keys.mjs`) — **PHASE 2 ACTIVE (no longer deferred)**
 
@@ -81,9 +83,10 @@
 
 - **What.** Currently the streaming branch does NOT participate in D16 salvage (the salvage-on-SPAWN_FAILED + chunks pattern that the buffered path uses). Streaming SPAWN_FAILED mid-stream → the truncation marker (D35 #10) fires, but no salvage logic captures partial chunks for downstream cache reuse.
 - **Why deferred.** Less impactful than #1 — at most one client benefits per spawn event, and the buffered path already provides salvage for the bulk of requests. Streaming is the minority path.
-- **Design ADR.** Not yet ratified. Coordinated with #1 because the tee architecture changes the salvage semantics (multiple clients may want different finish_reason interpretations on source-mid-stream-failure).
+- **Status update post-#1 close (2026-05-25).** #1 was originally bundled with #6 in the design ADR (Amendment 8). The tee architecture as implemented does NOT carry salvage semantics — D57's tee writes `accumulatedChunks` to cache only on normal source completion (stop chunk seen); on SPAWN_FAILED mid-stream the cache layer rejects all clients with the error and does NOT persist partial chunks. D58 preserves D16's truncated-not-cached invariant via server-layer `cacheStore.delete` on stop-less exhaustion. #6 therefore remains independently deferrable.
+- **Design ADR.** Not yet ratified. The unbundling from #1 means #6 now needs its own ADR amendment when triggered.
 - **Tracking.** Not a GitHub issue. Tracked here.
-- **Trigger to start.** Bundled with #1 implementation work (the inflight tee architecture changes the salvage semantics, so designing them together is cheaper than serializing).
+- **Trigger to start.** First report of streaming-path SPAWN_FAILED mid-stream where partial-chunk salvage would have helped a downstream caller. Practically unlikely at family scale.
 
 ## #7 — AUTH_MISSING tuple path test coverage (D40 follow-up)
 

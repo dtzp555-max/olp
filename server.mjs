@@ -14,7 +14,10 @@
  * - Zero runtime npm dependencies in the proxy core
  *
  * Env vars:
- *   OLP_PORT  — listen port (default: 3456)
+ *   OLP_PORT  — listen port (default: 4567 since D60 / v0.4.0 — moved off 3456
+ *               so OLP can co-host with OCP for migration windows. ADR 0010 §
+ *               Default port. Set OLP_PORT=3456 explicitly to restore the
+ *               pre-D60 default when not co-hosting with OCP.)
  */
 
 import { createServer } from 'node:http';
@@ -71,7 +74,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8'));
 const VERSION = pkg.version;
 
-const PORT = parseInt(process.env.OLP_PORT ?? '3456', 10);
+const PORT = parseInt(process.env.OLP_PORT ?? '4567', 10);
 const BODY_LIMIT = 5 * 1024 * 1024; // 5 MB
 
 // ── Logging ───────────────────────────────────────────────────────────────

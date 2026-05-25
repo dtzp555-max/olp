@@ -4,7 +4,18 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-(empty — Phase 4 entries land here once Phase 4 opens)
+### D60 — Phase 4 charter (ADR 0010) + default port 3456 → 4567
+
+Opens Phase 4 (Operator + Client UX). No functional code change beyond the default port value; the substantive D-day work lands D61 onward. Per `release_kit.phase_rolling_mode`, the version bump fires at Phase 4 close (v0.4.0), not at this D-day.
+
+- **Default `OLP_PORT` changed from `3456` to `4567`.** Rationale: OCP defaults to 3456; OLP and OCP can now co-host on the same machine without `OLP_PORT` env override. Existing deployments wanting the pre-D60 default can set `OLP_PORT=3456` in launchd plist / shell env. Tests use `port: 0` (ephemeral) — no test-surface impact. Cache / fallback / provider plugins are port-agnostic. Dashboard uses relative paths.
+- **ADR 0010 (Phase 4 charter) ratified.** Records: (a) Phase 4 scope as 5 D-day groups (~13 D-days total) culminating in v0.4.0; (b) explicit DEFER of `/v1/messages` Anthropic-shape entry surface with re-open trigger gated on ADR 0009 P0 success + maintainer-named family CC user; (c) opportunistic Phase 4 micro-additions and Phase 5+ deferrals.
+- **ADR 0001 amendment.** § "Decision" paragraph about port conflict struck and amended: the OCP-OLP port-conflict assumption is lifted by the 3456 → 4567 default move + per-project launchd labels (`dev.ocp.proxy` vs `dev.olp.proxy`).
+- **ADR 0008 amendment.** § 6.6 default-port reference updated.
+- **README quick start + Environment Variables table + Migration from OCP § note** updated for the new default.
+- **Authority:** ADR 0010 (Phase 4 charter), ADR 0009 (interactive-mode placeholder — `/v1/messages` defer rationale), 2026-05-26 brainstorm (OCP feature audit + multi-provider proxy / IDE integration prior-art survey).
+
+
 
 ## v0.3.2 — 2026-05-25
 

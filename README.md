@@ -2,7 +2,7 @@
 
 A personal- and family-scale multi-provider LLM proxy. One HTTP endpoint, many subscriptions behind it, automatic routing, automatic fallback, content-addressed caching — so your IDEs and family clients keep working as long as *any* of your subscriptions has quota left.
 
-> **Status:** v0.1.1 shipped (2026-05-25) — Phase 1 multi-provider proxy core + cleanup. Phase 2 (multi-key auth, `lib/keys.mjs`) is currently in progress per ADR 0007. Sections marked _placeholder_ land alongside the relevant phase of work (see [phase plan](#phase-plan)).
+> **Status:** v0.2.0 shipped (2026-05-25) — Phase 1 multi-provider proxy core (v0.1.0 + v0.1.1) + Phase 2 multi-key auth + audit + owner gating + keygen CLI. Phase 3 (Dashboard + audit query layer) is the next milestone. Sections marked _placeholder_ land alongside the relevant phase of work (see [phase plan](#phase-plan)).
 
 ---
 
@@ -165,9 +165,9 @@ If a fallback chain is exhausted, `X-OLP-Fallback-Exhausted` lists the tried pro
 
 ---
 
-## Implementation status (as of 2026-05-25)
+## Implementation status (as of 2026-05-25, post-v0.2.0)
 
-Phase 1 is closed at v0.1.1 (multi-provider proxy core + pre-Phase-2 cleanup). Phase 2 (multi-key auth, `lib/keys.mjs`) is in progress per ADR 0007. This table reflects what is currently shipped vs. what is designed for later phases.
+Phase 1 closed at v0.1.1 (multi-provider proxy core + pre-Phase-2 cleanup). Phase 2 closed at v0.2.0 (multi-key auth + audit + owner gating + keygen CLI; ADR 0007 § 10 all 11 acceptance criteria shipped). Phase 3 (Dashboard + audit query layer) is the next milestone. This table reflects what is currently shipped vs. what is designed for later phases.
 
 | File / artifact | Status | Notes |
 |---|---|---|
@@ -248,8 +248,8 @@ The original v0.1 spec (in `~/.cc-rules/memory/projects/olp_v0_1_spec.md` on the
 
 - **Phase 0** — Repo bootstrap, `ALIGNMENT.md`, founding ADRs, CI workflows, PR template. ✅ Shipped (2026-05-23).
 - **Phase 1** — Multi-provider proxy core: `server.mjs`, IR, three Tier-D provider plugins (Anthropic / OpenAI Codex / Mistral Vibe), cache (D1+D4) + cleanup (D2 bypass / D3 chunked replay / D23 size cap), fallback engine with first-chunk safety + hard triggers + per-hop log observability, IR↔OpenAI translation under Rule 2(b). ✅ Shipped — v0.1.0 (2026-05-24) + v0.1.1 cleanup (2026-05-25, D35–D42).
-- **Phase 2** — Multi-key auth (`lib/keys.mjs`) per ADR 0007: opaque OLP API keys, per-key cache namespacing (the data model already supports this — only the `keyId` source is missing), owner-vs-guest tier for header gating, audit ndjson, owner-only gating for `/health` + `X-OLP-Fallback-Detail` (D40 follow-up). **(current — ADR drafting at D43-B)**.
-- **Phase 3** — Dashboard (`dashboard.html`) + audit query layer (deferred from Phase 2). Owner-only multi-provider quota panels, fallback rate, cache hit rate; localhost-bound by default.
+- **Phase 2** — Multi-key auth (`lib/keys.mjs`) per ADR 0007: opaque OLP API keys, per-key cache namespacing, owner-vs-guest tier for header gating, audit ndjson (`lib/audit.mjs`), `/health` payload trimming + `X-OLP-Fallback-Detail` emission gating, `OLP_OWNER_TOKEN` env override, keygen CLI (`bin/olp-keys.mjs`). ✅ Shipped — v0.2.0 (2026-05-25, D43-A → D47). All 11 ADR 0007 § 10 acceptance criteria covered.
+- **Phase 3** — Dashboard (`dashboard.html`) + audit query layer (deferred from Phase 2). Owner-only multi-provider quota panels, fallback rate, cache hit rate; localhost-bound by default. **(next)**.
 - **Phase 4+** — v1.x roadmap items as triggered. Full deferred-work tracker: [`docs/v1x-roadmap.md`](./docs/v1x-roadmap.md). Includes streaming-path singleflight ([issue #16](https://github.com/dtzp555-max/olp/issues/16) + ADR 0005 Amendment 8 design ratified), soft-trigger reactivation (ADR 0004 Amendment 2), `/health` activeSpawns integration, provider-level `cacheKeyFields` mask, streaming-path SPAWN_FAILED salvage.
 - **Phase N (opt-in)** — Tier-2 / Tier-C provider plugins (Grok / Kimi / MiniMax / GLM / Qwen) per [ADR 0006](./docs/adr/0006-provider-inclusion.md); provider-native protocol endpoints; deterministic triggers. Triggered by tier-2 demand, not on the bootstrap path.
 

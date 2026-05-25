@@ -4,6 +4,55 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+(empty — Phase 3 entries land here once Phase 3 opens)
+
+## v0.2.0 — 2026-05-25
+
+### Phase 2 — Multi-key auth + audit + owner gating + keygen CLI (D43-A → D47)
+
+**Overview.** v0.2.0 closes Phase 2 — the multi-key authentication track that grew OLP from single-tenant anonymous-only proxy (v0.1.1) to a multi-identity deployment with per-key cache isolation, audit attribution, owner-vs-guest header gating, and a reproducible bootstrap CLI. 6 D-day commits (D43-A through D47) shipped between 2026-05-25 (single intensive session under the standing-autopilot grant). All 11 ADR 0007 § 10 acceptance criteria are implemented + tested.
+
+**Test count: 468 (v0.1.1) → 544 (v0.2.0).** +76 tests across the Phase 2 arc.
+
+**Phase 2 release_kit checklist**
+
+- [x] All 6 D-day deliverables landed on main (D43-A, D43-B ADR draft, D44, D45, D46, D47)
+- [x] CI green on every D-day merge commit + on this release commit's head
+- [x] Fresh-context opus reviewer on every implementation D-day (D44/D45/D46/D47), maintainer text-review on D43-B ADR
+- [x] All 11 ADR 0007 § 10 acceptance criteria (#1–#11) covered by Suite 19/20/21/22 tests
+- [x] CHANGELOG "Unreleased" promoted to "## v0.2.0 — 2026-05-25" with D43-A through D47 entries
+- [x] `package.json` bumped 0.1.1 → 0.2.0
+- [x] `CLAUDE.md release_kit.phase_rolling_mode`: `current_phase` Phase 2 → Phase 3; `current_pre_release_identifier` `0.2.0-phase2` → `0.3.0-phase3`
+- [x] README status header + Implementation Status + Phase plan reflect Phase 2 shipped
+- [ ] Tag pushed (next step in this PR's lifecycle)
+- [ ] `release.yml` triggered + GitHub Release created (auto on tag push; D37 phase_rolling_mode gate will pass because Unreleased is now sentinel-only)
+
+**ADR 0007 § 10 acceptance criteria — final ship status**
+
+| # | Criterion | Covering tests |
+|---|---|---|
+| 1 | Per-key cache namespace isolation | Suite 20i |
+| 2 | Anonymous prod-default off → 401 | Suite 20a |
+| 3 | Anonymous dev-mode on → 200 | Suite 20g |
+| 4 | Owner-vs-guest `/health` gating | Suite 21a-d |
+| 5 | Owner-vs-guest `X-OLP-Fallback-Detail` gating | Suite 21e-h |
+| 6 | Post-revoke 401 within next request | Suite 19o + Suite 20e |
+| 7 | Manifest atomicity + revoke-dominates-touch | Suite 19y-1..4 |
+| 8 | Audit ndjson round-trip + PII guard | Suite 20j + 20j-stream + 20j-401 |
+| 9 | Bootstrap keygen surface reproducible | Suite 22 |
+| 10 | `OLP_OWNER_TOKEN` env override | Suite 19p + Suite 20f |
+| 11 | `providers_enabled` 403 scope enforcement | Suite 20h |
+
+**Known limitations carried beyond v0.2.0**
+
+Phase 2 functional scope is complete. The following remain as Phase 3+ deferrals (tracked in `docs/v1x-roadmap.md` + new entries below):
+
+- **Dashboard (`dashboard.html`)** — owner-only multi-provider quota / fallback / cache-hit-rate panels. Per ADR 0007 § 12 + v0.1 spec § 4.6. Phase 3 mainline.
+- **Audit query layer + rotation** — `audit.ndjson` is append-only at v0.2.0; aggregate queries + log rotation deferred to Phase 3 alongside Dashboard.
+- **`tried_providers` semantics on `key_no_provider_access` 403** — schema currently reports filter-rejected hops as "tried"; either ADR § 8 amendment (rename / add field) or D46+ semantic fix. Noted by D45 opus reviewer.
+- **Per-provider per-key auth artifact mapping** — ADR § 12 explicit out-of-scope. Per-key cache + audit isolation works; per-key per-provider OAuth tokens (e.g., two OLP keys each authenticated to different OpenAI Codex accounts) is Phase 3+ work.
+- **SQLite migration (Option 3 hybrid)** — ADR § 13 documents the forward path; trigger is Dashboard / SQL-aggregate-quota / multi-second audit-query workload. Requires engines bump (`>=22.13.0` or `>=23.4.0`) per ADR § 11 as a separate prior PR.
+
 ### D47 — `bin/olp-keys.mjs` keygen CLI (Phase 2 functional scope closes)
 
 Fourth Phase 2 implementation D-day. Closes ADR 0007 § 10 acceptance criterion #9 (bootstrap workflow must be reproducible without manual file editing) by shipping a minimal keygen CLI per § 9.1. **Phase 2 functional scope is complete with this D-day** — remaining work is Phase 2 close → v0.2.0 (maintainer-triggered, explicit per CLAUDE.md `release_kit.phase_close_trigger`).

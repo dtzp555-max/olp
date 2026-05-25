@@ -231,7 +231,9 @@ Returns just the quota array (subset of dashboard-data; useful for scripted moni
 
 ### 7.4 `GET /cache/stats`
 
-Returns the live in-memory `cacheStore.stats()` shape (per ADR 0005 § "Cache stats"). Per ADR 0005 this surface was always planned; Phase 3 ships it gated owner-only.
+Returns the live in-memory `cacheStore.stats()` shape. Planning authority is **OLP v0.1 spec § 4.6** (which names `/cache/stats` explicitly); ADR 0005's `Consequences/Mitigations` paragraph (~ line 279) references it as the monitoring surface for per-`(provider, model)` cache hit-rate breakdown.
+
+**Shape gap to resolve at D50.** The current `cacheStore.stats()` in `lib/cache/store.mjs:320-350` returns `{ hits, misses, size, inflightCount }` — global aggregate only, no per-`(provider, model)` breakdown. If D50 reveals the shape is insufficient for Panel 2 (per-provider 24h cache hit rate, currently sourced from `aggregateRequests` audit-side rather than `cacheStore.stats`), the dashboard endpoint is satisfied. If a future panel needs the per-`(provider, model)` breakdown that spec § 4.6 implies, D50 amends the store shape + an ADR 0005 amendment fires at that time. Phase 3 acceptance criteria do not require the breakdown.
 
 ### 7.5 Audit on management endpoints
 
@@ -241,14 +243,16 @@ All four endpoints append an audit row via the existing `appendAuditEvent` patte
 
 ## 8. Auth gating
 
-Reuses ADR 0007 § 7 owner-vs-non-owner model. The owner_only_endpoints config gains four entries:
+Reuses ADR 0007 § 7 owner-vs-non-owner model + introduces a second gating mode.
 
-- `/dashboard`
-- `/v0/management/dashboard-data`
-- `/v0/management/quota`
-- `/cache/stats`
+**Two gating modes (this ADR formalizes the distinction):**
 
-Server startup defaults `owner_only_endpoints` to include `/health` + these four (Phase 3 default; operator can opt-out per-endpoint via config). Pre-Phase-3 deployments with `owner_only_endpoints: ['/health']` continue to work — the new endpoints will trim to a 401 for non-owner under that legacy config, which is the secure default. (No new endpoint reveals data without owner auth.)
+- **`owner_only_trim`** (Phase 2 / D46 model) — non-owner identities receive a 200 response with a trimmed payload (e.g., `/health` returns `{ ok, version }` only). Used when the endpoint has a baseline payload that is safe to share with all identities and an enriched payload only for owners.
+- **`owner_only_block`** (Phase 3 / D48 new) — non-owner identities receive `401 invalid_or_revoked_key` (or `401 auth_required` if no token). Used when the entire payload is sensitive and there is no safe baseline to share (Dashboard quota stats, fallback chains by trigger, etc. all reveal operational behaviour that should not leak to non-owner identities).
+
+The four new endpoints (`/dashboard`, `/v0/management/dashboard-data`, `/v0/management/quota`, `/cache/stats`) are `owner_only_block`. `/health` remains `owner_only_trim`.
+
+The owner_only_endpoints config gains four entries; the gating-mode distinction is implementation-side (the handler decides whether to trim or block based on the endpoint). Server startup defaults `owner_only_endpoints` to include `/health` + the four new ones (Phase 3 default; operator can opt-out per-endpoint via config). Pre-Phase-3 deployments with `owner_only_endpoints: ['/health']` continue to work — the new endpoints will 401 for non-owner under that legacy config because the handler is `owner_only_block`-mode regardless of the config list (the config controls /health's trim/full toggle only; the management endpoints are not opt-out-able to a non-401 response).
 
 `401` shapes match Phase 2 / D45 pattern: JSON `{ error: { message, type } }` with `type: 'auth_required'` or `'invalid_or_revoked_key'`.
 
@@ -281,7 +285,7 @@ Implementation D-days (D49+) MUST land tests covering:
 6. **Daily rotation** — writing past UTC midnight renames `audit.ndjson` → `audit-<yesterday>.ndjson` and continues appending to a fresh `audit.ndjson`.
 7. **Cross-file query** — a 30-day window with mixed rotated files returns correctly merged results.
 8. **Concurrent rotation safety** — N concurrent `appendAuditEvent` calls during a UTC date change result in exactly one rename + all lines append to the correct file.
-9. **`GET /dashboard`** returns 200 HTML to owner; 401 to non-owner; 401 to anonymous with `allow_anonymous: false`.
+9. **`GET /dashboard`** returns 200 HTML to owner; 401 to non-owner. This includes the case where `allow_anonymous: true` AND no Authorization header is presented: the authenticate middleware produces an anonymous identity, the `owner_only_block` mode then rejects with 401 (per § 8 — anonymous is non-owner; management endpoints block, do not trim). When `allow_anonymous: false` + no header, 401 fires earlier at the authenticate middleware itself. Test must cover both cases.
 10. **`GET /v0/management/dashboard-data`** returns 200 JSON to owner with all required fields populated.
 11. **`GET /cache/stats`** returns 200 JSON to owner with the live in-memory cache stats shape.
 12. **Dashboard HTML smoke** — fetched via test http client + parsed → has the 4 panel containers + 30s poll script; no JS console errors when loaded in a real browser (manual or playwright; manual is acceptable at Phase 3).
@@ -361,7 +365,7 @@ Each D-day = implementor + fresh-context opus reviewer per Iron Rule 10. Estimat
 - **OCP `dashboard.html`** (prior-art reference for the multi-panel HTML structure) — at `~/ocp/dashboard.html` on the maintainer's workstation; OCP production reference.
 - **ADR 0007 §§ 7 / 8 / 12 / 13** (owner-gating model; audit ndjson schema; Phase 3 scope opening; SQLite forward path).
 - **ADR 0002** (Provider contract — `quotaStatus` method that Panel 1 consumes).
-- **ADR 0005 § Cache stats** (`/cache/stats` endpoint pre-existing in design; Phase 3 ships).
+- **OLP v0.1 spec § 4.6** (planning authority for `/cache/stats` endpoint name + Dashboard requirements). ADR 0005's `Consequences/Mitigations` paragraph references the endpoint as the monitoring surface for per-`(provider, model)` cache hit-rate breakdown; that breakdown is a Phase 4+ amendment trigger if needed (see § 7.4 above).
 - **ADR 0004 Amendment 5** (D40 X-OLP-Fallback-Detail — top-fallback-chains panel data shape lineage).
 - **Standing-autopilot grant** (`~/.cc-rules/memory/auto/standing_autopilot_phase_2.md` in cc-rules `bf0ed9a`) — Phase 3 kickoff via maintainer "go" + lane pin.
 - **Phase 2 kickoff handoff pattern** (`~/.cc-rules/memory/handoffs/2026-05-25-phase-2-kickoff.md` in cc-rules `d9da966`) — this ADR follows the same structure.

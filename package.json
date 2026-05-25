@@ -7,14 +7,16 @@
   "bin": {
     "olp": "./bin/olp.mjs",
     "olp-keys": "./bin/olp-keys.mjs",
-    "olp-audit-rotate": "./bin/olp-audit-rotate.mjs"
+    "olp-audit-rotate": "./bin/olp-audit-rotate.mjs",
+    "olp-connect": "./bin/olp-connect"
   },
   "scripts": {
     "start": "node server.mjs",
     "test": "node test-features.mjs",
     "olp": "node bin/olp.mjs",
     "olp-keys": "node bin/olp-keys.mjs",
-    "olp-audit-rotate": "node bin/olp-audit-rotate.mjs"
+    "olp-audit-rotate": "node bin/olp-audit-rotate.mjs",
+    "olp-connect": "bash bin/olp-connect"
   },
   "engines": {
     "node": ">=18"

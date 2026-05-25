@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+# bin/olp-connect — Lightweight client script to connect this machine to a remote
+# OLP (Open LLM Proxy). Ported from OCP's `ocp-connect` per ADR 0010 § Phase 4
+# D68-D70 charter; uses /health.anonymousKey when the remote operator opted in
+# via `auth.advertise_anonymous_key: true` (ADR 0011).
+#
+# Authority:
+#   - ADR 0010 (Phase 4 charter — D68 line: client-side IDE auto-config)
+#   - ADR 0011 (anonymous-key deployment-context limits — trusted-LAN invariant)
+#   - OCP `ocp-connect` v1.3.0 (prior-art reference)
+#
+# Why bash (not Node like `olp` CLI):
+#   olp-connect MUST run on CLIENT machines that may not have a recent Node
+#   installed (parents' laptops, work machines, Raspberry Pi). bash + curl +
+#   python3 give maximum portability; this script does not import any OLP
+#   Node modules.
+#
+# Dependencies: bash >=4, curl, python3 (for /health JSON parsing).
+#
+# Install:
+#   curl -fsSL https://raw.githubusercontent.com/dtzp555-max/olp/main/bin/olp-connect -o olp-connect
+#   chmod +x olp-connect
+#
+# Or via npm/npx (once `npm install -g olp` is run on a machine that has Node):
+#   olp-connect <ip>
+#
+# Or run directly via curl-pipe:
+#   curl -fsSL https://raw.githubusercontent.com/dtzp555-max/olp/main/bin/olp-connect | bash -s -- <host-ip>
+
+set -euo pipefail
+
+OLP_CONNECT_VERSION="0.4.0-phase4"
+
+show_version() {
+  echo "olp-connect $OLP_CONNECT_VERSION"
+}
+
+show_help() {
+  cat <<'EOF'
+olp-connect — Connect this machine to a remote OLP (Open LLM Proxy)
+
+Configures OPENAI_BASE_URL + OPENAI_API_KEY in your shell rc file (and macOS
+launchctl env / Linux systemd user env), then detects installed IDEs (Cline,
+Continue.dev, Cursor, Aider, OpenClaw, Claude Code) and prints / writes the
+provider-specific configuration each needs.
+
+Usage:
+  olp-connect <host-ip> [options]
+  olp-connect --help
+  olp-connect --version
+
+Options:
+  --port PORT       Port OLP listens on (default: 4567 — OLP v0.4.0+ default;
+                    set 3456 if connecting to a pre-D60 OLP install)
+  --key API_KEY     OLP API key (from `olp-keys keygen` on the server). When
+                    omitted, the script reads /health.anonymousKey (if the
+                    server opted in via auth.advertise_anonymous_key=true) or
+                    prompts interactively.
+  --no-system-env   Skip macOS launchctl setenv / Linux systemd env writes;
+                    only update shell rc files.
+  --dry-run         Print everything the script would do without modifying
+                    any file or setting any env var.
+  --version         Print version and exit
+  --help, -h        Show this help
+
+Examples:
+  olp-connect 192.168.1.10
+  olp-connect 192.168.1.10 --port 8080
+  olp-connect 192.168.1.10 --key olp_AbcDef1234...
+  olp-connect 100.64.0.5 --dry-run
+
+Requires:
+  bash, curl, python3 (for /health JSON parsing)
+
+Exit codes:
+  0   success
+  1   bad arguments / unknown flag / missing required value
+  2   connectivity or auth failure / smoke test failure
+
+Authority: ADR 0010 § Phase 4 D68-D70; ADR 0011 (anonymous-key trusted-LAN
+invariant — when --key is auto-resolved from /health.anonymousKey, this
+deployment MUST be on a trusted LAN).
+EOF
+}
+
+# ── Globals populated by main() ─────────────────────────────────────────────
+
+DRY_RUN=false
+NO_SYSTEM_ENV=false
+
+# ── Logging helpers ─────────────────────────────────────────────────────────
+
+log_info()  { echo "  $*"; }
+log_step()  { echo "  → $*"; }
+log_ok()    { echo "  ✓ $*"; }
+log_warn()  { echo "  ⚠ $*"; }
+log_err()   { echo "  ✗ $*" >&2; }
+
+# Echo a state change (a write / env-set) before executing — operator can
+# Ctrl-C if something looks wrong. Returns 0 always.
+log_change() { echo "  • $*"; }
+
+# ── IDE detection + configuration ───────────────────────────────────────────
+
+# Truncate long keys for display (avoid leaking via screenshot / screen share).
+key_display() {
+  local k="$1"
+  if [[ -z "$k" ]]; then
+    echo "(none — anonymous; most IDEs require a non-empty API Key)"
+  elif [[ ${#k} -gt 16 ]]; then
+    echo "${k:0:8}...${k: -4}"
+  else
+    echo "$k"
+  fi
+}
+
+# Detect Claude Code and print warn-only message. Per ADR 0010 § Out of
+# Phase 4 scope, OLP does NOT ship /v1/messages and CC is not a supported
+# client. The user is steered toward Cline + OLP.
+detect_claude_code() {
+  if command -v claude &>/dev/null; then
+    log_info ""
+    log_info "Detected: Claude Code (`command -v claude`)"
+    log_warn "Claude Code is NOT supported as an OLP client (OLP does not ship"
+    log_warn "  /v1/messages — see ADR 0010 § Out-of-Phase-4-scope)."
+    log_warn "  Recommended alternative: install Cline (VSCode extension) + OLP."
+    log_warn "  Cline uses OpenAI-shape /v1/chat/completions which OLP DOES serve."
+  fi
+}
+
+# Detect Cline VSCode extension and print manual-configure snippet.
+# Cline cannot be auto-configured via env vars — user must paste into VSCode
+# settings UI. We surface the values for them.
+detect_cline() {
+  local base_url="$1" key="$2"
+  local exts=""
+  if command -v code &>/dev/null; then
+    exts=$(code --list-extensions 2>/dev/null || true)
+  fi
+  if [[ -z "$exts" && -d "$HOME/.vscode/extensions" ]]; then
+    exts=$(ls "$HOME/.vscode/extensions/" 2>/dev/null || true)
+  fi
+
+  if echo "$exts" | grep -qiE 'cline|saoudrizwan\.claude-dev'; then
+    log_info ""
+    log_info "Detected: Cline (VSCode extension)"
+    log_info "  Cline must be configured via the VSCode settings UI."
+    log_info "  Open VSCode → Cline panel → Settings → API Provider:"
+    log_info "    API Provider:  \"OpenAI Compatible\""
+    log_info "    Base URL:      $base_url/v1"
+    log_info "    API Key:       $(key_display "$key")"
+    log_info "    Model ID:      claude-sonnet-4-5 (or any model from /v1/models)"
+  fi
+}
+
+# Detect Continue.dev and write a `models:` entry to ~/.continue/config.yaml
+# (idempotent — checks if an entry with the same name exists first).
+detect_continue() {
+  local base_url="$1" key="$2"
+  local exts=""
+  if command -v code &>/dev/null; then
+    exts=$(code --list-extensions 2>/dev/null || true)
+  fi
+  local config_yaml="$HOME/.continue/config.yaml"
+  local config_json="$HOME/.continue/config.json"
+
+  local found=false
+  if echo "$exts" | grep -qi 'continue\.continue'; then found=true; fi
+  if [[ -f "$config_yaml" || -f "$config_json" ]]; then found=true; fi
+
+  if ! $found; then return 0; fi
+
+  log_info ""
+  log_info "Detected: Continue.dev"
+  log_info "  Configuration snippet for ~/.continue/config.yaml:"
+  log_info "    models:"
+  log_info "      - name: OLP Sonnet"
+  log_info "        provider: openai"
+  log_info "        model: claude-sonnet-4-5"
+  log_info "        apiBase: $base_url/v1"
+  log_info "        apiKey: $(key_display "$key")"
+  log_info "  Note: Continue.dev autoreload-on-save is fragile; restart VSCode if"
+  log_info "        the new model doesn't appear in the model selector."
+}
+
+# Detect Cursor and print manual snippet + known-fragility warning.
+detect_cursor() {
+  local base_url="$1" key="$2"
+  local found=false
+  if command -v cursor &>/dev/null; then found=true; fi
+  if [[ -d "$HOME/.cursor" ]]; then found=true; fi
+  if [[ -d "/Applications/Cursor.app" ]]; then found=true; fi
+
+  if ! $found; then return 0; fi
+
+  log_info ""
+  log_info "Detected: Cursor"
+  log_info "  Cmd+Shift+P → 'Cursor Settings' → Models:"
+  log_info "    OpenAI API Key:           $(key_display "$key")"
+  log_info "    Override OpenAI Base URL: $base_url/v1"
+  log_info "    Custom OpenAI Models:     claude-sonnet-4-5,claude-opus-4-1"
+  log_warn "  Cursor's base-URL handling is known-fragile (issue #7128 et al);"
+  log_warn "  if requests fail with 'malformed request', try removing then"
+  log_warn "  re-adding the model in the Cursor models list."
+}
+
+# Detect Aider and write OPENAI_API_BASE / OPENAI_API_KEY to rc files.
+# Aider reads these env vars at startup — already handled by the rc-file
+# block in main(). We just announce detection here.
+detect_aider() {
+  if command -v aider &>/dev/null; then
+    log_info ""
+    log_info "Detected: Aider (`command -v aider`)"
+    log_info "  Aider reads OPENAI_API_BASE + OPENAI_API_KEY from env."
+    log_info "  These are already being written to your shell rc — open a fresh"
+    log_info "  shell and run: aider --model openai/claude-sonnet-4-5"
+  fi
+}
+
+# Detect OpenClaw. Per Phase 4 D71-D73 (NOT in this PR), olp will ship
+# olp-plugin/ for OpenClaw with full Telegram/Discord /olp slash commands.
+# Until that ships, we just announce detection and link.
+detect_openclaw() {
+  if command -v openclaw &>/dev/null || [[ -f "$HOME/.openclaw/openclaw.json" ]]; then
+    log_info ""
+    log_info "Detected: OpenClaw"
+    log_info "  The OpenClaw OLP plugin (D71-D73) is NOT YET SHIPPED."
+    log_info "  When it ships, install with: openclaw plugin install olp"
+    log_info "  For now, you can manually point OpenClaw at OLP via the OPENAI_BASE_URL"
+    log_info "  env var (already written to your shell rc above)."
+  fi
+}
+
+# ── rc-file helpers ─────────────────────────────────────────────────────────
+
+# Identify which shell rc files to write to. Returns paths on stdout, one per line.
+detect_rc_files() {
+  local is_mac=false
+  [[ "$(uname)" == "Darwin" ]] && is_mac=true
+  if [[ "${SHELL:-}" == */fish ]]; then
+    log_warn "fish shell detected; writing to ~/.bashrc — add to fish config manually." >&2
+    echo "$HOME/.bashrc"
+    return
+  fi
+  if $is_mac; then
+    # macOS Catalina+ default shell is zsh
+    [[ -f "$HOME/.bashrc" ]] && echo "$HOME/.bashrc"
+    [[ -f "$HOME/.zshrc" ]] || { $DRY_RUN || touch "$HOME/.zshrc"; }
+    echo "$HOME/.zshrc"
+  else
+    [[ -f "$HOME/.bashrc" || "${SHELL:-}" == */bash ]] && echo "$HOME/.bashrc"
+    [[ -f "$HOME/.zshrc" || "${SHELL:-}" == */zsh ]] && echo "$HOME/.zshrc"
+  fi
+}
+
+# Remove any previously-written OLP block from an rc file (idempotent).
+# The block is bracketed by:
+#   # OLP LAN (added by olp-connect) ... # /OLP LAN
+strip_olp_block() {
+  local rc_file="$1"
+  [[ -f "$rc_file" ]] || return 0
+  if $DRY_RUN; then
+    if grep -qF '# OLP LAN (added by olp-connect)' "$rc_file" 2>/dev/null; then
+      log_change "[dry-run] would strip existing OLP block from $rc_file"
+    fi
+    return 0
+  fi
+  python3 - "$rc_file" <<'PYEOF'
+import sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        lines = f.readlines()
+except OSError:
+    sys.exit(0)
+out = []
+skip = False
+for line in lines:
+    s = line.rstrip('\n')
+    if s == '# OLP LAN (added by olp-connect)':
+        skip = True
+        continue
+    if skip and s == '# /OLP LAN':
+        skip = False
+        continue
+    if skip:
+        continue
+    out.append(line)
+with open(path, 'w') as f:
+    f.writelines(out)
+PYEOF
+}
+
+# Append a new OLP block to an rc file.
+append_olp_block() {
+  local rc_file="$1" base_url="$2" key="$3"
+  if $DRY_RUN; then
+    log_change "[dry-run] would append OLP block to $rc_file:"
+    log_change "    # OLP LAN (added by olp-connect)"
+    log_change "    export OPENAI_BASE_URL=$base_url/v1"
+    [[ -n "$key" ]] && log_change "    export OPENAI_API_KEY=$(key_display "$key")"
+    log_change "    # /OLP LAN"
+    return 0
+  fi
+  {
+    echo ""
+    echo "# OLP LAN (added by olp-connect)"
+    echo "export OPENAI_BASE_URL=$base_url/v1"
+    if [[ -n "$key" ]]; then
+      echo "export OPENAI_API_KEY=$key"
+    fi
+    echo "# /OLP LAN"
+  } >> "$rc_file"
+}
+
+# ── System-level env (macOS launchctl / Linux systemd user) ────────────────
+
+set_system_env() {
+  local base_url="$1" key="$2"
+  if $NO_SYSTEM_ENV; then
+    log_info "Skipping system-level env (--no-system-env)"
+    return 0
+  fi
+  if [[ "$(uname)" == "Darwin" ]]; then
+    if $DRY_RUN; then
+      log_change "[dry-run] would launchctl setenv OPENAI_BASE_URL=$base_url/v1"
+      [[ -n "$key" ]] && log_change "[dry-run] would launchctl setenv OPENAI_API_KEY=$(key_display "$key")"
+      return 0
+    fi
+    launchctl setenv OPENAI_BASE_URL "$base_url/v1" 2>/dev/null || log_warn "launchctl setenv OPENAI_BASE_URL failed"
+    if [[ -n "$key" ]]; then
+      launchctl setenv OPENAI_API_KEY "$key" 2>/dev/null || log_warn "launchctl setenv OPENAI_API_KEY failed"
+    fi
+    log_ok "launchctl setenv applied (visible to GUI apps + daemons)"
+    log_info "  Note: launchctl env vars reset on reboot. Re-run olp-connect after restart"
+    log_info "        or add the script to Login Items."
+  else
+    local env_dir="$HOME/.config/environment.d"
+    if $DRY_RUN; then
+      log_change "[dry-run] would write $env_dir/olp.conf"
+      return 0
+    fi
+    mkdir -p "$env_dir" 2>/dev/null
+    {
+      echo "OPENAI_BASE_URL=$base_url/v1"
+      if [[ -n "$key" ]]; then
+        echo "OPENAI_API_KEY=$key"
+      fi
+    } > "$env_dir/olp.conf"
+    log_ok "Wrote $env_dir/olp.conf (applies to systemd user services after re-login)"
+  fi
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+main() {
+  local host="" port=4567 key=""
+
+  # Parse args (POSIX-style; --flag value AND --flag=value both accepted)
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)    port="${2:?--port requires a value}"; shift 2 ;;
+      --port=*)  port="${1#*=}"; shift ;;
+      --key)     key="${2:?--key requires a value}"
+                 [[ -z "$key" ]] && { log_err "--key cannot be empty (omit --key for zero-config / auto-discovery)"; exit 1; }
+                 shift 2 ;;
+      --key=*)   key="${1#*=}"; shift ;;
+      --no-system-env) NO_SYSTEM_ENV=true; shift ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      --version) show_version; exit 0 ;;
+      --help|-h) show_help; exit 0 ;;
+      --*)       log_err "Unknown option: $1"; show_help >&2; exit 1 ;;
+      *)         host="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$host" ]]; then
+    log_err "host IP is required."
+    echo "" >&2
+    show_help >&2
+    exit 1
+  fi
+
+  if ! [[ "$host" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    log_err "invalid host '$host'"
+    exit 1
+  fi
+
+  # Dependency check
+  for cmd in curl python3; do
+    if ! command -v "$cmd" &>/dev/null; then
+      log_err "'$cmd' is required but not found in PATH."
+      [[ "$cmd" == "python3" ]] && log_err "  python3 is used for /health + /v1/models JSON parsing."
+      exit 1
+    fi
+  done
+
+  local base_url="http://$host:$port"
+
+  echo "olp-connect v$OLP_CONNECT_VERSION"
+  echo "─────────────────────────────────────"
+  log_info "Remote: $base_url"
+  $DRY_RUN && log_info "Mode:   DRY RUN (no files will be modified, no env vars will be set)"
+  echo ""
+
+  # Step 1: connectivity probe. We capture status separately from body so we
+  # can distinguish "TCP/HTTP unreachable" from "reached but 401" (the latter
+  # is a known surface when the server has auth.allow_anonymous=false AND
+  # auth.advertise_anonymous_key=false — user MUST provide --key).
+  log_step "Probing /health..."
+  local probe_body probe_status
+  probe_body=$(curl -s --max-time 5 -o /tmp/olp-connect-health.$$ -w "%{http_code}" "$base_url/health" 2>/dev/null || echo "000")
+  probe_status="$probe_body"
+  if [[ -f /tmp/olp-connect-health.$$ ]]; then
+    probe_body=$(cat /tmp/olp-connect-health.$$ 2>/dev/null || echo "")
+    rm -f /tmp/olp-connect-health.$$
+  fi
+  if [[ "$probe_status" == "000" ]]; then
+    log_err "Cannot reach $base_url/health (connection refused / timeout / DNS)"
+    log_err "  Ensure OLP is running on $host and bound to 0.0.0.0 (LAN mode)."
+    log_err "  Default port changed 3456 → 4567 at OLP v0.4.0; pass --port 3456 for older installs."
+    exit 2
+  fi
+  if [[ "$probe_status" == "401" ]]; then
+    log_warn "Server reachable but /health returned 401."
+    log_warn "  Either the operator has not enabled auth.advertise_anonymous_key, or"
+    log_warn "  the server requires auth (auth.allow_anonymous=false)."
+    if [[ -z "$key" ]]; then
+      log_err "  Pass --key olp_... to continue, or ask the operator to advertise an anonymous key (see ADR 0011)."
+      exit 2
+    fi
+    # If user supplied --key, we proceed without /health body (auth-required mode).
+    log_info "  Proceeding with the --key you supplied; skipping /health.anonymousKey discovery."
+    local health_json=""
+    local remote_version="?"
+  else
+    if [[ "$probe_status" != "200" ]]; then
+      log_err "/health returned HTTP $probe_status (expected 200 or 401)."
+      exit 2
+    fi
+    local health_json="$probe_body"
+    local remote_version
+    remote_version=$(echo "$health_json" | python3 -c "import sys,json
+try: print(json.loads(sys.stdin.read()).get('version','?'))
+except: print('?')" 2>/dev/null || echo "?")
+    log_ok "Connected — OLP v$remote_version"
+  fi
+
+  # Step 2: auth resolution
+  if [[ -z "$key" ]]; then
+    # Try /health.anonymousKey first (D69 / ADR 0011 opt-in).
+    local anon_key
+    anon_key=$(echo "$health_json" | python3 -c "import sys,json
+try:
+    d = json.loads(sys.stdin.read())
+    k = d.get('anonymousKey')
+    print(k if isinstance(k, str) and k else '')
+except: print('')" 2>/dev/null || echo "")
+    if [[ -n "$anon_key" ]]; then
+      key="$anon_key"
+      log_ok "Using server-advertised anonymous key: $(key_display "$key")"
+      log_info "  (set by remote via auth.advertise_anonymous_key=true; see ADR 0011 for"
+      log_info "   the trusted-LAN-only invariant — this assumes you and the remote are"
+      log_info "   on the same trusted network)"
+    else
+      # No advertised key; prompt interactively (skip in dry-run for non-TTY safety)
+      if $DRY_RUN; then
+        log_info "[dry-run] would prompt for API key here (no --key + no anonymousKey)"
+        key="<prompted-at-runtime>"
+      else
+        echo ""
+        log_info "Remote does not advertise an anonymous key."
+        log_info "Ask the OLP operator to run on the server:  olp-keys keygen --name <your-label>"
+        printf "  Enter OLP API key: "
+        { read -rs key </dev/tty; } 2>/dev/null || key=""
+        echo
+        if [[ -z "$key" ]]; then
+          log_err "No key provided and the remote did not advertise an anonymous key."
+          log_err "  Re-run with: olp-connect $host --key olp_..."
+          exit 2
+        fi
+      fi
+    fi
+  fi
+
+  # Step 3: smoke test /v1/models
+  log_step "Smoke-testing /v1/models..."
+  if $DRY_RUN && [[ "$key" == "<prompted-at-runtime>" ]]; then
+    log_info "[dry-run] skipping smoke test (no real key)"
+  else
+    local models_out models_ok=0
+    if [[ -n "$key" ]]; then
+      models_out=$(curl -sf --max-time 10 \
+        -H "Authorization: Bearer $key" \
+        "$base_url/v1/models" 2>/dev/null) && models_ok=1
+    else
+      models_out=$(curl -sf --max-time 10 "$base_url/v1/models" 2>/dev/null) && models_ok=1
+    fi
+    if [[ $models_ok -eq 0 ]]; then
+      log_err "/v1/models request failed — key may be invalid, revoked, or not allowed for any provider."
+      exit 2
+    fi
+    local model_count
+    model_count=$(echo "$models_out" | python3 -c "import sys,json
+try: print(len(json.loads(sys.stdin.read()).get('data', [])))
+except: print('?')" 2>/dev/null || echo "?")
+    log_ok "/v1/models OK — $model_count models available"
+  fi
+  echo ""
+
+  # Step 4: write shell rc files
+  log_step "Writing shell rc files..."
+  local rc_files=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && rc_files+=("$line")
+  done < <(detect_rc_files)
+
+  if [[ ${#rc_files[@]} -eq 0 ]]; then
+    log_warn "No shell rc files detected; falling back to ~/.bashrc"
+    rc_files=("$HOME/.bashrc")
+  fi
+
+  for rc_file in "${rc_files[@]}"; do
+    log_change "stripping old OLP block from $(basename "$rc_file") (idempotent)"
+    strip_olp_block "$rc_file"
+    log_change "appending new OLP block to $(basename "$rc_file")"
+    append_olp_block "$rc_file" "$base_url" "$key"
+  done
+  log_ok "Shell rc files updated:"
+  for rc_file in "${rc_files[@]}"; do
+    log_info "  $rc_file"
+  done
+  echo ""
+
+  # Step 5: system-level env (macOS launchctl / Linux systemd)
+  log_step "Setting system-level env..."
+  set_system_env "$base_url" "$key"
+  echo ""
+
+  # Step 6: IDE detection + per-IDE config
+  log_step "Detecting installed IDEs..."
+  detect_claude_code
+  detect_cline    "$base_url" "$key"
+  detect_continue "$base_url" "$key"
+  detect_cursor   "$base_url" "$key"
+  detect_aider
+  detect_openclaw
+  echo ""
+
+  # Step 7: final summary
+  log_step "Done."
+  log_info "OLP base URL:   $base_url/v1"
+  log_info "OLP API key:    $(key_display "$key")"
+  log_info ""
+  log_info "Test it: open a fresh shell, run:"
+  log_info "  curl -sf -H \"Authorization: Bearer \$OPENAI_API_KEY\" $base_url/v1/models | python3 -m json.tool | head -20"
+  log_info ""
+  log_info "Reload your current shell to apply env changes:"
+  for rc_file in "${rc_files[@]}"; do
+    log_info "  source $rc_file"
+  done
+}
+
+main "$@"

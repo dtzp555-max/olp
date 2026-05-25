@@ -52,10 +52,12 @@ import {
   loadFallbackConfigSync,
 } from './lib/fallback/engine.mjs';
 // Phase 2 / D45 — multi-key auth integration per ADR 0007.
+// D69 (ADR 0011): findAdvertisedKey for /health.anonymousKey opt-in surface.
 import {
   validateKey,
   touchLastUsed,
   loadAuthConfigSync,
+  findAdvertisedKey,
   ANONYMOUS_KEY_ID,
   ENV_OWNER_KEY_ID,
 } from './lib/keys.mjs';
@@ -231,10 +233,37 @@ if (_authConfig.allow_anonymous === true) {
     message: 'config.json auth.allow_anonymous is true — all routes accept requests without an OLP API key; production deployments should set this to false (ADR 0007 § 7).',
   });
 }
+// D69 (ADR 0011): startup-time prerequisite validation for /health.anonymousKey
+// advertisement. The field is emitted ONLY when all three prerequisites hold:
+//   (1) auth.advertise_anonymous_key === true (config opt-in)
+//   (2) auth.allow_anonymous === true         (anonymous tier must be reachable
+//                                              for the advertised key to be
+//                                              meaningful to zero-config callers)
+//   (3) at least one advertised key exists on disk (manifest with
+//       plaintext_advertise field, not revoked)
+// Violations log warn at startup but the server still boots; the runtime
+// handleHealth checks the same conditions and simply omits the field.
+if (_authConfig.advertise_anonymous_key === true) {
+  if (_authConfig.allow_anonymous !== true) {
+    logEvent('warn', 'anonymous_key_advertised_but_denied', {
+      message: 'auth.advertise_anonymous_key=true but auth.allow_anonymous=false — the advertised key would not be usable anonymously. /health.anonymousKey will NOT be emitted until allow_anonymous=true. See ADR 0011.',
+    });
+  } else if (findAdvertisedKey() === null) {
+    logEvent('warn', 'anonymous_key_advertised_but_no_anonymous_key_exists', {
+      message: 'auth.advertise_anonymous_key=true but no active key with plaintext_advertise exists. Run `olp-keys keygen --anonymous --advertise` to create one. /health.anonymousKey will NOT be emitted until then. See ADR 0011.',
+    });
+  }
+}
 
 /** @internal — test seam: inject a synthetic auth config (no file I/O). */
 export function __setAuthConfig(config) {
-  _authConfig = config ?? { allow_anonymous: false, owner_only_endpoints: ['/health'], fallback_detail_header_policy: 'owner_only' };
+  _authConfig = config ?? { allow_anonymous: false, owner_only_endpoints: ['/health'], fallback_detail_header_policy: 'owner_only', advertise_anonymous_key: false };
+  // D69: defensively normalize so tests passing partial configs still get a
+  // boolean advertise_anonymous_key value (downstream code treats undefined
+  // as falsy but explicit normalisation matches loadAuthConfigSync's contract).
+  if (typeof _authConfig.advertise_anonymous_key !== 'boolean') {
+    _authConfig.advertise_anonymous_key = false;
+  }
 }
 
 /** @internal — reset auth config to file-loaded state. */
@@ -751,9 +780,34 @@ async function handleHealth(req, res) {
     });
   }
 
+  // D69 (ADR 0011): compute opt-in /health.anonymousKey. The field is added
+  // to BOTH trimmed and full payloads (the trimmed payload's whole purpose
+  // is to be readable by anonymous clients so they can self-bootstrap into
+  // a real key). Three prerequisites must hold (see startup warns above):
+  //   (1) auth.advertise_anonymous_key === true
+  //   (2) auth.allow_anonymous === true
+  //   (3) findAdvertisedKey() returns a non-null active manifest
+  // When any fails, the field is absent (NOT null) — preserves the v0.3.x
+  // /health payload shape for clients that strict-validate keys.
+  let anonymousKey = null;
+  if (_authConfig.advertise_anonymous_key === true && _authConfig.allow_anonymous === true) {
+    try {
+      const adv = findAdvertisedKey();
+      if (adv && typeof adv.plaintext_advertise === 'string' && adv.plaintext_advertise.length > 0) {
+        anonymousKey = adv.plaintext_advertise;
+      }
+    } catch {
+      // Filesystem error reading manifests is non-fatal; just omit the field.
+      anonymousKey = null;
+    }
+  }
+
   if (isGated && !isOwner) {
-    // Trimmed payload per § 7.1.
-    return sendJSON(res, 200, { ok: true, version: VERSION });
+    // Trimmed payload per § 7.1. D69: include anonymousKey here too — zero-
+    // config olp-connect callers read it BEFORE they have a key.
+    const trimmed = { ok: true, version: VERSION };
+    if (anonymousKey !== null) trimmed.anonymousKey = anonymousKey;
+    return sendJSON(res, 200, trimmed);
   }
 
   // Full payload (owner OR /health removed from owner_only_endpoints).
@@ -774,11 +828,13 @@ async function handleHealth(req, res) {
       providerStatuses[name] = { ok: false, error: e.message, activeSpawns };
     }
   }
-  sendJSON(res, 200, {
+  const fullPayload = {
     ok: true,
     version: VERSION,
     providers: { enabled, available, status: providerStatuses },
-  });
+  };
+  if (anonymousKey !== null) fullPayload.anonymousKey = anonymousKey;
+  sendJSON(res, 200, fullPayload);
 }
 
 /**

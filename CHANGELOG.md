@@ -4,6 +4,29 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D47 — `bin/olp-keys.mjs` keygen CLI (Phase 2 functional scope closes)
+
+Fourth Phase 2 implementation D-day. Closes ADR 0007 § 10 acceptance criterion #9 (bootstrap workflow must be reproducible without manual file editing) by shipping a minimal keygen CLI per § 9.1. **Phase 2 functional scope is complete with this D-day** — remaining work is Phase 2 close → v0.2.0 (maintainer-triggered, explicit per CLAUDE.md `release_kit.phase_close_trigger`).
+
+- **New file `bin/olp-keys.mjs`** (~250 lines): subcommand CLI with three subcommands:
+  - `keygen [--owner] [--name=<label>] [--tier=guest|owner] [--providers=<csv>] [--force]` — creates a key + prints plaintext token to stdout ONCE; manifest stores only SHA-256 hash. `--force` revokes existing owner keys before creating the new owner (recovery flow per ADR § 9.3). `--providers=*` (default) or comma-separated allowlist.
+  - `list [--owner-only] [--include-revoked]` — lists keys with `token_hash` redacted (lib/keys.mjs `listKeys` already redacts).
+  - `revoke --id=<key-id>` — marks the key's `revoked_at`; idempotent (already-revoked → no-op + status message); missing id → exit 2.
+  - Common flag `--olp-home=<path>` overrides `~/.olp/`; defaults to `OLP_HOME` env or `~/.olp/`.
+- **`package.json` `bin` field**: `olp-keys` → `./bin/olp-keys.mjs` so `npx olp-keys ...` resolves; also `npm run olp-keys ...` via scripts.
+- **Module shape**: CLI exposes `runCli(argv, { out, err })` so tests can invoke it with synthetic argv + IO writers (no process spawn). Main guard auto-runs when invoked as entrypoint.
+- **Plaintext token discipline**: per ADR § 5 + § 9.1, plaintext is printed exactly once on stdout. Never logged, never written to manifest, never written to audit. Operators must capture immediately; lost → `--force` revoke + regenerate.
+- **`--force` async correctness**: `cmdKeygen` is async and `await`s each `revokeKey` (which is async — acquires per-key write lock per § 6.4). Sequence: revoke each existing owner manifest atomically → then `createKey` for new owner. Avoids the race where create-new runs before revoke-old completes.
+- **Test surface (Suite 22, +20 tests — 524 → 544):**
+  - 22a-1..5: parseArgv unit tests (`--flag=value`, `--flag value`, boolean, mixed positional)
+  - 22b-1..5: keygen subcommand (owner default, name+providers, missing-name error, invalid-tier error, --force revoke-then-create flow with isolation tmpdir)
+  - 22c-1..3: list subcommand (empty, populated with token_hash-redaction check, --owner-only filter)
+  - 22d-1..4: revoke subcommand (valid id, idempotent re-revoke, missing-id error, nonexistent-id error)
+  - 22e-1..3: top-level CLI behaviour (--help / no args / unknown subcommand exit codes)
+- **Documentation:** AGENTS.md `lib/keys.mjs` marker promoted to ✅; new `bin/olp-keys.mjs` entry. Implementation-status-note + shipped-set updated. README.md Implementation Status table gains `bin/olp-keys.mjs` row; Known limitations note updated to "Phase 2 functional scope complete; close pending"; new "Bootstrap workflow" section with copy-pasteable npx commands + recovery flow.
+- **Test count:** 524 → 544 (+20 D47 tests in Suite 22).
+- **Authority:** ADR 0007 (multi-key auth — § 5 token format, § 9.1 minimal keygen command surface, § 9.3 recovery, § 10 acceptance criterion #9 covered); CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; standing autopilot grant.
+
 ### D46 — owner-vs-guest gating for `/health` + `X-OLP-Fallback-Detail` (Phase 2 closes header observability gap)
 
 Third Phase 2 implementation D-day. Closes ADR 0007 § 10 acceptance criteria #4 (`/health` payload trimming for non-owner) + #5 (`X-OLP-Fallback-Detail` emission gating per `fallback_detail_header_policy`). Phase 2 server surface is now fully gated end-to-end; remaining D-days are keygen CLI surface (D47+) and Phase 2 close (v0.2.0, maintainer-triggered).

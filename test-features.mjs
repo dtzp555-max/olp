@@ -10657,3 +10657,243 @@ describe('Suite 21 — D46 owner-vs-guest gating (ADR 0007 §§ 7.1, 7.2)', () =
     });
   });
 });
+
+// ── Suite 22: D47 keygen CLI (bin/olp-keys.mjs, ADR 0007 § 9.1) ───────────
+//
+// Tests for the minimal keygen command surface that satisfies ADR § 10
+// acceptance criterion #9 (bootstrap workflow must be reproducible without
+// manual file editing).
+
+import { runCli as runOlpKeysCli, parseArgv as parseOlpKeysArgv } from './bin/olp-keys.mjs';
+
+describe('Suite 22 — D47 keygen CLI (bin/olp-keys.mjs, ADR 0007 § 9.1)', () => {
+
+  describe('22a — parseArgv unit tests', () => {
+    it('22a-1: empty argv → empty positional + empty flags', () => {
+      const r = parseOlpKeysArgv([]);
+      assert.deepEqual(r.positional, []);
+      assert.deepEqual(r.flags, {});
+    });
+
+    it('22a-2: --flag=value form', () => {
+      const r = parseOlpKeysArgv(['--name=keyA', '--tier=owner']);
+      assert.equal(r.flags.name, 'keyA');
+      assert.equal(r.flags.tier, 'owner');
+    });
+
+    it('22a-3: --flag value form (space-separated)', () => {
+      const r = parseOlpKeysArgv(['--name', 'keyB', '--tier', 'guest']);
+      assert.equal(r.flags.name, 'keyB');
+      assert.equal(r.flags.tier, 'guest');
+    });
+
+    it('22a-4: --flag (boolean, no value) when followed by another --flag', () => {
+      const r = parseOlpKeysArgv(['--owner', '--force']);
+      assert.equal(r.flags.owner, true);
+      assert.equal(r.flags.force, true);
+    });
+
+    it('22a-5: positional args + flags mixed', () => {
+      const r = parseOlpKeysArgv(['keygen', '--owner']);
+      assert.deepEqual(r.positional, ['keygen']);
+      assert.equal(r.flags.owner, true);
+    });
+  });
+
+  describe('22b — keygen subcommand', () => {
+    let TMP;
+    before(() => { TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-22b-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetWriteLocks(); });
+
+    it('22b-1: keygen --owner creates owner key + prints plaintext token to stdout', async () => {
+      let out = '';
+      const code = await runOlpKeysCli(['keygen', '--owner', '--olp-home', TMP], {
+        out: s => { out += s; },
+        err: () => {},
+      });
+      assert.equal(code, 0);
+      assert.match(out, /token \(plaintext\):\s+olp_[A-Za-z0-9_-]{43}/);
+      assert.match(out, /owner_tier:\s+owner/);
+      // Verify manifest was actually written
+      const list = listKeys({ olpHome: TMP });
+      assert.equal(list.length, 1);
+      assert.equal(list[0].owner_tier, 'owner');
+    });
+
+    it('22b-2: keygen --name=test --providers=anthropic,openai → guest key with explicit providers', async () => {
+      let out = '';
+      const code = await runOlpKeysCli(
+        ['keygen', '--name=test-guest', '--providers=anthropic,openai', '--olp-home', TMP],
+        { out: s => { out += s; }, err: () => {} },
+      );
+      assert.equal(code, 0);
+      assert.match(out, /owner_tier:\s+guest/);
+      assert.match(out, /providers_enabled:\s+\[anthropic, openai\]/);
+    });
+
+    it('22b-3: keygen without --name AND without --owner → error exit 1', async () => {
+      let err = '';
+      const code = await runOlpKeysCli(['keygen', '--olp-home', TMP], {
+        out: () => {},
+        err: s => { err += s; },
+      });
+      assert.equal(code, 1);
+      assert.match(err, /--name is required/);
+    });
+
+    it('22b-4: keygen --tier=admin → error exit 1 (invalid tier)', async () => {
+      let err = '';
+      const code = await runOlpKeysCli(
+        ['keygen', '--name=bad', '--tier=admin', '--olp-home', TMP],
+        { out: () => {}, err: s => { err += s; } },
+      );
+      assert.equal(code, 1);
+      assert.match(err, /--tier must be "owner" or "guest"/);
+    });
+
+    it('22b-5: keygen --owner --force revokes existing owner + creates new', async () => {
+      // Use a fresh tmpdir for this isolation
+      const TMP2 = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-22b5-'));
+      try {
+        // Create initial owner
+        await runOlpKeysCli(['keygen', '--owner', '--olp-home', TMP2], { out: () => {}, err: () => {} });
+        const list1 = listKeys({ olpHome: TMP2 });
+        assert.equal(list1.length, 1);
+        const originalId = list1[0].id;
+
+        // --force: revoke existing + create new
+        let err = '';
+        const code = await runOlpKeysCli(['keygen', '--owner', '--force', '--olp-home', TMP2], {
+          out: () => {},
+          err: s => { err += s; },
+        });
+        assert.equal(code, 0);
+        assert.match(err, new RegExp(`Revoked existing owner key id=${originalId}`));
+
+        // Listing including revoked must show 2 entries; active-only must show 1
+        const listAll = listKeys({ olpHome: TMP2 });
+        assert.equal(listAll.length, 2);
+        const activeOwners = listAll.filter(k => k.owner_tier === 'owner' && k.revoked_at === null);
+        assert.equal(activeOwners.length, 1, 'exactly one active owner after --force');
+        const revokedOwners = listAll.filter(k => k.owner_tier === 'owner' && k.revoked_at !== null);
+        assert.equal(revokedOwners.length, 1, 'exactly one revoked owner after --force');
+        assert.equal(revokedOwners[0].id, originalId);
+      } finally {
+        rmSync(TMP2, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('22c — list subcommand', () => {
+    let TMP;
+    before(() => { TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-22c-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetWriteLocks(); });
+
+    it('22c-1: list with no keys → "No keys."', async () => {
+      let out = '';
+      const code = await runOlpKeysCli(['list', '--olp-home', TMP], {
+        out: s => { out += s; }, err: () => {},
+      });
+      assert.equal(code, 0);
+      assert.match(out, /No keys\./);
+    });
+
+    it('22c-2: list after 2 keys → both visible with redacted token_hash', async () => {
+      await runOlpKeysCli(['keygen', '--name=alpha', '--olp-home', TMP], { out: () => {}, err: () => {} });
+      await runOlpKeysCli(['keygen', '--name=beta', '--owner', '--olp-home', TMP], { out: () => {}, err: () => {} });
+      let out = '';
+      const code = await runOlpKeysCli(['list', '--olp-home', TMP], { out: s => { out += s; }, err: () => {} });
+      assert.equal(code, 0);
+      assert.match(out, /name:\s+alpha/);
+      assert.match(out, /name:\s+beta/);
+      assert.match(out, /owner_tier:\s+owner/);
+      assert.match(out, /owner_tier:\s+guest/);
+      // token_hash MUST NOT appear in list output (lib/keys.mjs listKeys redacts it)
+      assert.ok(!out.includes('token_hash'), 'list output must not include token_hash field');
+    });
+
+    it('22c-3: list --owner-only filters to owner_tier=owner', async () => {
+      let out = '';
+      const code = await runOlpKeysCli(['list', '--owner-only', '--olp-home', TMP], {
+        out: s => { out += s; }, err: () => {},
+      });
+      assert.equal(code, 0);
+      assert.ok(!out.includes('name:       alpha'), 'guest "alpha" must be filtered out with --owner-only');
+      assert.match(out, /name:\s+beta/, 'owner "beta" must remain');
+    });
+  });
+
+  describe('22d — revoke subcommand', () => {
+    let TMP, keyId;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-22d-'));
+      const r = createKey({ name: '22d-target', owner_tier: 'guest', olpHome: TMP });
+      keyId = r.id;
+    });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetWriteLocks(); });
+
+    it('22d-1: revoke --id=<valid> → exit 0, manifest revoked_at set', async () => {
+      let out = '';
+      const code = await runOlpKeysCli(['revoke', `--id=${keyId}`, '--olp-home', TMP], {
+        out: s => { out += s; }, err: () => {},
+      });
+      assert.equal(code, 0);
+      assert.match(out, new RegExp(`Revoked key id=${keyId}`));
+      const m = readManifest(keyId, { olpHome: TMP });
+      assert.ok(m.revoked_at !== null);
+    });
+
+    it('22d-2: revoke --id=<already-revoked> → exit 0 + "already revoked" message (idempotent)', async () => {
+      let out = '';
+      const code = await runOlpKeysCli(['revoke', `--id=${keyId}`, '--olp-home', TMP], {
+        out: s => { out += s; }, err: () => {},
+      });
+      assert.equal(code, 0);
+      assert.match(out, /already revoked/);
+    });
+
+    it('22d-3: revoke without --id → exit 1', async () => {
+      let err = '';
+      const code = await runOlpKeysCli(['revoke', '--olp-home', TMP], {
+        out: () => {}, err: s => { err += s; },
+      });
+      assert.equal(code, 1);
+      assert.match(err, /--id=<key-id> is required/);
+    });
+
+    it('22d-4: revoke --id=<nonexistent> → exit 2', async () => {
+      let err = '';
+      const code = await runOlpKeysCli(['revoke', '--id=nonexistent-key', '--olp-home', TMP], {
+        out: () => {}, err: s => { err += s; },
+      });
+      assert.equal(code, 2);
+      assert.match(err, /no key with id="nonexistent-key"/);
+    });
+  });
+
+  describe('22e — top-level CLI behaviour', () => {
+    it('22e-1: --help → exit 0 with usage text', async () => {
+      let out = '';
+      const code = await runOlpKeysCli(['--help'], { out: s => { out += s; }, err: () => {} });
+      assert.equal(code, 0);
+      assert.match(out, /OLP key management CLI/);
+      assert.match(out, /keygen/);
+      assert.match(out, /list/);
+      assert.match(out, /revoke/);
+    });
+
+    it('22e-2: no args → exit 1 with usage text', async () => {
+      let out = '';
+      const code = await runOlpKeysCli([], { out: s => { out += s; }, err: () => {} });
+      assert.equal(code, 1);
+      assert.match(out, /OLP key management CLI/);
+    });
+
+    it('22e-3: unknown subcommand → exit 1 with error', async () => {
+      let err = '';
+      const code = await runOlpKeysCli(['frobnicate'], { out: () => {}, err: s => { err += s; } });
+      assert.equal(code, 1);
+      assert.match(err, /unknown subcommand "frobnicate"/);
+    });
+  });
+});

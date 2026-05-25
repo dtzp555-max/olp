@@ -4,9 +4,13 @@
   "description": "Personal multi-provider LLM proxy. Successor to OCP. One HTTP endpoint, multiple subscriptions behind it, automatic routing + fallback + caching.",
   "type": "module",
   "main": "server.mjs",
+  "bin": {
+    "olp-keys": "./bin/olp-keys.mjs"
+  },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node test-features.mjs"
+    "test": "node test-features.mjs",
+    "olp-keys": "node bin/olp-keys.mjs"
   },
   "engines": {
     "node": ">=18"

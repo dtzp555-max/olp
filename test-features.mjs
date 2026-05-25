@@ -10146,6 +10146,35 @@ describe('Suite 20 — server.mjs auth integration (D45, ADR 0007)', () => {
       });
       assert.equal(r.status, 200);
     });
+
+    it('20h-extra-audit: D53 — key_no_provider_access 403 audit row has tried_providers = []', async () => {
+      // Per ADR 0007 § 8 tried_providers semantics clarification: the field
+      // captures providers the server actually dispatched. On 403 (filter
+      // rejected the whole chain) the server dispatched zero providers, so
+      // tried_providers MUST be []. The configured-but-blocked chain only
+      // appears in the human-readable error message, not in the audit.
+      // D45 P2 deferral fix — was previously stamping the original chain
+      // which distorted "which providers did key X actually call" queries.
+      const { id, plaintext_token } = createKey({ name: '20h-extra-audit', owner_tier: 'guest', providers_enabled: ['mistral'], olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20h-extra-audit' }] },
+      });
+      assert.equal(r.status, 403);
+      assert.equal(JSON.parse(r.body).error.type, 'key_no_provider_access');
+      // Wait for the res.on('finish') audit append
+      await new Promise(resolve => setTimeout(resolve, 25));
+      const auditPath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      const lines = fsReadFileSync(auditPath, 'utf-8').trim().split('\n').filter(Boolean);
+      const row = lines.map(l => JSON.parse(l)).find(r =>
+        r.path === '/v1/chat/completions' && r.status_code === 403 && r.key_id === id,
+      );
+      assert.ok(row, '403 audit row must be present');
+      assert.equal(row.error_code, 'key_no_provider_access');
+      assert.deepEqual(row.tried_providers, [],
+        'tried_providers MUST be [] on key_no_provider_access — D53 semantic fix per ADR 0007 § 8 clarification');
+    });
   });
 
   // ── 20i: per-key cache namespace isolation (criterion #1) ────────────────

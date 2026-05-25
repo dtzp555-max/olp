@@ -4,6 +4,17 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D53 — `tried_providers` schema semantic fix (D45 P2 deferral closed)
+
+Sixth Phase 3 D-day. Small focused fix for the D45 fresh-context opus reviewer P2 finding that was deferred: `auditCtx.tried_providers` on the `key_no_provider_access` 403 path was being stamped with the ORIGINAL chain (which was filtered out, never dispatched), distorting downstream audit queries like "which providers did key X actually call".
+
+- **`server.mjs` 403 path fix** (around L815): `auditCtx.tried_providers = []` (was `_originalChainProviders`). The configured-but-blocked chain still appears in the human-readable error message body — the audit just doesn't claim those providers were "tried" when the server's filter dispatched zero.
+- **ADR 0007 § 8 amendment**: new paragraph spelling out the `tried_providers` semantic — "the list of providers the server actually dispatched a spawn against. A provider that was configured in the chain but filtered out by `providers_enabled` gating is NOT included — the key didn't try the provider, the gate did. On the 403 path `tried_providers` is the empty array." Plus a forward note that audit log rotation moved to Phase 3 / ADR 0008 § 5.
+- **Suite 20h-extra-audit (+1 test — 600 → 601):** creates a guest key with `providers_enabled: ['mistral']`; fires a request for an Anthropic-routed model; asserts 403 `key_no_provider_access`; reads the audit row from `audit.ndjson`; asserts `tried_providers === []`. This pins the D53 semantic against regression — if a future change reverts to stamping the original chain, the test fails.
+- **Documentation:** CHANGELOG D53 entry; ADR 0007 § 8 amendment.
+- **Test count:** 600 → 601 (+1 D53 regression test).
+- **Authority:** ADR 0007 § 8 amendment (D53, 2026-05-25); D45 fresh-context opus reviewer P2 deferral note; CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; standing autopilot grant.
+
 ### D52 — Daily audit rotation (`lib/audit.mjs` extension + `bin/olp-audit-rotate.mjs`)
 
 Fifth Phase 3 D-day. Adds daily UTC-aware rotation to `lib/audit.mjs` per ADR 0008 § 5 + ships an external cron tool. Rotation is **synchronous** at v0.3.0 (Lane 3 = B daily rotation; synchronous design eliminates the race that an async wrapper would create between date-change-detection and the append).

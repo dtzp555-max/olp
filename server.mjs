@@ -813,7 +813,15 @@ async function handleChatCompletions(req, res) {
   chain = chain.filter(hop => isProviderEnabled(olpIdentity, hop.provider));
   if (chain.length === 0) {
     auditCtx.error_code = 'key_no_provider_access';
-    auditCtx.tried_providers = _originalChainProviders;
+    // D53 (D45 P2 deferral fix): tried_providers semantic per ADR 0007 § 8 is
+    // "providers the server actually dispatched a spawn against". On 403 the
+    // filtered chain is empty — no provider was dispatched, so the audit
+    // value is []. The configured-but-blocked chain providers go into the
+    // human-readable error message + a separate _diagnostic field we don't
+    // surface in audit (would distort downstream queries like "which
+    // providers did key X actually call"). ADR 0007 § 8 amended in this
+    // D-day's CHANGELOG entry to spell the semantic.
+    auditCtx.tried_providers = [];
     const allowed = olpIdentity.providers_enabled === '*' ? '*' : (olpIdentity.providers_enabled ?? []).join(', ') || '(none)';
     return sendError(
       res, 403,

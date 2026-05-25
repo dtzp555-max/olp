@@ -263,7 +263,9 @@ Field origin:
 
 **No PII.** Audit deliberately captures NO request body, NO response body, NO IR-message content. Hash + shape only. This is a personal/family deployment property; do not relax without a separate ADR amendment.
 
-**Rotation.** Phase 2 does NOT rotate `audit.ndjson`. Rotation policy lands in Phase 3 alongside Dashboard / audit query work (§ 12).
+**`tried_providers` semantics (clarification, D53 / 2026-05-25).** The field captures the list of providers the server **actually dispatched a spawn against** for this request. A provider that was configured in the chain but filtered out by `providers_enabled` gating (resulting in 403 `key_no_provider_access`) is NOT included — the key didn't try the provider, the gate did. On the 403 path `tried_providers` is the empty array. The configured-but-blocked chain providers appear in the human-readable error message returned to the client but are intentionally NOT surfaced in the audit event, so downstream queries like "which providers did key X actually call" stay accurate. This semantic was implicit in the D45 implementation (where the field was set to the original chain on 403, misrepresenting "tried"); D53 corrects the implementation + amends this section to spell out the intent.
+
+**Rotation.** Phase 2 does NOT rotate `audit.ndjson`. Rotation policy ships in Phase 3 — daily rotation via `lib/audit.mjs` `_maybeRotateAudit` synchronous trigger on first append after UTC date change + optional `bin/olp-audit-rotate.mjs` external cron. See ADR 0008 § 5.
 
 ---
 

@@ -13,9 +13,46 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
 import { EventEmitter } from 'node:events';
-import { homedir } from 'node:os';
+import { homedir, tmpdir as _tmpdirForSetup } from 'node:os';
+import { mkdtempSync as _mkdtempSyncForSetup } from 'node:fs';
+import { join as _pathJoinForSetup } from 'node:path';
 import { computeCacheKey, extractCacheControlMarkers, hasCacheControl } from './lib/cache/keys.mjs';
 import { CacheStore } from './lib/cache/store.mjs';
+
+// ── Phase 2 / D45 test-mode setup ─────────────────────────────────────────
+// Two adjustments keep pre-D45 tests working alongside the new auth gate:
+//   1. process.env.OLP_HOME → tmpdir so audit ndjson / manifest writes
+//      triggered by handleChatCompletions / handleModels do not pollute
+//      the user's real ~/.olp/. lib/keys.mjs + lib/audit.mjs resolve the
+//      env per-call so this takes effect immediately.
+//   2. server.mjs __setAuthConfig({ allow_anonymous: true }) so existing
+//      HTTP integration tests (Suite 18 etc.) that hit /v1/chat/completions
+//      and /v1/models without an Authorization header continue to pass
+//      via the anonymous identity. Suite 20 (D45 auth tests) explicitly
+//      overrides per-case to exercise allow_anonymous: false / valid key /
+//      revoked / env-owner / providers_enabled paths.
+// (ESM imports are hoisted, so all module side effects — including
+// server.mjs's startup loadAuthConfigSync() — complete before this body
+// code runs. Setting OLP_HOME + __setAuthConfig here applies to all
+// suites below.)
+const _GLOBAL_TEST_OLP_HOME = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-home-'));
+process.env.OLP_HOME = _GLOBAL_TEST_OLP_HOME;
+// Clean up the global test tmpdir on process exit so successive npm test runs
+// don't accumulate /var/folders/.../olp-test-home-* directories. process.on
+// ('exit') fires synchronously after node:test reports all results.
+process.on('exit', () => {
+  try {
+    // rmSync is imported lower in the file (Suite 19 imports it from 'node:fs').
+    // ESM hoists all imports to top-of-module so the binding is available here.
+    rmSync(_GLOBAL_TEST_OLP_HOME, { recursive: true, force: true });
+  } catch {
+    // best-effort; do not throw at exit
+  }
+});
+// __setAuthConfig is imported below from './server.mjs'; deferring the call
+// to a later block (after server.mjs's import-time loadAuthConfigSync runs)
+// is necessary because ESM hoists imports before this body code. See the
+// "Phase 2 / D45 server-side default override" block below the imports.
 
 // ── Modules under test ────────────────────────────────────────────────────
 
@@ -4302,7 +4339,18 @@ import {
   __setFallbackConfig,
   __resetFallbackConfig,
   __clearCache,
+  __setAuthConfig,
+  __resetAuthConfig,
 } from './server.mjs';
+
+// ── Phase 2 / D45 server-side default override ────────────────────────────
+// Override the auth.allow_anonymous default (false in production) so that
+// existing pre-D45 HTTP integration tests (Suite 18 etc.) that make /v1/*
+// requests without an Authorization header continue to pass as anonymous.
+// New Suite 20 tests explicitly call __setAuthConfig per-case to exercise
+// the production-default-off path + valid key / revoked / providers_enabled
+// scopes.
+__setAuthConfig({ allow_anonymous: true });
 
 // ── 13a: Trigger taxonomy ────────────────────────────────────────────────
 
@@ -9864,4 +9912,455 @@ describe('Suite 19 — lib/keys.mjs multi-key auth (ADR 0007, D44)', () => {
     });
   });
 
+});
+
+// ── Suite 20: server.mjs auth integration (D45, ADR 0007 §§ 5/6.2/7/9.4) ──
+//
+// HTTP-level tests for the Phase 2 D45 server-side wire-up:
+//   - auth.allow_anonymous false-by-default 401
+//   - Authorization Bearer / x-api-key header acceptance
+//   - revoked-key 401 (acceptance criterion #6 — full coverage with D45)
+//   - OLP_OWNER_TOKEN env override (acceptance criterion #10 — full coverage)
+//   - providers_enabled 403 scope enforcement (acceptance criterion #11)
+//   - per-key cache namespace isolation (acceptance criterion #1)
+//   - audit ndjson written with correct fields (acceptance criterion #8)
+//   - touchLastUsed wire updates last_used_at after a request
+//   - /v1/models gates auth the same way as /v1/chat/completions
+
+import { readFileSync as fsReadFileSync, existsSync as fsExistsSync } from 'node:fs';
+import { appendAuditEvent, __resetAuditDropCount } from './lib/audit.mjs';
+
+describe('Suite 20 — server.mjs auth integration (D45, ADR 0007)', () => {
+  // Each describe block gets its own tmp OLP_HOME so audit + key writes are
+  // isolated and verifiable. Restore the global test default in after().
+  const GLOBAL_OLP_HOME = process.env.OLP_HOME;
+
+  // Each Suite 20 server requires the anthropic auth-check to pass before the
+  // mock spawn runs. lib/providers/anthropic.mjs _spawnAndStream checks for an
+  // OAuth token BEFORE calling the (mock) spawn — without a token the AUTH_MISSING
+  // pre-check fires and the request 502s before the mock can return chunks. Same
+  // pattern as Suite 9 cache HTTP tests (line ~2154 "test-fake-oauth-token-for-
+  // cache-tests"). CI Node 24 has no OAuth env; local dev machines may; CI was
+  // the trigger that caught this.
+  let _suite20SavedOAuth;
+  function ensureSuite20FakeOAuth() {
+    _suite20SavedOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'suite20-fake-oauth-token';
+  }
+  function restoreSuite20OAuth() {
+    if (_suite20SavedOAuth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = _suite20SavedOAuth;
+    else delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  }
+
+  function makeSuite20Server() {
+    __setProvidersEnabled({ anthropic: true });
+    __setSpawnImpl(makeMockSpawn(['suite20-mock-response']));
+    ensureSuite20FakeOAuth();
+    const server = createOlpServer();
+    return new Promise(resolve => {
+      server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+    });
+  }
+
+  function teardownSuite20(server) {
+    return new Promise(resolve => {
+      __resetSpawnImpl();
+      __setProvidersEnabled({});
+      __clearCache();
+      restoreSuite20OAuth();
+      if (server) server.close(() => resolve());
+      else resolve();
+    });
+  }
+
+  // ── 20a-d: header parsing + happy paths ────────────────────────────────
+
+  describe('20a-d — header parsing + valid key paths', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-20ad-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: false });
+      ({ server, port } = await makeSuite20Server());
+    });
+    after(async () => {
+      await teardownSuite20(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('20a: allow_anonymous=false + no Authorization header → 401 auth_required', async () => {
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20a' }] },
+      });
+      assert.equal(r.status, 401);
+      const err = JSON.parse(r.body);
+      assert.equal(err.error.type, 'auth_required');
+    });
+
+    it('20b: valid Authorization: Bearer <token> → 200 (filesystem identity)', async () => {
+      const { plaintext_token } = createKey({ name: '20b-bearer', owner_tier: 'guest', providers_enabled: ['anthropic'], olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20b' }] },
+      });
+      assert.equal(r.status, 200);
+    });
+
+    it('20c: x-api-key header alternative → 200 (filesystem identity)', async () => {
+      const { plaintext_token } = createKey({ name: '20c-xapikey', owner_tier: 'guest', providers_enabled: ['anthropic'], olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { 'x-api-key': plaintext_token },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20c' }] },
+      });
+      assert.equal(r.status, 200);
+    });
+
+    it('20d: invalid token → 401 invalid_or_revoked_key', async () => {
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: 'Bearer olp_not-a-real-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20d' }] },
+      });
+      assert.equal(r.status, 401);
+      const err = JSON.parse(r.body);
+      assert.equal(err.error.type, 'invalid_or_revoked_key');
+    });
+  });
+
+  // ── 20e-g: revocation + env owner + allow_anonymous true ────────────────
+
+  describe('20e-g — revocation + env owner override + anonymous-mode dev', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-20eg-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: false });
+      ({ server, port } = await makeSuite20Server());
+    });
+    after(async () => {
+      await teardownSuite20(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true });
+      delete process.env.ENV_OWNER_VAR;
+      delete process.env[ENV_OWNER_VAR];
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('20e: revoked key → 401 invalid_or_revoked_key (criterion #6 full coverage)', async () => {
+      const { id, plaintext_token } = createKey({ name: '20e-rev', owner_tier: 'guest', providers_enabled: ['anthropic'], olpHome: TMP });
+      // First request — should succeed
+      const r1 = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20e-1' }] },
+      });
+      assert.equal(r1.status, 200);
+      // Revoke
+      await revokeKey({ id, olpHome: TMP });
+      // Second request — must 401
+      const r2 = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20e-2' }] },
+      });
+      assert.equal(r2.status, 401);
+      const err = JSON.parse(r2.body);
+      assert.equal(err.error.type, 'invalid_or_revoked_key');
+    });
+
+    it('20f: OLP_OWNER_TOKEN env override → 200 (env identity, criterion #10 full coverage)', async () => {
+      const envToken = 'olp_' + 'f'.repeat(43);
+      process.env[ENV_OWNER_VAR] = envToken;
+      try {
+        const r = await fetch({
+          port, method: 'POST', path: '/v1/chat/completions',
+          headers: { Authorization: `Bearer ${envToken}` },
+          body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20f' }] },
+        });
+        assert.equal(r.status, 200);
+      } finally {
+        delete process.env[ENV_OWNER_VAR];
+      }
+    });
+
+    it('20g: allow_anonymous=true + no header → 200 (anonymous identity — dev escape hatch)', async () => {
+      __setAuthConfig({ allow_anonymous: true });
+      try {
+        const r = await fetch({
+          port, method: 'POST', path: '/v1/chat/completions',
+          body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20g' }] },
+        });
+        assert.equal(r.status, 200);
+      } finally {
+        __setAuthConfig({ allow_anonymous: false });
+      }
+    });
+  });
+
+  // ── 20h: providers_enabled scope enforcement (criterion #11) ─────────────
+
+  describe('20h — providers_enabled scope enforcement (criterion #11)', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-20h-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: false });
+      ({ server, port } = await makeSuite20Server());
+    });
+    after(async () => {
+      await teardownSuite20(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('20h: providers_enabled: ["mistral"] + anthropic-routed model → 403 key_no_provider_access', async () => {
+      const { plaintext_token } = createKey({ name: '20h-scoped', owner_tier: 'guest', providers_enabled: ['mistral'], olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20h' }] },
+      });
+      assert.equal(r.status, 403);
+      const err = JSON.parse(r.body);
+      assert.equal(err.error.type, 'key_no_provider_access');
+    });
+
+    it('20h-extra: providers_enabled: "*" + anthropic-routed model → 200 (sanity baseline)', async () => {
+      const { plaintext_token } = createKey({ name: '20h-wildcard', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20h-star' }] },
+      });
+      assert.equal(r.status, 200);
+    });
+  });
+
+  // ── 20i: per-key cache namespace isolation (criterion #1) ────────────────
+
+  describe('20i — per-key cache namespace isolation (criterion #1)', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-20i-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: false });
+      ({ server, port } = await makeSuite20Server());
+    });
+    after(async () => {
+      await teardownSuite20(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('20i: keys A + B sending identical payload do NOT share cache (per-keyId namespace from ADR 0005 D1)', async () => {
+      const { plaintext_token: tokenA } = createKey({ name: '20i-A', owner_tier: 'guest', providers_enabled: ['anthropic'], olpHome: TMP });
+      const { plaintext_token: tokenB } = createKey({ name: '20i-B', owner_tier: 'guest', providers_enabled: ['anthropic'], olpHome: TMP });
+      const sharedPayload = {
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: '20i-cache-shared-prompt' }],
+      };
+
+      // Key A: first request → miss
+      const rA1 = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${tokenA}` },
+        body: sharedPayload,
+      });
+      assert.equal(rA1.status, 200);
+      assert.equal(rA1.headers['x-olp-cache'], 'miss');
+
+      // Key A: second identical request → hit
+      const rA2 = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${tokenA}` },
+        body: sharedPayload,
+      });
+      assert.equal(rA2.status, 200);
+      assert.equal(rA2.headers['x-olp-cache'], 'hit', 'Key A second request must hit cache within A namespace');
+
+      // Key B: identical payload but different key → MUST be miss (isolated namespace)
+      const rB1 = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${tokenB}` },
+        body: sharedPayload,
+      });
+      assert.equal(rB1.status, 200);
+      assert.equal(rB1.headers['x-olp-cache'], 'miss',
+        'Key B first request MUST be miss — per-key cache isolation (ADR 0005 D1 + ADR 0007 § 7)');
+    });
+  });
+
+  // ── 20j: audit ndjson written with § 8 schema fields ─────────────────────
+
+  describe('20j — audit ndjson written per § 8 schema', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-20j-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: false });
+      __resetAuditDropCount();
+      ({ server, port } = await makeSuite20Server());
+    });
+    after(async () => {
+      await teardownSuite20(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('20j: successful request appends an audit row with key_id, model, status_code, latency_ms (criterion #8)', async () => {
+      const { id, plaintext_token } = createKey({ name: '20j-aud', owner_tier: 'guest', providers_enabled: ['anthropic'], olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20j' }] },
+      });
+      assert.equal(r.status, 200);
+      // Allow the res.on('finish') hook to flush the audit write
+      await new Promise(resolve => setTimeout(resolve, 25));
+
+      const auditPath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      assert.ok(fsExistsSync(auditPath), 'audit.ndjson must be created on first request');
+      const lines = fsReadFileSync(auditPath, 'utf-8').trim().split('\n').filter(Boolean);
+      assert.ok(lines.length >= 1, 'at least one audit line expected');
+      const lastRow = JSON.parse(lines[lines.length - 1]);
+
+      assert.equal(lastRow.key_id, id);
+      assert.equal(lastRow.owner_tier, 'guest');
+      assert.equal(lastRow.method, 'POST');
+      assert.equal(lastRow.path, '/v1/chat/completions');
+      assert.equal(lastRow.model, 'claude-sonnet-4-6');
+      assert.equal(lastRow.status_code, 200);
+      assert.ok(typeof lastRow.latency_ms === 'number' && lastRow.latency_ms >= 0);
+      assert.ok(typeof lastRow.ts === 'string');
+      assert.equal(lastRow.provider, 'anthropic');
+
+      // PII guard: no message / response content in the audit row
+      assert.ok(!('content' in lastRow), 'no message content in audit row (§ 8 no PII)');
+      assert.ok(JSON.stringify(lastRow).indexOf('20j') === -1,
+        'request payload text must NOT appear in audit row (§ 8 no PII)');
+    });
+
+    it('20j-stream: streaming-path audit row populates provider + cache_status (D45 fold-in P1 regression)', async () => {
+      const { plaintext_token } = createKey({ name: '20j-stream', owner_tier: 'guest', providers_enabled: ['anthropic'], olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}`, Accept: 'text/event-stream' },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20j-stream' }], stream: true },
+      });
+      assert.equal(r.status, 200);
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      const auditPath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      const lines = fsReadFileSync(auditPath, 'utf-8').trim().split('\n').filter(Boolean);
+      const streamingRows = lines.map(l => JSON.parse(l)).filter(row =>
+        row.path === '/v1/chat/completions' && row.status_code === 200 && row.key_id !== ANONYMOUS_KEY_ID,
+      );
+      assert.ok(streamingRows.length >= 1, 'at least one successful authed row expected');
+      const lastStreamingRow = streamingRows[streamingRows.length - 1];
+      // Prior to D45 fold-in P1: provider was null on real-streaming success path.
+      assert.equal(lastStreamingRow.provider, 'anthropic',
+        'streaming-path audit row MUST populate provider (D45 fold-in P1 regression)');
+      assert.equal(lastStreamingRow.cache_status, 'miss',
+        'streaming-path audit row MUST populate cache_status');
+      assert.deepEqual(lastStreamingRow.tried_providers, ['anthropic']);
+    });
+
+    it('20j-401: 401 unauth request still appends audit row with error_code', async () => {
+      const before = fsExistsSync(_pathJoinForSetup(TMP, 'logs', 'audit.ndjson'))
+        ? fsReadFileSync(_pathJoinForSetup(TMP, 'logs', 'audit.ndjson'), 'utf-8').split('\n').filter(Boolean).length
+        : 0;
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20j-401' }] },
+      });
+      assert.equal(r.status, 401);
+      await new Promise(resolve => setTimeout(resolve, 25));
+      const after = fsReadFileSync(_pathJoinForSetup(TMP, 'logs', 'audit.ndjson'), 'utf-8').split('\n').filter(Boolean);
+      assert.ok(after.length > before, '401 must also append a row');
+      const lastRow = JSON.parse(after[after.length - 1]);
+      assert.equal(lastRow.status_code, 401);
+      assert.equal(lastRow.error_code, 'auth_required');
+    });
+  });
+
+  // ── 20k: touchLastUsed wire after successful request ────────────────────
+
+  describe('20k — touchLastUsed wire updates last_used_at post-request', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-20k-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: false });
+      ({ server, port } = await makeSuite20Server());
+    });
+    after(async () => {
+      await teardownSuite20(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('20k: filesystem key last_used_at populated after first successful request', async () => {
+      const { id, plaintext_token, manifest: m0 } = createKey({
+        name: '20k-touch', owner_tier: 'guest', providers_enabled: ['anthropic'], olpHome: TMP,
+      });
+      assert.equal(m0.last_used_at, null);
+
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20k' }] },
+      });
+      assert.equal(r.status, 200);
+      // Allow the async touchLastUsed (fired in res.on('finish')) to settle
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      const m1 = readManifest(id, { olpHome: TMP });
+      assert.ok(m1.last_used_at !== null, 'last_used_at must be populated after first request');
+      assert.equal(m1.revoked_at, null, 'revoked_at unchanged');
+    });
+  });
+
+  // ── 20l: /v1/models also enforces auth ───────────────────────────────────
+
+  describe('20l — /v1/models also enforces auth', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-20l-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: false });
+      ({ server, port } = await makeSuite20Server());
+    });
+    after(async () => {
+      await teardownSuite20(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('20l: /v1/models without auth → 401', async () => {
+      const r = await fetch({ port, method: 'GET', path: '/v1/models' });
+      assert.equal(r.status, 401);
+    });
+
+    it('20l-200: /v1/models with valid Bearer → 200 + data array', async () => {
+      const { plaintext_token } = createKey({ name: '20l-ok', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/v1/models',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.equal(body.object, 'list');
+      assert.ok(Array.isArray(body.data));
+    });
+  });
 });

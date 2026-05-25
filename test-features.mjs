@@ -9495,7 +9495,7 @@ import {
   generateToken, hashToken, validateManifest,
   readManifest, writeManifestAtomic,
   SCHEMA_VERSION, ENV_OWNER_KEY_ID, ANONYMOUS_KEY_ID, ENV_OWNER_VAR,
-  __setTouchInterleaveHook, __resetWriteLocks,
+  __setTouchInterleaveHook, __resetWriteLocks, __writeLockSize,
 } from './lib/keys.mjs';
 
 describe('Suite 19 — lib/keys.mjs multi-key auth (ADR 0007, D44)', () => {
@@ -9625,6 +9625,16 @@ describe('Suite 19 — lib/keys.mjs multi-key auth (ADR 0007, D44)', () => {
       assert.equal(validateKey(null, { olpHome: TMP }), null);
     });
 
+    it('19m-extra: non-string truthy plaintext (number / object / array) → null (no throw)', () => {
+      // D44 fold-in P2 #2: prior version threw TypeError on these inputs.
+      assert.equal(validateKey(42, { olpHome: TMP }), null);
+      assert.equal(validateKey({}, { olpHome: TMP }), null);
+      assert.equal(validateKey([], { olpHome: TMP }), null);
+      assert.equal(validateKey({ token: 'olp_xxx' }, { olpHome: TMP }), null);
+      // Same guard for allowAnonymous: true (env path doesn't change behaviour)
+      assert.equal(validateKey(42, { olpHome: TMP, allowAnonymous: true }), null);
+    });
+
     it('19n: missing plaintext with allowAnonymous:true → anonymous identity', () => {
       const id = validateKey(null, { olpHome: TMP, allowAnonymous: true });
       assert.ok(id);
@@ -9741,6 +9751,37 @@ describe('Suite 19 — lib/keys.mjs multi-key auth (ADR 0007, D44)', () => {
     it('19x: failure is best-effort (no throw on missing key)', async () => {
       await touchLastUsed('phantom-key-xyz', { olpHome: TMP });
     });
+
+    it('19x-extra: per-key write-lock Map is cleaned up after sequential calls (D44 fold-in P2 #1 regression)', async () => {
+      __resetWriteLocks();
+      assert.equal(__writeLockSize(), 0, 'lock map starts empty');
+      const { id } = createKey({ name: 'lock-cleanup-test', olpHome: TMP });
+      // Sequential touch calls
+      for (let i = 0; i < 5; i++) {
+        await touchLastUsed(id, { olpHome: TMP });
+      }
+      assert.equal(__writeLockSize(), 0,
+        'lock map MUST be empty after sequential awaited calls (prior bug: stored derived promise never matched cleanup identity check, leaving stale entry per unique key-id)');
+    });
+
+    it('19x-extra-2: per-key write-lock Map cleans up after concurrent contention resolves', async () => {
+      __resetWriteLocks();
+      const ids = [];
+      for (let i = 0; i < 3; i++) {
+        const { id } = createKey({ name: `concurrent-${i}`, olpHome: TMP });
+        ids.push(id);
+      }
+      // Race: 3 keys, each with 3 concurrent touches
+      const calls = [];
+      for (const id of ids) {
+        for (let j = 0; j < 3; j++) {
+          calls.push(touchLastUsed(id, { olpHome: TMP }));
+        }
+      }
+      await Promise.all(calls);
+      assert.equal(__writeLockSize(), 0,
+        'lock map MUST drain to 0 after all queued callers across all keys finish');
+    });
   });
 
   describe('19y-1 to 19y-4 — Acceptance criterion #7: concurrent revoke + touch (§ 6.3, § 6.4)', () => {
@@ -9774,6 +9815,19 @@ describe('Suite 19 — lib/keys.mjs multi-key auth (ADR 0007, D44)', () => {
     });
 
     it('19y-3: interleaved external revoke fires inside touch lock before read — revoked_at preserved', async () => {
+      // SCENARIO TESTED: external revoke lands after touch acquires its lock
+      // but before touch's read. touch's subsequent read sees the revoke and
+      // NO-OPs per § 6.3 step 2.
+      //
+      // SCENARIO NOT TESTED (and currently UNREACHABLE in implementation):
+      // external revoke between touch's read and touch's write. The current
+      // touchLastUsed has SYNCHRONOUS read→write (no await between
+      // readManifest and writeManifestAtomic), so no external write can
+      // interleave between them at the JS event-loop level. If a future
+      // refactor introduces an await between read and write, this guarantee
+      // breaks and a post-read hook + matching test would be required to
+      // catch the regression. ADR § 10 criterion #7 scenario 3 is satisfied
+      // by the synchronous-read-write property of the current implementation.
       const { id } = createKey({ name: 'race-3', olpHome: TMP });
       let hookFired = false;
       __setTouchInterleaveHook(async () => {

@@ -14055,3 +14055,342 @@ describe('Suite 33 — D65 lib/doctor.mjs framework (ADR 0010 § Phase 4 D64-D67
     assert.equal(na.verify, 'olp doctor');
   });
 });
+
+// ── Suite 34: D68-D70 — /health.anonymousKey + plaintext_advertise (ADR 0011) ──
+//
+// Tests for:
+//   - lib/keys.mjs createKey({ plaintext_advertise: true }) writes the field;
+//     rejects on owner tier
+//   - lib/keys.mjs findAdvertisedKey() discovery semantics (skips revoked /
+//     skips no-advertise / returns first match)
+//   - server.mjs /health emits anonymousKey ONLY when all 3 prerequisites hold
+//   - bin/olp-keys.mjs `--anonymous --advertise` end-to-end (manifest +
+//     plaintext printed + stderr warning + advertise label)
+//   - bin/olp-keys.mjs rejects `--owner --advertise`
+
+import {
+  findAdvertisedKey as findAdvertisedKey34,
+} from './lib/keys.mjs';
+
+describe('Suite 34 — D68-D70 /health.anonymousKey + plaintext_advertise (ADR 0011)', () => {
+  const SUITE34_GLOBAL_OLP_HOME = process.env.OLP_HOME;
+
+  // ── 34a-c: lib/keys.mjs unit tests ──────────────────────────────────────
+
+  describe('34a-c — lib/keys.mjs createKey + findAdvertisedKey', () => {
+    let TMP;
+    before(() => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34abc-'));
+    });
+    after(() => {
+      rmSync(TMP, { recursive: true, force: true });
+      __resetWriteLocks();
+    });
+
+    it('34a — createKey({ plaintext_advertise: true }) writes plaintext_advertise field on guest manifest', () => {
+      const { id, plaintext_token, manifest } = createKey({
+        name: '34a-advert', owner_tier: 'guest', providers_enabled: '*',
+        plaintext_advertise: true, olpHome: TMP,
+      });
+      assert.equal(manifest.plaintext_advertise, plaintext_token);
+      // Verify on-disk
+      const reread = readManifest(id, { olpHome: TMP });
+      assert.equal(reread.plaintext_advertise, plaintext_token);
+      // Token hash also correct
+      assert.equal(reread.token_hash, hashToken(plaintext_token));
+    });
+
+    it('34a-2 — createKey() default (no plaintext_advertise) does NOT write the field (ADR 0007 § 5 invariant preserved)', () => {
+      const { id, manifest } = createKey({
+        name: '34a2-normal', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP,
+      });
+      assert.ok(!('plaintext_advertise' in manifest), 'manifest must NOT carry plaintext_advertise by default');
+      const reread = readManifest(id, { olpHome: TMP });
+      assert.ok(!('plaintext_advertise' in reread), 'on-disk manifest must NOT carry plaintext_advertise by default');
+    });
+
+    it('34b — createKey({ owner_tier:"owner", plaintext_advertise:true }) is rejected (ADR 0011 tier restriction)', () => {
+      assert.throws(
+        () => createKey({
+          name: '34b-fail', owner_tier: 'owner', plaintext_advertise: true, olpHome: TMP,
+        }),
+        /plaintext_advertise requires owner_tier="guest"/,
+      );
+    });
+
+    it('34c-1 — findAdvertisedKey() returns null when no key has plaintext_advertise', () => {
+      const TMP2 = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34c1-'));
+      try {
+        createKey({ name: 'plain', owner_tier: 'guest', olpHome: TMP2 });
+        assert.equal(findAdvertisedKey34({ olpHome: TMP2 }), null);
+      } finally {
+        rmSync(TMP2, { recursive: true, force: true });
+      }
+    });
+
+    it('34c-2 — findAdvertisedKey() returns the advertised manifest with plaintext_advertise field intact', () => {
+      const TMP3 = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34c2-'));
+      try {
+        const { plaintext_token } = createKey({
+          name: '34c2', owner_tier: 'guest', plaintext_advertise: true, olpHome: TMP3,
+        });
+        const found = findAdvertisedKey34({ olpHome: TMP3 });
+        assert.ok(found !== null, 'findAdvertisedKey must return non-null');
+        assert.equal(found.plaintext_advertise, plaintext_token);
+        assert.equal(found.owner_tier, 'guest');
+      } finally {
+        rmSync(TMP3, { recursive: true, force: true });
+      }
+    });
+
+    it('34c-3 — findAdvertisedKey() skips revoked advertised keys', async () => {
+      const TMP4 = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34c3-'));
+      try {
+        const { id } = createKey({
+          name: '34c3', owner_tier: 'guest', plaintext_advertise: true, olpHome: TMP4,
+        });
+        assert.ok(findAdvertisedKey34({ olpHome: TMP4 }) !== null, 'pre-revoke: must find it');
+        await revokeKey({ id, olpHome: TMP4 });
+        assert.equal(findAdvertisedKey34({ olpHome: TMP4 }), null, 'post-revoke: must skip');
+      } finally {
+        rmSync(TMP4, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── 34d-g: /health.anonymousKey HTTP integration (D69 prereqs) ──────────
+
+  describe('34d-g — /health.anonymousKey HTTP integration', () => {
+    let TMP, server, port;
+
+    async function makeSuite34Server() {
+      __setProvidersEnabled({});
+      const srv = createOlpServer();
+      return new Promise(resolve => {
+        srv.listen(0, '127.0.0.1', () => resolve({ server: srv, port: srv.address().port }));
+      });
+    }
+    function teardownSuite34() {
+      return new Promise(resolve => {
+        __setProvidersEnabled({});
+        __clearCache();
+        if (server) server.close(() => resolve());
+        else resolve();
+      });
+    }
+
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34dg-'));
+      process.env.OLP_HOME = TMP;
+      ({ server, port } = await makeSuite34Server());
+    });
+
+    after(async () => {
+      await teardownSuite34();
+      process.env.OLP_HOME = SUITE34_GLOBAL_OLP_HOME;
+      // Restore test-global auth config so subsequent suites are unaffected
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    beforeEach(() => {
+      // Clean slate between cases — each test installs the precise auth config
+      // it needs (default-off / advertise-but-no-anon / advertise-but-no-key /
+      // all three prerequisites met) before issuing the /health request.
+      __setAuthConfig({
+        allow_anonymous: false,
+        owner_only_endpoints: ['/health'],
+        fallback_detail_header_policy: 'owner_only',
+        advertise_anonymous_key: false,
+      });
+    });
+
+    it('34d — default (advertise_anonymous_key: false) — /health response has NO anonymousKey field', async () => {
+      // Create an advertised key on disk but don't enable the flag.
+      createKey({
+        name: '34d-key', owner_tier: 'guest', plaintext_advertise: true, olpHome: TMP,
+      });
+      // Owner identity to access full payload (since allow_anonymous: false)
+      const { plaintext_token } = createKey({
+        name: '34d-owner', owner_tier: 'owner', olpHome: TMP,
+      });
+      const r = await fetch({
+        port, method: 'GET', path: '/health',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.ok(!('anonymousKey' in body), '/health MUST NOT include anonymousKey when advertise_anonymous_key=false');
+    });
+
+    it('34e — advertise_anonymous_key: true + allow_anonymous: false → field omitted (prereq 2 fails)', async () => {
+      createKey({
+        name: '34e-key', owner_tier: 'guest', plaintext_advertise: true, olpHome: TMP,
+      });
+      __setAuthConfig({
+        allow_anonymous: false,           // prereq 2 NOT satisfied
+        advertise_anonymous_key: true,
+        owner_only_endpoints: ['/health'],
+        fallback_detail_header_policy: 'owner_only',
+      });
+      // Use owner identity (must — allow_anonymous=false rejects anonymous)
+      const { plaintext_token } = createKey({
+        name: '34e-owner', owner_tier: 'owner', olpHome: TMP,
+      });
+      const r = await fetch({
+        port, method: 'GET', path: '/health',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.ok(!('anonymousKey' in body), '/health MUST NOT include anonymousKey when allow_anonymous=false even if advertise=true');
+    });
+
+    it('34f — advertise_anonymous_key: true + allow_anonymous: true + NO advertised key → field omitted (prereq 3 fails)', async () => {
+      // Fresh isolated tmpdir so no advertised key exists
+      const TMP_F = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34f-'));
+      const SAVED = process.env.OLP_HOME;
+      process.env.OLP_HOME = TMP_F;
+      __setAuthConfig({
+        allow_anonymous: true,
+        advertise_anonymous_key: true,
+        owner_only_endpoints: [],          // /health full payload to anonymous
+        fallback_detail_header_policy: 'all',
+      });
+      try {
+        const r = await fetch({ port, method: 'GET', path: '/health' });
+        assert.equal(r.status, 200);
+        const body = JSON.parse(r.body);
+        assert.ok(!('anonymousKey' in body), '/health MUST NOT include anonymousKey when no plaintext_advertise key exists');
+      } finally {
+        process.env.OLP_HOME = SAVED;
+        rmSync(TMP_F, { recursive: true, force: true });
+      }
+    });
+
+    it('34g — all 3 prerequisites met → /health.anonymousKey exposes the plaintext token', async () => {
+      const TMP_G = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34g-'));
+      const SAVED = process.env.OLP_HOME;
+      process.env.OLP_HOME = TMP_G;
+      try {
+        const { plaintext_token } = createKey({
+          name: '34g-anon', owner_tier: 'guest', plaintext_advertise: true, olpHome: TMP_G,
+        });
+        __setAuthConfig({
+          allow_anonymous: true,
+          advertise_anonymous_key: true,
+          owner_only_endpoints: [],         // anonymous sees full payload too
+          fallback_detail_header_policy: 'all',
+        });
+        const r = await fetch({ port, method: 'GET', path: '/health' });
+        assert.equal(r.status, 200);
+        const body = JSON.parse(r.body);
+        assert.equal(body.anonymousKey, plaintext_token);
+        assert.match(body.anonymousKey, /^olp_[A-Za-z0-9_-]{43}$/);
+      } finally {
+        process.env.OLP_HOME = SAVED;
+        rmSync(TMP_G, { recursive: true, force: true });
+      }
+    });
+
+    it('34g-trimmed — anonymousKey also surfaces in trimmed /health (anonymous client zero-config path)', async () => {
+      // /health is gated as owner-only; anonymous client gets trimmed payload
+      // but anonymousKey must still surface — it's the whole point of D69.
+      const TMP_H = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34gt-'));
+      const SAVED = process.env.OLP_HOME;
+      process.env.OLP_HOME = TMP_H;
+      try {
+        const { plaintext_token } = createKey({
+          name: '34gt-anon', owner_tier: 'guest', plaintext_advertise: true, olpHome: TMP_H,
+        });
+        __setAuthConfig({
+          allow_anonymous: true,
+          advertise_anonymous_key: true,
+          owner_only_endpoints: ['/health'],   // trim gating ACTIVE
+          fallback_detail_header_policy: 'owner_only',
+        });
+        const r = await fetch({ port, method: 'GET', path: '/health' });
+        assert.equal(r.status, 200);
+        const body = JSON.parse(r.body);
+        // Trimmed shape (no providers) BUT anonymousKey is present
+        assert.ok(!('providers' in body), 'trimmed /health must omit providers');
+        assert.equal(body.anonymousKey, plaintext_token);
+      } finally {
+        process.env.OLP_HOME = SAVED;
+        rmSync(TMP_H, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── 34h-j: bin/olp-keys.mjs --anonymous --advertise CLI ─────────────────
+
+  describe('34h-j — bin/olp-keys.mjs --anonymous --advertise', () => {
+    let TMP;
+    before(() => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34hj-'));
+    });
+    after(() => {
+      rmSync(TMP, { recursive: true, force: true });
+      __resetWriteLocks();
+    });
+
+    it('34h — keygen --anonymous --advertise creates guest+advertise key + prints WARNING to stderr', async () => {
+      let out = '';
+      let err = '';
+      const code = await runOlpKeysCli(
+        ['keygen', '--anonymous', '--advertise', '--olp-home', TMP],
+        { out: s => { out += s; }, err: s => { err += s; } },
+      );
+      assert.equal(code, 0);
+      assert.match(out, /token \(plaintext\):\s+olp_[A-Za-z0-9_-]{43}/);
+      assert.match(out, /owner_tier:\s+guest/);
+      assert.match(out, /name:\s+anonymous/);
+      assert.match(out, /advertise:\s+YES/);
+      assert.match(err, /WARNING:.*plaintext is now stored on disk/);
+      assert.match(err, /ADR 0011/);
+      // Manifest carries plaintext_advertise + matches printed plaintext
+      const advManifest = findAdvertisedKey34({ olpHome: TMP });
+      assert.ok(advManifest !== null);
+      const printedTokenMatch = out.match(/token \(plaintext\):\s+(olp_[A-Za-z0-9_-]{43})/);
+      assert.ok(printedTokenMatch);
+      assert.equal(advManifest.plaintext_advertise, printedTokenMatch[1]);
+    });
+
+    it('34i — keygen --owner --advertise → exit 1 with ADR 0011 pointer (tier mismatch rejected at CLI layer)', async () => {
+      const TMP_I = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34i-'));
+      try {
+        let err = '';
+        const code = await runOlpKeysCli(
+          ['keygen', '--owner', '--advertise', '--olp-home', TMP_I],
+          { out: () => {}, err: s => { err += s; } },
+        );
+        assert.equal(code, 1);
+        assert.match(err, /--advertise requires guest tier/);
+        assert.match(err, /ADR 0011/);
+        // Nothing was written
+        assert.equal(listKeys({ olpHome: TMP_I }).length, 0);
+      } finally {
+        rmSync(TMP_I, { recursive: true, force: true });
+      }
+    });
+
+    it('34j — keygen --anonymous (without --advertise) creates guest key WITHOUT plaintext_advertise field', async () => {
+      const TMP_J = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-34j-'));
+      try {
+        let out = '';
+        const code = await runOlpKeysCli(
+          ['keygen', '--anonymous', '--olp-home', TMP_J],
+          { out: s => { out += s; }, err: () => {} },
+        );
+        assert.equal(code, 0);
+        assert.match(out, /owner_tier:\s+guest/);
+        assert.match(out, /name:\s+anonymous/);
+        assert.doesNotMatch(out, /advertise:\s+YES/);
+        // Manifest does NOT carry plaintext_advertise
+        assert.equal(findAdvertisedKey34({ olpHome: TMP_J }), null);
+      } finally {
+        rmSync(TMP_J, { recursive: true, force: true });
+      }
+    });
+  });
+});

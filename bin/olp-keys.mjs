@@ -79,6 +79,7 @@ const USAGE = `OLP key management CLI
 Usage:
   olp-keys keygen --owner [--name=<label>] [--providers=<csv>] [--force]
   olp-keys keygen --name=<label> [--tier=guest|owner] [--providers=<csv>]
+  olp-keys keygen --anonymous --advertise [--name=<label>] [--providers=<csv>]
   olp-keys list [--owner-only] [--include-revoked]
   olp-keys revoke --id=<key-id>
 
@@ -86,7 +87,8 @@ Common flags:
   --olp-home=<path>    Override ~/.olp (default reads OLP_HOME env)
   --help               Print this message
 
-Authority: ADR 0007 § 9 (bootstrap & recovery).`;
+Authority: ADR 0007 § 9 (bootstrap & recovery); ADR 0011 (anonymous-key
+deployment-context limits — trusted-LAN-only invariant for --advertise).`;
 
 // ── Subcommand implementations ────────────────────────────────────────────
 
@@ -94,16 +96,36 @@ async function cmdKeygen(flags, ioOut, ioErr) {
   const olpHome = flags['olp-home'];
   const owner = flags.owner === true;
   const force = flags.force === true;
+  // D69 (ADR 0011): --anonymous is shorthand for "create a guest-tier key
+  // intended to be the zero-config /health.anonymousKey advertise key".
+  // It implies --tier=guest and defaults the name to 'anonymous'. The
+  // distinct field that actually triggers /health advertisement is
+  // --advertise (writes plaintext_advertise into the manifest). Either
+  // flag works on its own (--anonymous without --advertise is just a
+  // conventionally-named guest key); --advertise without --anonymous is
+  // accepted (operator may want to advertise a named guest key).
+  const isAnonymous = flags.anonymous === true;
+  const advertise = flags.advertise === true;
   let tier = flags.tier;
   if (owner) tier = 'owner';
+  if (isAnonymous && !owner) tier = 'guest';
   if (!tier) tier = 'guest';
   if (tier !== 'owner' && tier !== 'guest') {
     ioErr(`Error: --tier must be "owner" or "guest" (got "${tier}").\n`);
     return 1;
   }
-  const name = flags.name || (owner ? 'owner' : null);
+  // D69: reject --owner --advertise (would expose owner identity unauthenticated).
+  if (advertise && tier !== 'guest') {
+    ioErr(`Error: --advertise requires guest tier (cannot advertise owner-tier key plaintext). See ADR 0011.\n`);
+    return 1;
+  }
+  let name = flags.name;
   if (!name) {
-    ioErr('Error: --name is required (or use --owner to default to "owner").\n');
+    if (owner) name = 'owner';
+    else if (isAnonymous) name = 'anonymous';
+  }
+  if (!name) {
+    ioErr('Error: --name is required (or use --owner to default to "owner", or --anonymous to default to "anonymous").\n');
     return 1;
   }
   const providersFlag = flags.providers;
@@ -136,7 +158,7 @@ async function cmdKeygen(flags, ioOut, ioErr) {
 
   let result;
   try {
-    result = createKey({ name, owner_tier: tier, providers_enabled, olpHome });
+    result = createKey({ name, owner_tier: tier, providers_enabled, olpHome, plaintext_advertise: advertise });
   } catch (err) {
     ioErr(`Error: createKey failed: ${err?.message ?? err}\n`);
     return 2;
@@ -150,6 +172,13 @@ async function cmdKeygen(flags, ioOut, ioErr) {
   ioOut(`  providers_enabled:  ${typeof result.manifest.providers_enabled === 'string' ? result.manifest.providers_enabled : `[${result.manifest.providers_enabled.join(', ')}]`}\n`);
   ioOut(`  created_at:         ${result.manifest.created_at}\n`);
   ioOut(`  manifest:           ~/.olp/keys/${result.id}/manifest.json\n`);
+  if (advertise) {
+    // D69 (ADR 0011): explicit warning when plaintext lands on disk + opt-in surface.
+    ioOut(`  advertise:          YES — plaintext stored in manifest; surfaced via /health.anonymousKey\n`);
+    ioErr(`\n  WARNING: this key's plaintext is now stored on disk + will be exposed via\n`);
+    ioErr(`           /health.anonymousKey when auth.advertise_anonymous_key=true AND\n`);
+    ioErr(`           auth.allow_anonymous=true. Use ONLY on a trusted LAN. See ADR 0011.\n`);
+  }
   ioOut(`\n  token (plaintext):  ${result.plaintext_token}\n\n`);
   ioOut(`  Pass via:           Authorization: Bearer ${result.plaintext_token.slice(0, 12)}...\n`);
   ioOut(`              or:     x-api-key: ${result.plaintext_token.slice(0, 12)}...\n\n`);

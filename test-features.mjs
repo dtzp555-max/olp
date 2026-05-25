@@ -4341,6 +4341,11 @@ import {
   __clearCache,
   __setAuthConfig,
   __resetAuthConfig,
+  __setStreamingConfig,
+  __resetStreamingConfig,
+  __clearRecentErrors,
+  __snapshotRecentErrors,
+  __resetRequestCounters,
 } from './server.mjs';
 
 // ── Phase 2 / D45+D46 server-side default override ────────────────────────
@@ -12926,5 +12931,663 @@ describe('Suite 28 — D58 streaming singleflight (server.mjs HTTP wiring, ADR 0
     const r2 = await makeStreamRequest({ prompt: 'd58-28i' });
     assert.equal(r2.status, 200, '28i r2: SSE response 200');
     assert.equal(counter.count, 2, '28i r2: second request triggered a fresh spawn (no cache reuse for truncated entry)');
+  });
+});
+
+// ── Suite 29: D61 SSE heartbeat (ADR 0010 § Phase 4 D61-D63) ──────────────
+//
+// Tests the opt-in SSE heartbeat that emits `: keepalive\n\n` SSE comment
+// frames during silent windows. Port of OCP `startHeartbeat` (server.mjs:
+// 660-685) adapted to OLP's config (`streaming.heartbeat_interval_ms`),
+// per-attached-client lifecycle, and eager-headers-post-spawn rule.
+//
+// Authority: ADR 0010 § Phase 4 D61-D63; OCP spec
+//   docs/superpowers/specs/2026-04-25-47-sse-heartbeat-design.md.
+
+describe('Suite 29 — D61 SSE heartbeat (ADR 0010 § Phase 4 D61-D63)', () => {
+  let server29;
+  let port29;
+  let savedToken29;
+  let lp29;
+  let savedAnthropic29;
+
+  before(async () => {
+    savedToken29 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-suite-29';
+    __setProvidersEnabled({ anthropic: true });
+
+    const mod = await import('./server.mjs');
+    lp29 = mod.loadedProviders;
+    savedAnthropic29 = lp29.get('anthropic');
+    mod.__clearCache();
+
+    server29 = mod.createOlpServer();
+    await new Promise((resolve, reject) => {
+      server29.listen(0, '127.0.0.1', resolve);
+      server29.once('error', reject);
+    });
+    port29 = server29.address().port;
+  });
+
+  after(async () => {
+    if (savedAnthropic29 !== undefined) {
+      lp29.set('anthropic', savedAnthropic29);
+    } else {
+      lp29.delete('anthropic');
+    }
+    __resetProvidersEnabled();
+    __resetSpawnImpl();
+    __resetStreamingConfig();
+    if (savedToken29 !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken29;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    if (!server29) return;
+    return new Promise(r => server29.close(r));
+  });
+
+  beforeEach(async () => {
+    const mod = await import('./server.mjs');
+    mod.__clearCache();
+    __setStreamingConfig({ heartbeat_interval_ms: 0 });
+  });
+
+  /** Install a fake provider whose async generator paces yields with `gapMs`. */
+  function installPacedProvider(chunks, gapMs) {
+    const counter = { count: 0 };
+    const fake = {
+      ...savedAnthropic29,
+      spawn: async function* (_ir, _ctx) {
+        counter.count++;
+        for (const c of chunks) {
+          if (gapMs > 0) await new Promise(r => setTimeout(r, gapMs));
+          yield c;
+        }
+      },
+    };
+    lp29.set('anthropic', fake);
+    return counter;
+  }
+
+  /** Make a streaming request and return body + arrival timestamps. */
+  function makeTimedStreamRequest({ prompt }) {
+    return new Promise((resolve, reject) => {
+      const arrivals = [];
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: port29,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        let data = '';
+        res.on('data', d => {
+          const s = d.toString();
+          arrivals.push({ ts: Date.now(), text: s });
+          data += s;
+        });
+        res.on('end', () => resolve({
+          status: res.statusCode,
+          body: data,
+          headers: res.headers,
+          arrivals,
+        }));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.write(JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: prompt }],
+        stream: true,
+      }));
+      req.end();
+    });
+  }
+
+  it('29a — heartbeat ENABLED (interval=40ms) + slow provider → keepalive frame(s) appear in body', async () => {
+    // Provider stalls 200ms before first delta, then ~80ms between deltas.
+    // With heartbeat=40ms the silent windows produce multiple keepalive
+    // frames. Eager-headers must fire so the frames are flushed.
+    installPacedProvider([
+      { type: 'delta', content: 'h29a-1' },
+      { type: 'delta', content: 'h29a-2' },
+      { type: 'stop', finish_reason: 'stop' },
+    ], 100);
+    __setStreamingConfig({ heartbeat_interval_ms: 40 });
+
+    const r = await makeTimedStreamRequest({ prompt: 'h29a-prompt' });
+    assert.equal(r.status, 200, `r status ${r.status}: ${r.body.slice(0, 200)}`);
+    // At least one keepalive comment frame must be present.
+    const keepaliveCount = (r.body.match(/: keepalive/g) ?? []).length;
+    assert.ok(keepaliveCount >= 1, `expected at least one keepalive frame, got ${keepaliveCount}; body=${r.body.slice(0, 400)}`);
+    // Content + [DONE] still present (heartbeat does not break the stream).
+    assert.ok(r.body.includes('h29a-1'), 'body must include h29a-1');
+    assert.ok(r.body.includes('h29a-2'), 'body must include h29a-2');
+    assert.ok(r.body.includes('[DONE]'), 'body must include [DONE]');
+  });
+
+  it('29b — heartbeat DISABLED (default 0) → NO keepalive frame in body', async () => {
+    // Same provider pacing but no heartbeat config → no keepalive frames.
+    installPacedProvider([
+      { type: 'delta', content: 'h29b-1' },
+      { type: 'delta', content: 'h29b-2' },
+      { type: 'stop', finish_reason: 'stop' },
+    ], 100);
+    __setStreamingConfig({ heartbeat_interval_ms: 0 });
+
+    const r = await makeTimedStreamRequest({ prompt: 'h29b-prompt' });
+    assert.equal(r.status, 200);
+    assert.equal(
+      (r.body.match(/: keepalive/g) ?? []).length,
+      0,
+      `heartbeat disabled but found keepalive frame; body=${r.body.slice(0, 400)}`,
+    );
+    assert.ok(r.body.includes('h29b-1'));
+    assert.ok(r.body.includes('[DONE]'));
+  });
+
+  it('29c — heartbeat timer resets on every real chunk (chunks at 30ms gaps with hb=50ms → 0 keepalives mid-stream)', async () => {
+    // With chunks arriving every 30ms and heartbeat=50ms, the timer resets
+    // before it can fire — there should be no keepalive frames between
+    // chunks (silent windows never exceed 50ms). Pacing the source by a
+    // long pre-first-chunk gap is avoided here: pre-first-chunk silence is
+    // covered by 29a.
+    installPacedProvider([
+      { type: 'delta', content: 'r29c-1' },
+      { type: 'delta', content: 'r29c-2' },
+      { type: 'delta', content: 'r29c-3' },
+      { type: 'delta', content: 'r29c-4' },
+      { type: 'stop', finish_reason: 'stop' },
+    ], 30);
+    __setStreamingConfig({ heartbeat_interval_ms: 50 });
+
+    const r = await makeTimedStreamRequest({ prompt: 'h29c-prompt' });
+    assert.equal(r.status, 200);
+    // Each chunk fires within 30ms of the previous, so the heartbeat (50ms)
+    // is repeatedly reset before it can fire. There may still be ONE
+    // keepalive frame from the pre-first-chunk window (30ms wait before
+    // first delta is borderline), but we expect zero mid-stream frames.
+    const keepaliveCount = (r.body.match(/: keepalive/g) ?? []).length;
+    assert.ok(keepaliveCount <= 1, `expected <= 1 keepalive (reset working), got ${keepaliveCount}; body=${r.body.slice(0, 400)}`);
+    for (const tag of ['r29c-1', 'r29c-2', 'r29c-3', 'r29c-4', '[DONE]']) {
+      assert.ok(r.body.includes(tag), `body missing ${tag}`);
+    }
+  });
+
+  it('29d — heartbeat cancelled on client disconnect (no further keepalive after abort)', async () => {
+    // Source stalls forever. Heartbeat=20ms fires repeatedly while the
+    // client is connected. After abort, heartbeat.stop() must fire — the
+    // surface check we do here: the server cleanly closes (no uncaught
+    // exception on continued setTimeout firing). We can't observe "no more
+    // keepalive frames" directly from the aborted client, but we CAN
+    // observe that the test runner doesn't time out — the dead-socket
+    // res.write inside the heartbeat is swallowed (no throw bubbling up).
+    let yieldedCount = 0;
+    const fake = {
+      ...savedAnthropic29,
+      spawn: async function* (_ir, _ctx) {
+        // Hold open with a single delta then a long sleep.
+        yield { type: 'delta', content: 'first-delta' };
+        yieldedCount++;
+        try {
+          // Long stall; should be interrupted by iterator.return()
+          await new Promise(r => setTimeout(r, 1000));
+          yield { type: 'stop', finish_reason: 'stop' };
+        } finally {
+          // intentional
+        }
+      },
+    };
+    lp29.set('anthropic', fake);
+    __setStreamingConfig({ heartbeat_interval_ms: 20 });
+
+    const result = await new Promise((resolve) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: port29,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        let body = '';
+        res.on('data', d => { body += d.toString(); });
+        res.on('end', () => resolve({ body, aborted: false }));
+        res.on('error', () => resolve({ body, aborted: true }));
+      });
+      req.on('error', () => resolve({ body: '', aborted: true }));
+      req.write(JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'h29d-abort' }],
+        stream: true,
+      }));
+      req.end();
+      // Abort after 100ms (well into heartbeat firing window).
+      setTimeout(() => { try { req.destroy(); } catch { /* ignore */ } }, 100);
+    });
+    // Sanity: client saw at least the first chunk + maybe keepalives.
+    assert.ok(yieldedCount === 1, 'first delta was yielded once');
+    // Give the heartbeat loop time to fire post-abort — if heartbeat.stop()
+    // didn't fire, an uncaught exception or runaway timer would surface.
+    // Then assert that the server is still responsive to a new request,
+    // proving no fatal lingering state.
+    await new Promise(r => setTimeout(r, 60));
+
+    // Server health check: a fresh request must complete normally.
+    const probe = await fetch({ port: port29, method: 'GET', path: '/v1/models' });
+    assert.equal(probe.status, 200, 'server remains responsive after disconnect; heartbeat timer did not crash the process');
+  });
+
+  it('29e — eager-headers: heartbeat enabled → headers flushed BEFORE first content chunk', async () => {
+    // Pre-first-chunk silent window of 300ms; heartbeat=40ms ⇒ multiple
+    // keepalive frames must arrive BEFORE the first content delta. This
+    // is the OCP db11105 invariant: without eager-headers the keepalive
+    // writes would buffer (no headers sent yet) and the client wouldn't
+    // see anything until the first real chunk.
+    let firstDeltaIdx = -1;
+    let firstKeepaliveIdx = -1;
+    const fake = {
+      ...savedAnthropic29,
+      spawn: async function* (_ir, _ctx) {
+        // Long pre-first-chunk silence.
+        await new Promise(r => setTimeout(r, 250));
+        yield { type: 'delta', content: 'eager-delta' };
+        yield { type: 'stop', finish_reason: 'stop' };
+      },
+    };
+    lp29.set('anthropic', fake);
+    __setStreamingConfig({ heartbeat_interval_ms: 40 });
+
+    const r = await makeTimedStreamRequest({ prompt: 'h29e-prompt' });
+    assert.equal(r.status, 200);
+    // Headers received (status 200 was already received → headers flushed).
+    // Locate index of first arrival containing : keepalive and first arrival
+    // containing eager-delta.
+    for (let i = 0; i < r.arrivals.length; i++) {
+      if (firstKeepaliveIdx === -1 && r.arrivals[i].text.includes(': keepalive')) {
+        firstKeepaliveIdx = i;
+      }
+      if (firstDeltaIdx === -1 && r.arrivals[i].text.includes('eager-delta')) {
+        firstDeltaIdx = i;
+      }
+    }
+    assert.ok(firstKeepaliveIdx >= 0, `expected at least one keepalive arrival; arrivals=${JSON.stringify(r.arrivals.map(a => a.text.slice(0, 60)))}`);
+    assert.ok(firstDeltaIdx >= 0, 'expected the eager-delta to arrive');
+    assert.ok(firstKeepaliveIdx < firstDeltaIdx,
+      `keepalive (idx ${firstKeepaliveIdx}) must arrive BEFORE first delta (idx ${firstDeltaIdx}); proves eager-headers`);
+  });
+});
+
+// ── Suite 30: D62 recentErrors[20] ring buffer (ADR 0010 § Phase 4 D61-D63) ──
+//
+// Tests the in-memory ring of the last 20 server-side error events plus its
+// filter (401/403 excluded so brute-force loops cannot flood the ring) and
+// path-sanitization. Surfaced via /status (Suite 31).
+
+describe('Suite 30 — D62 recentErrors[20] ring buffer (ADR 0010 § Phase 4 D61-D63)', () => {
+  let server30;
+  let port30;
+  let savedToken30;
+  let lp30;
+  let savedAnthropic30;
+
+  before(async () => {
+    savedToken30 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-suite-30';
+    __setProvidersEnabled({ anthropic: true });
+
+    const mod = await import('./server.mjs');
+    lp30 = mod.loadedProviders;
+    savedAnthropic30 = lp30.get('anthropic');
+    mod.__clearCache();
+
+    server30 = mod.createOlpServer();
+    await new Promise((resolve, reject) => {
+      server30.listen(0, '127.0.0.1', resolve);
+      server30.once('error', reject);
+    });
+    port30 = server30.address().port;
+  });
+
+  after(async () => {
+    if (savedAnthropic30 !== undefined) {
+      lp30.set('anthropic', savedAnthropic30);
+    } else {
+      lp30.delete('anthropic');
+    }
+    __resetProvidersEnabled();
+    __resetSpawnImpl();
+    __clearRecentErrors();
+    if (savedToken30 !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken30;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    if (!server30) return;
+    return new Promise(r => server30.close(r));
+  });
+
+  beforeEach(async () => {
+    const mod = await import('./server.mjs');
+    mod.__clearCache();
+    __clearRecentErrors();
+    __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+  });
+
+  it('30a — provider error pushes an entry onto the recentErrors ring', async () => {
+    // Install a provider that throws SPAWN_FAILED before first chunk.
+    const fake = {
+      ...savedAnthropic30,
+      spawn: async function* (_ir, _ctx) {
+        // Throw before yielding any chunk → propagates through the streaming
+        // branch as a pre-first-chunk error → 502 + _pushError fires.
+        throw new (await import('./lib/providers/base.mjs')).ProviderError(
+          'fake spawn failure for 30a',
+          'SPAWN_FAILED',
+        );
+        // eslint-disable-next-line no-unreachable
+        yield { type: 'stop', finish_reason: 'stop' };
+      },
+    };
+    lp30.set('anthropic', fake);
+
+    const before = __snapshotRecentErrors().length;
+    const r = await fetch({
+      port: port30, method: 'POST', path: '/v1/chat/completions',
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: '30a-trigger' }],
+        stream: true,
+      },
+    });
+    // The exact status varies (502 for pre-first-chunk error, or
+    // chain-exhausted 502 from the buffered path); both record _pushError.
+    assert.ok(r.status === 502 || r.status === 500,
+      `expected 5xx error, got ${r.status}: ${r.body.slice(0, 200)}`);
+    const after = __snapshotRecentErrors();
+    assert.ok(after.length > before, `ring should have grown; before=${before} after=${after.length}`);
+    const last = after[after.length - 1];
+    assert.ok(typeof last.time === 'string' && last.time.includes('T'),
+      'entry must have ISO8601 time');
+    assert.ok(typeof last.message === 'string' && last.message.length > 0,
+      'entry must have a message');
+    assert.ok(last.message.length <= 200, 'message must be capped at 200 chars');
+    assert.equal(last.path, '/v1/chat/completions', 'entry path captured');
+    assert.equal(typeof last.status_code, 'number', 'entry status_code captured');
+  });
+
+  it('30b — ring caps at 20 entries (oldest evicted on push)', async () => {
+    __clearRecentErrors();
+    // Push 25 synthetic errors via the public seam (we exercise this via a
+    // provider that throws repeatedly). Easier: call _pushError directly by
+    // hitting an endpoint that maps to a 5xx; install a fake that always
+    // throws and fire 25 requests. Each request adds one entry.
+    let pushCount = 0;
+    const fake = {
+      ...savedAnthropic30,
+      spawn: async function* (_ir, _ctx) {
+        pushCount++;
+        throw new (await import('./lib/providers/base.mjs')).ProviderError(
+          `30b-err-${pushCount}`,
+          'SPAWN_FAILED',
+        );
+        // eslint-disable-next-line no-unreachable
+        yield { type: 'stop', finish_reason: 'stop' };
+      },
+    };
+    lp30.set('anthropic', fake);
+
+    for (let i = 0; i < 25; i++) {
+      await fetch({
+        port: port30, method: 'POST', path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: `30b-iter-${i}` }],
+          stream: false,
+        },
+      });
+    }
+    const snap = __snapshotRecentErrors();
+    assert.equal(snap.length, 20, `ring must cap at 20, got ${snap.length}`);
+    // Oldest evicted → the first remaining entry's message should not be
+    // 30b-err-1 (which was pushed first and evicted). It should also not
+    // include `30b-err-2 .. 30b-err-5` (we pushed 25, last 20 retained →
+    // entries 6..25 remain).
+    const firstMsg = snap[0].message;
+    assert.ok(!firstMsg.includes('30b-err-1') || firstMsg.includes('30b-err-10') || firstMsg.includes('30b-err-11'),
+      `oldest 5 must be evicted; first message=${firstMsg}`);
+  });
+
+  it('30c — 401/403 auth failures are NOT pushed onto the ring (brute-force flood guard)', async () => {
+    __clearRecentErrors();
+    __setAuthConfig({ allow_anonymous: false, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+    try {
+      const before = __snapshotRecentErrors().length;
+      // Fire 5 requests with no auth header → all 401s.
+      for (let i = 0; i < 5; i++) {
+        const r = await fetch({
+          port: port30, method: 'POST', path: '/v1/chat/completions',
+          headers: { 'Content-Type': 'application/json' },
+          body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: `30c-${i}` }] },
+        });
+        assert.equal(r.status, 401, `expected 401 on no-auth request, got ${r.status}`);
+      }
+      const after = __snapshotRecentErrors().length;
+      assert.equal(after, before, '401 responses must NOT push onto recentErrors');
+    } finally {
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+    }
+  });
+
+  it('30d — path sanitization: filesystem-path-like tokens in message are replaced with [path]', async () => {
+    __clearRecentErrors();
+    const fake = {
+      ...savedAnthropic30,
+      spawn: async function* (_ir, _ctx) {
+        // Error message embeds a filesystem path.
+        throw new (await import('./lib/providers/base.mjs')).ProviderError(
+          'ENOENT: no such file or directory /Users/private/secret-file.json',
+          'SPAWN_FAILED',
+        );
+        // eslint-disable-next-line no-unreachable
+        yield { type: 'stop', finish_reason: 'stop' };
+      },
+    };
+    lp30.set('anthropic', fake);
+
+    await fetch({
+      port: port30, method: 'POST', path: '/v1/chat/completions',
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: '30d-path-sanitize' }],
+        stream: false,
+      },
+    });
+    const snap = __snapshotRecentErrors();
+    assert.ok(snap.length >= 1, 'an entry must have been pushed');
+    const last = snap[snap.length - 1];
+    assert.ok(!last.message.includes('/Users/private/secret-file.json'),
+      `path leaked: ${last.message}`);
+    assert.ok(last.message.includes('[path]'),
+      `sanitization marker [path] expected; got ${last.message}`);
+  });
+});
+
+// ── Suite 31: D63 /v0/management/status combined endpoint (ADR 0010 § Phase 4) ──
+//
+// Owner-only_block management endpoint that returns process/provider/cache
+// stats + recentErrors. Tests gating + payload shape + recent_errors wiring.
+
+describe('Suite 31 — D63 /v0/management/status (ADR 0010 § Phase 4 D61-D63)', () => {
+  const GLOBAL_OLP_HOME_31 = process.env.OLP_HOME;
+  let TMP31, server31, port31;
+  let savedToken31;
+  let lp31;
+  let savedAnthropic31;
+
+  before(async () => {
+    TMP31 = mkdtempSync(pathJoin(tmpdir(), 'olp-test-31-'));
+    process.env.OLP_HOME = TMP31;
+    savedToken31 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-suite-31';
+    __setProvidersEnabled({ anthropic: true });
+    __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+
+    const mod = await import('./server.mjs');
+    lp31 = mod.loadedProviders;
+    savedAnthropic31 = lp31.get('anthropic');
+    mod.__clearCache();
+    mod.__clearRecentErrors();
+    mod.__resetRequestCounters();
+
+    server31 = mod.createOlpServer();
+    await new Promise((resolve, reject) => {
+      server31.listen(0, '127.0.0.1', resolve);
+      server31.once('error', reject);
+    });
+    port31 = server31.address().port;
+  });
+
+  after(async () => {
+    if (savedAnthropic31 !== undefined) {
+      lp31.set('anthropic', savedAnthropic31);
+    } else {
+      lp31.delete('anthropic');
+    }
+    __resetProvidersEnabled();
+    __resetSpawnImpl();
+    __clearRecentErrors();
+    __resetRequestCounters();
+    __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+    if (savedToken31 !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken31;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    process.env.OLP_HOME = GLOBAL_OLP_HOME_31;
+    if (!server31) return;
+    await new Promise(r => server31.close(r));
+    rmSync(TMP31, { recursive: true, force: true });
+  });
+
+  beforeEach(async () => {
+    const mod = await import('./server.mjs');
+    mod.__clearCache();
+  });
+
+  it('31a — owner identity GETs /v0/management/status → 200 + full payload shape', async () => {
+    const { plaintext_token } = createKey({
+      name: '31a-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP31,
+    });
+    const r = await fetch({
+      port: port31, method: 'GET', path: '/v0/management/status',
+      headers: { Authorization: `Bearer ${plaintext_token}` },
+    });
+    assert.equal(r.status, 200, `expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+    const body = JSON.parse(r.body);
+    // Top-level shape per ADR 0010 § Phase 4 D63 spec.
+    assert.equal(body.ok, true);
+    assert.equal(typeof body.version, 'string');
+    assert.equal(typeof body.uptime_ms, 'number');
+    assert.ok(body.uptime_ms >= 0);
+    assert.equal(typeof body.uptime_human, 'string');
+    assert.match(body.uptime_human, /^\d+h \d+m \d+s$/);
+    assert.equal(typeof body.started_at, 'string');
+    assert.ok(body.started_at.includes('T'));
+    assert.ok(typeof body.providers === 'object' && body.providers !== null);
+    assert.equal(typeof body.providers.enabled, 'number');
+    assert.equal(typeof body.providers.available, 'number');
+    assert.ok(typeof body.providers.status === 'object');
+    assert.ok(typeof body.stats === 'object');
+    assert.equal(typeof body.stats.total_requests, 'number');
+    assert.equal(typeof body.stats.active_requests, 'number');
+    assert.ok(typeof body.stats.cache === 'object');
+    assert.ok(Array.isArray(body.recent_errors));
+    assert.equal(typeof body.generated_at, 'string');
+  });
+
+  it('31b — non-owner (guest) → 401 owner_required', async () => {
+    const { plaintext_token } = createKey({
+      name: '31b-guest', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP31,
+    });
+    const r = await fetch({
+      port: port31, method: 'GET', path: '/v0/management/status',
+      headers: { Authorization: `Bearer ${plaintext_token}` },
+    });
+    assert.equal(r.status, 401);
+    const body = JSON.parse(r.body);
+    assert.equal(body.error.type, 'owner_required');
+  });
+
+  it('31c — allow_anonymous=false + no header → 401 auth_required', async () => {
+    __setAuthConfig({ allow_anonymous: false, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+    try {
+      const r = await fetch({ port: port31, method: 'GET', path: '/v0/management/status' });
+      assert.equal(r.status, 401);
+      const body = JSON.parse(r.body);
+      assert.equal(body.error.type, 'auth_required');
+    } finally {
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+    }
+  });
+
+  it('31d — payload recent_errors populated after a triggered chain-exhausted error', async () => {
+    __clearRecentErrors();
+    // Install a provider that throws → triggers _pushError on the buffered path.
+    const fake = {
+      ...savedAnthropic31,
+      spawn: async function* (_ir, _ctx) {
+        throw new (await import('./lib/providers/base.mjs')).ProviderError(
+          'fake spawn failure 31d',
+          'SPAWN_FAILED',
+        );
+        // eslint-disable-next-line no-unreachable
+        yield { type: 'stop', finish_reason: 'stop' };
+      },
+    };
+    lp31.set('anthropic', fake);
+
+    // Fire a non-streaming request → goes through executeWithFallback path
+    // → chain-exhausted → _pushError fires.
+    const trigger = await fetch({
+      port: port31, method: 'POST', path: '/v1/chat/completions',
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: '31d-trigger' }],
+        stream: false,
+      },
+    });
+    assert.ok(trigger.status === 502 || trigger.status === 500,
+      `expected 5xx error, got ${trigger.status}`);
+
+    // Restore real provider so the /status healthCheck doesn't itself throw.
+    lp31.set('anthropic', savedAnthropic31);
+
+    // Owner fetches /status — recent_errors must include our pushed entry.
+    const { plaintext_token } = createKey({
+      name: '31d-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP31,
+    });
+    const r = await fetch({
+      port: port31, method: 'GET', path: '/v0/management/status',
+      headers: { Authorization: `Bearer ${plaintext_token}` },
+    });
+    assert.equal(r.status, 200);
+    const body = JSON.parse(r.body);
+    assert.ok(Array.isArray(body.recent_errors) && body.recent_errors.length >= 1,
+      `recent_errors expected to be populated; got ${JSON.stringify(body.recent_errors)}`);
+    const matchingEntry = body.recent_errors.find(e =>
+      typeof e.message === 'string' && e.message.includes('fake spawn failure 31d'),
+    );
+    assert.ok(matchingEntry,
+      `expected to find the triggered error in recent_errors; got ${JSON.stringify(body.recent_errors)}`);
+    assert.equal(matchingEntry.path, '/v1/chat/completions');
+    assert.equal(matchingEntry.provider, 'anthropic');
+    // total_requests must have advanced past 0 (we made at least 1 chat request).
+    assert.ok(body.stats.total_requests >= 1,
+      `total_requests expected >= 1, got ${body.stats.total_requests}`);
   });
 });

@@ -90,6 +90,117 @@ function logEvent(level, event, data = {}) {
   }
 }
 
+// ── SSE response headers (D61, ADR 0010 § Phase 4 D61-D63) ────────────────
+// Canonical SSE response-header set used by every streaming response. Pulled
+// out as a top-level constant so all streaming write sites share a single
+// source of truth (per OCP db11105 lesson: drift between branches caused the
+// "headers sent but no Buffering directive" 502 regression).
+//
+// Authority: RFC 8895 (text/event-stream); nginx `X-Accel-Buffering: no`
+// disables the upstream proxy buffer (load-bearing for real-time delivery
+// behind nginx / Cloudflare / Tailscale Funnel).
+const SSE_DEFAULT_HEADERS = Object.freeze({
+  'Content-Type': 'text/event-stream',
+  'Cache-Control': 'no-cache',
+  Connection: 'keep-alive',
+  'X-Accel-Buffering': 'no',
+});
+
+// ── D62 recentErrors[20] ring buffer (ADR 0010 § Phase 4 D61-D63) ─────────
+// Last 20 server-side error events. Surfaced via /status (owner-only). Ported
+// from OCP server.mjs:301 + 354-358 — same shape adapted to OLP's identity-
+// aware error vocabulary (key_id present when known; never client-tier-only
+// errors like 401/403 which would let brute-force loops fill the ring).
+//
+// Lifecycle: module-scope, in-memory only. NOT persisted across restart
+// (OCP precedent: same; acceptable per the spec).
+//
+// Sanitization: filesystem-path-like tokens in `message` are replaced with
+// `[path]` so an unintentionally logged absolute path doesn't surface in a
+// `/status` payload an owner copy-pastes elsewhere. Port of OCP server.mjs:1395.
+//
+// 200-char message cap: matches OCP precedent; keeps the ring bounded even
+// for verbose stack traces (the dashboard / `olp` CLI surface a one-line
+// preview, not the full trace).
+const RECENT_ERRORS_MAX = 20;
+const recentErrors = [];
+
+/**
+ * Push a server-side error event onto the recentErrors ring. Filters out
+ * client-tier auth rejections (401/403) so a brute-force loop cannot flood
+ * the ring. ProviderError instances are always recorded; other errors are
+ * recorded when `statusCode >= 500`.
+ *
+ * @param {object} opts
+ * @param {Error|null|undefined} opts.error
+ * @param {string|null} [opts.provider]
+ * @param {string|null} [opts.path]
+ * @param {number|null} [opts.statusCode]
+ */
+function _pushError({ error, provider = null, path = null, statusCode = null }) {
+  // D61-D63 reviewer P2-1 (defense-in-depth): explicitly reject 401/403 at the
+  // function level even if a caller mistakenly passes one. The current call
+  // sites all use the "no auth" path → never invoke _pushError, but a future
+  // contributor passing a ProviderError tagged statusCode=401 would otherwise
+  // slip past the isProviderError branch and flood the ring under brute force.
+  if (statusCode === 401 || statusCode === 403) return;
+  // Filter: any other status is recorded when (a) statusCode >= 500 OR (b) the
+  // error is a ProviderError (provider-shape failure, always interesting for
+  // operators).
+  const isProviderError = error?.code === 'PROVIDER_ERROR'
+    || error?.code === 'SPAWN_FAILED'
+    || error?.code === 'CONCURRENCY_LIMIT'
+    || error?.constructor?.name === 'ProviderError';
+  const looksServerSide = statusCode !== null && statusCode >= 500;
+  if (!isProviderError && !looksServerSide) return;
+
+  const rawMessage = String(error?.message ?? error ?? 'unknown error');
+  // Strip filesystem-path-like tokens. Port of OCP server.mjs:1395 — the
+  // regex catches `/foo/bar` plus dotted/dashed variants. Replaces every
+  // match with `[path]`. Truncate to 200 chars after sanitization.
+  const sanitized = rawMessage
+    .replace(/\/[\w./-]+/g, '[path]')
+    .slice(0, 200);
+
+  recentErrors.push({
+    time: new Date().toISOString(),
+    message: sanitized,
+    code: error?.code ?? null,
+    provider,
+    path,
+    status_code: statusCode,
+  });
+  while (recentErrors.length > RECENT_ERRORS_MAX) recentErrors.shift();
+}
+
+/** @internal — test seam: clear the recentErrors ring. */
+export function __clearRecentErrors() {
+  recentErrors.length = 0;
+}
+
+/** @internal — test seam: snapshot the recentErrors ring (copy). */
+export function __snapshotRecentErrors() {
+  return recentErrors.slice();
+}
+
+// ── D63 request counters (ADR 0010 § Phase 4 D61-D63) ─────────────────────
+// Module-scope counters surfaced via /status (owner-only). _totalRequests is
+// the cumulative count of /v1/chat/completions invocations since process
+// start; _activeRequests is the live concurrent count.
+//
+// NOT exposed via /health (already owner-trimmed per Phase 2 D46); only
+// /status (owner-only_block) reads them. Ported from OCP `stats.totalRequests`
+// + `stats.activeRequests` (server.mjs:288-300).
+let _totalRequests = 0;
+let _activeRequests = 0;
+const _serverStartMs = Date.now();
+
+/** @internal — test seam: reset request counters. */
+export function __resetRequestCounters() {
+  _totalRequests = 0;
+  _activeRequests = 0;
+}
+
 // ── Startup config ────────────────────────────────────────────────────────
 // Read ~/.olp/config.json once at startup. Provides:
 //   - providers.enabled   → which providers are loaded (ADR 0002 § Disable model)
@@ -129,6 +240,76 @@ export function __setAuthConfig(config) {
 /** @internal — reset auth config to file-loaded state. */
 export function __resetAuthConfig() {
   _authConfig = loadAuthConfigSync();
+}
+
+// ── Streaming config (D61, ADR 0010 § Phase 4 D61-D63) ────────────────────
+// Reads `streaming.heartbeat_interval_ms` from ~/.olp/config.json via the
+// same loader used by routing/providers config. Default 0 = disabled;
+// behaviour is opt-in. Tests inject synthetic configs via __setStreamingConfig.
+let _streamingConfig = _startupConfig.streaming ?? { heartbeat_interval_ms: 0 };
+
+/** @internal — test seam: inject a synthetic streaming config (no file I/O). */
+export function __setStreamingConfig(config) {
+  _streamingConfig = config ?? { heartbeat_interval_ms: 0 };
+}
+
+/** @internal — reset streaming config to file-loaded state. */
+export function __resetStreamingConfig() {
+  _streamingConfig = loadFallbackConfigSync().streaming ?? { heartbeat_interval_ms: 0 };
+}
+
+// ── SSE heartbeat (D61, ADR 0010 § Phase 4 D61-D63) ───────────────────────
+// Port of OCP `startHeartbeat` (ocp/server.mjs:660-685). Emits `: keepalive\n\n`
+// SSE comment frames on `res` every `intervalMs` ms during silent windows.
+// The timer is reset on each real chunk write (`reset()`); cancelled on
+// stream end / error / client disconnect (`stop()`).
+//
+// Discipline (load-bearing): this is a downstream liveness hint only — it
+// MUST NOT abort or time out a request. The OCP timeout-tier regressions
+// (v2.2-v2.5; see OCP spec) showed that any auto-cancellation primitive in
+// the streaming branch is hostile to long-reasoning prompts.
+//
+// Per-attached-client: each call to startHeartbeat creates its own timer
+// state. The streaming-singleflight `attached` client and the `source`
+// client each get their own heartbeat instance (they share an underlying
+// spawn but write to different `res` objects). The `res.on('close')` handler
+// in the streaming branch calls `stop()` to cancel each client's timer
+// independently.
+//
+// @param {import('node:http').ServerResponse} res
+// @param {number} intervalMs — 0 or negative ⇒ no-op (timer never starts)
+// @param {string} requestId — for the one-time `heartbeat_active` log event
+// @returns {{ reset: () => void, stop: () => void }}
+function startHeartbeat(res, intervalMs, requestId) {
+  if (!intervalMs || intervalMs <= 0) {
+    return { reset: () => {}, stop: () => {} };
+  }
+  let handle = null;
+  let hasFired = false;
+  const onFire = () => {
+    if (res.writableEnded || res.destroyed) return;
+    try {
+      res.write(': keepalive\n\n');
+    } catch {
+      // res may have been destroyed between the writableEnded check and the
+      // write — swallow so the heartbeat is a no-op on a dead socket.
+      return;
+    }
+    if (!hasFired) {
+      hasFired = true;
+      logEvent('info', 'heartbeat_active', { interval_ms: intervalMs, request_id: requestId });
+    }
+    handle = setTimeout(onFire, intervalMs);
+  };
+  handle = setTimeout(onFire, intervalMs);
+  return {
+    reset: () => {
+      if (handle) { clearTimeout(handle); handle = setTimeout(onFire, intervalMs); }
+    },
+    stop: () => {
+      if (handle) { clearTimeout(handle); handle = null; }
+    },
+  };
 }
 
 // ── Provider registry ─────────────────────────────────────────────────────
@@ -705,6 +886,22 @@ function handleModels(req, res) {
 async function handleChatCompletions(req, res) {
   const startMs = Date.now();
 
+  // D63 (ADR 0010 § Phase 4 D61-D63): request counters for /status. Increment
+  // at the top (every request counts, even authentication failures); decrement
+  // in a single `res.on('close')` listener that fires on both normal end and
+  // client disconnect, ensuring _activeRequests cannot leak. `res.on('finish')`
+  // alone would miss client-disconnect-before-finish cases.
+  _totalRequests++;
+  _activeRequests++;
+  let _activeDecremented = false;
+  const _decrementActive = () => {
+    if (_activeDecremented) return;
+    _activeDecremented = true;
+    _activeRequests = Math.max(0, _activeRequests - 1);
+  };
+  res.on('close', _decrementActive);
+  res.on('finish', _decrementActive);
+
   // Audit context — fields populated as the request proceeds; § 8 schema.
   // Fired on res.on('finish') below regardless of success / error path.
   const auditCtx = {
@@ -1216,6 +1413,12 @@ async function handleChatCompletions(req, res) {
           model: streamModel,
           error: e.message,
         });
+        _pushError({
+          error: e,
+          provider: streamProvider,
+          path: '/v1/chat/completions',
+          statusCode: 502,
+        });
         return sendError(res, 502, e.message ?? 'Provider error', 'provider_error',
           olpHeaders({ providerUsed: streamProvider, modelUsed: streamModel, startMs, cacheStatus: 'miss', fallbackHops: 0 }));
       }
@@ -1250,8 +1453,16 @@ async function handleChatCompletions(req, res) {
       // after the response is fully sent, which is too late for our abort
       // propagation needs. Without this wire-up the cache layer would never
       // learn of disconnect → potential orphan spawns.
+      // Forward declaration of the heartbeat handle so the close-listener
+      // installed here can stop the timer when the client disconnects.
+      // (The handle itself is assigned a few lines below — startHeartbeat
+      // is invoked after eager-headers run, but the close listener must
+      // already be wired so a disconnect during the source-factory await
+      // path still propagates iterator return + heartbeat stop.)
+      let heartbeatRef = null;
       const onClose = () => {
         try { stream.return?.(); } catch { /* best-effort */ }
+        try { heartbeatRef?.stop?.(); } catch { /* best-effort */ }
       };
       res.on('close', onClose);
 
@@ -1282,6 +1493,37 @@ async function handleChatCompletions(req, res) {
       // that pre-first-chunk errors can still produce a JSON 502 (matching
       // the buffered path). Calling writeHead unconditionally was the D14
       // defect.
+      //
+      // D61 (ADR 0010 § Phase 4 D61-D63): when streaming heartbeat is
+      // enabled (streaming.heartbeat_interval_ms > 0), headers must be
+      // flushed BEFORE the first chunk so the `: keepalive\n\n` SSE comment
+      // frame has somewhere to land. Without eager-headers the heartbeat
+      // would write into a buffer that the client never sees (OCP db11105
+      // lesson — the bug was that `ensureHeaders()` returned `false` after
+      // headers were sent for the "connection-dead" case, which made all
+      // post-headers chunks no-ops). We send eager-headers only when
+      // heartbeat is enabled — preserving D14's lazy-headers default so
+      // pre-first-chunk errors still surface as JSON 502s when heartbeat
+      // is off (the legacy / current path).
+      const heartbeatIntervalMs = _streamingConfig.heartbeat_interval_ms ?? 0;
+      const eagerHeaders = heartbeatIntervalMs > 0;
+      if (eagerHeaders && !res.headersSent) {
+        res.writeHead(200, {
+          ...SSE_DEFAULT_HEADERS,
+          ...streamHeaders,
+        });
+      }
+
+      // Heartbeat instance is per-attached-client (each call to
+      // startHeartbeat creates its own timer state; source and attached
+      // clients write to different `res` objects and therefore each get
+      // their own timer). Heartbeat fires only AFTER headers are sent
+      // (eager-headers gate above); when intervalMs is 0 the returned
+      // object is a no-op stub so `reset()` / `stop()` calls are cheap.
+      const heartbeat = startHeartbeat(res, heartbeatIntervalMs, requestId);
+      // Expose to the onClose listener so a client disconnect cancels the
+      // timer immediately rather than waiting for the finally block.
+      heartbeatRef = heartbeat;
 
       const streamedChunks = [];
       let firstChunkEmitted = false;
@@ -1297,6 +1539,12 @@ async function handleChatCompletions(req, res) {
                 error: irChunk.error,
               });
               auditCtx.error_code = 'streaming_error_after_first_chunk';
+              _pushError({
+                error: { message: irChunk.error ?? 'streaming_error_after_first_chunk', code: 'SPAWN_FAILED' },
+                provider: streamProvider,
+                path: '/v1/chat/completions',
+                statusCode: null, // headers already sent; status_code intentionally null — record by error code only (D61-D63 reviewer P2-2: explicit intent over numeric-but-meaningless 200)
+              });
               res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
               res.write(SSE_DONE);
               res.end();
@@ -1307,15 +1555,16 @@ async function handleChatCompletions(req, res) {
 
           if (!res.headersSent) {
             res.writeHead(200, {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache',
-              Connection: 'keep-alive',
-              'X-Accel-Buffering': 'no',
+              ...SSE_DEFAULT_HEADERS,
               ...streamHeaders,
             });
           }
           streamedChunks.push(irChunk);
           res.write(irChunkToOpenAISSE(irChunk, requestId, ir.model));
+          // D61: reset the heartbeat timer on every real chunk so the next
+          // keepalive frame fires only after another silent window of
+          // intervalMs ms (rather than rapidly chasing the data stream).
+          heartbeat.reset();
           firstChunkEmitted = true;
 
           if (irChunk.type === 'stop') {
@@ -1352,10 +1601,7 @@ async function handleChatCompletions(req, res) {
         // yielded), emit headers + [DONE] so the response is still valid SSE.
         if (!res.headersSent) {
           res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            Connection: 'keep-alive',
-            'X-Accel-Buffering': 'no',
+            ...SSE_DEFAULT_HEADERS,
             ...streamHeaders,
           });
         }
@@ -1376,6 +1622,12 @@ async function handleChatCompletions(req, res) {
             model: streamModel,
             error: e.message,
           });
+          _pushError({
+            error: e,
+            provider: streamProvider,
+            path: '/v1/chat/completions',
+            statusCode: null, // headers already sent; status_code intentionally null — record by error code only (D61-D63 reviewer P2-2)
+          });
           res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
           res.write(SSE_DONE);
           res.end();
@@ -1387,6 +1639,12 @@ async function handleChatCompletions(req, res) {
             error: e.message,
           });
           auditCtx.error_code = e?.code ?? 'provider_error';
+          _pushError({
+            error: e,
+            provider: streamProvider,
+            path: '/v1/chat/completions',
+            statusCode: 502,
+          });
           if (!res.headersSent) {
             sendError(res, 502, e.message ?? 'Provider error', 'provider_error',
               olpHeaders({ providerUsed: streamProvider, modelUsed: streamModel, startMs, cacheStatus: 'miss', fallbackHops: 0 }));
@@ -1399,6 +1657,10 @@ async function handleChatCompletions(req, res) {
         // source caller acquired). The req-close listener is detached here
         // so it doesn't leak past the response lifetime.
         res.removeListener('close', onClose);
+        // D61: cancel the heartbeat timer on every exit path (normal stop,
+        // error, generator-exhausted, client-disconnect). The no-op stub
+        // returned when intervalMs<=0 makes this cheap when disabled.
+        heartbeat.stop();
       }
       return;
     }
@@ -1414,6 +1676,12 @@ async function handleChatCompletions(req, res) {
   } catch (e) {
     // executeWithFallback throws only on programming errors (empty chain).
     logEvent('error', 'fallback_engine_error', { error: e.message });
+    _pushError({
+      error: e,
+      provider: null,
+      path: '/v1/chat/completions',
+      statusCode: 500,
+    });
     return sendError(res, 500, 'Internal server error', 'internal_error',
       olpErrorHeaders({ startMs, model: ir.model }));
   }
@@ -1437,6 +1705,20 @@ async function handleChatCompletions(req, res) {
       triedProviders,
       error: originalError?.message,
     });
+    // D62: surface the chain-exhausted / provider-error onto the recentErrors
+    // ring so /status (D63) shows it to owner identities. The ring filter
+    // requires either a ProviderError code or statusCode >= 500; spawn errors
+    // typically map to 502 below — fall back to 500 if no statusCode is
+    // present so a programming-error throw still records.
+    {
+      const httpStatus = originalError?.statusCode ?? originalError?.status ?? 502;
+      _pushError({
+        error: originalError ?? new Error('unknown chain-exhausted error'),
+        provider: providerUsed ?? (chain[0]?.provider ?? null),
+        path: '/v1/chat/completions',
+        statusCode: httpStatus,
+      });
+    }
 
     // Emit exhausted header if more than one provider was tried
     const exhaustedHeader = triedProviders.length > 1
@@ -1543,11 +1825,13 @@ async function handleChatCompletions(req, res) {
     // Streaming response path: burst replay from buffered chunks.
     // Reaches here only when: bypassCacheForFirstHop=true OR preCheckHit=true OR chain.length>1.
     // (Single-hop cache-miss streaming is handled by the real-streaming path above.)
+    // D61: SSE headers are emitted from the shared SSE_DEFAULT_HEADERS
+    // constant so all streaming paths agree on `X-Accel-Buffering: no`.
+    // Heartbeat is intentionally not wired in the buffered replay path: the
+    // burst write completes synchronously into the socket buffer, so silent
+    // windows are bounded by the chunk count, not by provider think-time.
     res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
+      ...SSE_DEFAULT_HEADERS,
       ...headers,
     });
 
@@ -1719,6 +2003,89 @@ async function handleManagementQuota(req, res) {
 }
 
 /**
+ * GET /v0/management/status
+ *
+ * D63 (ADR 0010 § Phase 4 D61-D63). Combined snapshot of process lifecycle,
+ * per-provider health, request counters, cache stats, and recentErrors[20].
+ * Owner-only_block per ADR 0008 §8 (matches the rest of the management
+ * namespace).
+ *
+ * Port of OCP server.mjs:1151-1188 adapted to OLP's namespace + identity model:
+ *   - Path is /v0/management/status (not root /status — OLP's namespace
+ *     discipline is stricter than OCP's).
+ *   - No "plan" field (OCP's plan came from the Anthropic Pro/Max API which
+ *     OLP does not call directly).
+ *   - Adds provider-quota subset + cache stats + cumulative request counters.
+ *   - recentErrors is filtered upstream (no 401/403 entries) and capped at 20.
+ *
+ * Response shape:
+ *   {
+ *     ok: true,
+ *     version: "0.4.0-phase4",
+ *     uptime_ms: <number>,
+ *     uptime_human: "Xh Ym Zs",
+ *     started_at: <ISO8601>,
+ *     providers: {
+ *       enabled: <number>,
+ *       available: <number>,
+ *       status: { [providerKey]: { ok, ...healthCheck, activeSpawns } }
+ *     },
+ *     stats: {
+ *       total_requests: <number>,
+ *       active_requests: <number>,
+ *       cache: { hits, misses, size, inflightCount, ... },
+ *     },
+ *     recent_errors: [{ time, message, code, provider, path, status_code }, ...],
+ *     generated_at: <ISO8601>,
+ *   }
+ */
+async function handleManagementStatus(req, res) {
+  return _runOwnerOnlyManagementEndpoint(req, res, 'GET', '/v0/management/status',
+    async (_req, res2, _identity, _auditCtx) => {
+      const now = Date.now();
+      const uptimeMs = now - _serverStartMs;
+      const hours = Math.floor(uptimeMs / 3600000);
+      const minutes = Math.floor((uptimeMs % 3600000) / 60000);
+      const seconds = Math.floor((uptimeMs % 60000) / 1000);
+
+      // Provider status subset: ok + activeSpawns + a single optional error
+      // string (mirrors the /health full payload shape but trimmed — /status
+      // is for owner monitoring, not external probes).
+      const providerStatus = {};
+      for (const [name, provider] of loadedProviders) {
+        const activeSpawns = getActiveSpawnCount(name);
+        try {
+          const hc = await provider.healthCheck();
+          providerStatus[name] = { ...hc, activeSpawns };
+        } catch (err) {
+          providerStatus[name] = { ok: false, error: err?.message ?? String(err), activeSpawns };
+        }
+      }
+
+      const payload = {
+        ok: true,
+        version: VERSION,
+        uptime_ms: uptimeMs,
+        uptime_human: `${hours}h ${minutes}m ${seconds}s`,
+        started_at: new Date(_serverStartMs).toISOString(),
+        providers: {
+          enabled: loadedProviders.size,
+          available: listAllProviderNames().length,
+          status: providerStatus,
+        },
+        stats: {
+          total_requests: _totalRequests,
+          active_requests: _activeRequests,
+          cache: cacheStore.stats(),
+        },
+        recent_errors: recentErrors.slice(),
+        generated_at: new Date().toISOString(),
+      };
+      sendJSON(res2, 200, payload);
+    });
+}
+
+/**
  * GET /cache/stats
  * Live in-memory CacheStore stats. Owner-only_block.
  * Per ADR 0008 § 7.4: returns the current cacheStore.stats() shape
@@ -1767,6 +2134,9 @@ async function router(req, res) {
     if (method === 'GET' && path === '/v0/management/quota') {
       return await handleManagementQuota(req, res);
     }
+    if (method === 'GET' && path === '/v0/management/status') {
+      return await handleManagementStatus(req, res);
+    }
     if (method === 'GET' && path === '/cache/stats') {
       return await handleCacheStats(req, res);
     }
@@ -1775,6 +2145,12 @@ async function router(req, res) {
     sendError(res, 404, `Route ${method} ${path} not found`, 'not_found');
   } catch (e) {
     logEvent('error', 'unhandled_request_error', { method, path, error: e?.message });
+    _pushError({
+      error: e,
+      provider: null,
+      path,
+      statusCode: 500,
+    });
     if (!res.headersSent) {
       sendError(res, 500, 'Internal server error', 'internal_error');
     }

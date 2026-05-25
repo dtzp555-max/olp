@@ -4,16 +4,20 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-### D56 — v1.x cleanup batch #1: AUTH_MISSING tuple test + `/health` activeSpawns (post-Phase-3)
+(empty — Phase 4 entries land here once Phase 4 opens)
 
-Post-Phase-3 cleanup batch. Resolves two small v1.x-roadmap deferrals into one D-day. No new user-facing feature; pins existing behaviour into tests + finally wires the ADR-documented `activeSpawns` field on `/health`.
+## v0.3.1 — 2026-05-25
 
-- **AUTH_MISSING tuple test** (v1.x roadmap #7 / D45 reviewer P3 deferral). New engine-level test in Suite D40 asserts that an `AUTH_MISSING` hop produces a `fallbackDetail` tuple with `trigger_type: 'auth_missing'` AND that the engine does NOT advance past the AUTH_MISSING hop (per ADR 0004 § Decision — `HARD_TRIGGER_CODES[AUTH_MISSING]=false`). Pre-D56 the behaviour was implicit through other engine-path tests; this commit makes it explicit so a future refactor that moves the tuple-push past the auth_missing branch fails this test directly.
-- **`/health` activeSpawns integration** (v1.x roadmap #4 / ADR 0002 Amendment 6 forward note). `handleHealth` now surfaces `providers.status.<name>.activeSpawns` (sourced from D38 `getActiveSpawnCount(name)`). The field is set BEFORE `healthCheck()` is awaited so it remains accessible even when `healthCheck()` throws (cheap in-memory counter read). New Suite 21c-extra test pins the field presence + non-negative value for every enabled provider. With no requests in flight: 0; under saturation: equals `hints.maxConcurrent`.
-- **Test count:** 601 → 603 (+2 D56 tests).
-- **Authority:** `docs/v1x-roadmap.md` #4 + #7; ADR 0002 Amendment 6 (concurrency observability forward note); ADR 0004 Amendment 5 (X-OLP-Fallback-Detail tuple shape the new test asserts).
+### Post-Phase-3 cleanup batch #1 (D56)
 
+Patch release closing two XS v1.x-roadmap deferrals (`docs/v1x-roadmap.md` #4 + #7) that became actionable now that Phase 3 management endpoints exist. No new feature surface; pins existing behaviour into tests + finally wires the ADR-documented `activeSpawns` field on `/health`.
 
+- **AUTH_MISSING tuple test** (v1.x roadmap #7 / D45 reviewer P3 deferral). New engine-level test in Suite D40 asserts that an `AUTH_MISSING` hop produces a `fallbackDetail` tuple with `trigger_type: 'auth_missing'` AND that the engine does NOT advance past the AUTH_MISSING hop (per ADR 0004 § Decision — `HARD_TRIGGER_CODES[AUTH_MISSING] = false`). Pre-D56 the behaviour was implicit through other engine-path tests; this commit makes it explicit so a future refactor that moves the tuple-push past the auth_missing branch fails this test directly.
+- **`/health` `activeSpawns` integration** (v1.x roadmap #4 / ADR 0002 Amendment 6 forward note). `handleHealth` now surfaces `providers.status.<name>.activeSpawns` (sourced from D38 `getActiveSpawnCount(name)`). The field is computed BEFORE `healthCheck()` is awaited so it remains present even when `healthCheck()` throws (cheap in-memory counter read). New Suite 21c-extra test pins the field presence + non-negative value for every enabled provider. With no requests in flight: 0; under saturation: equals `hints.maxConcurrent`.
+- **Test count:** 601 (v0.3.0) → 603 (v0.3.1). +2 D56 tests.
+- **Authority:** `docs/v1x-roadmap.md` #4 + #7; ADR 0002 Amendment 6 (concurrency observability forward note); ADR 0004 § Decision + Amendment 5 (X-OLP-Fallback-Detail tuple shape).
+
+**Patch-release classification.** Per `release_kit.phase_rolling_mode` cross-Phase discipline: D56 landed on main after v0.3.0 was tagged, so this is a hotfix-class patch — bump patch, tag, release before next push. Tag push triggers `release.yml`.
 
 ## v0.3.0 — 2026-05-25
 

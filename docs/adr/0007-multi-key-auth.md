@@ -168,9 +168,17 @@ Failure semantics:
 - Audit append failure NEVER fails the request. Auditing is observability, not authorization.
 - Dropped audit events surface via the warn log and the dropped-count metric (exposed in /health owner-tier view per § 7).
 
-### 6.3 `last_used_at` lazy update
+### 6.3 `last_used_at` lazy update (revoke-dominates-touch)
 
 The `touchLastUsed` write goes through the same atomic-write pattern as 6.1, but is fired async after request response is dispatched. Failure logs warn `last_used_update_failed` and does NOT fail the request.
+
+**Read-modify-write with revoke preservation.** `touchLastUsed` MUST:
+
+1. Re-read the latest manifest from disk inside the per-key write-lock (§6.4) — not reuse the snapshot the validating request held.
+2. If `revoked_at` is non-null in the freshly-read manifest, NO-OP (do not write). A revocation occurred between request validation and this lazy touch; the request was the last legitimate use of the now-revoked key.
+3. Otherwise, merge the new `last_used_at` value into the freshly-read manifest, preserving ALL other fields including `revoked_at`, and write via the atomic-rename pattern.
+
+This protects against the failure mode where a stale manifest snapshot held by the touch path overwrites a fresh revoke and silently clears `revoked_at` back to `null`. The safety property is **revoke dominates touch**: any ordering of CLI revoke and server-side `touchLastUsed` (revoke-then-touch, touch-then-revoke, or interleaved) leaves a revoked manifest. This is the contract that makes acceptance criterion #6 (post-revoke 401 within the next request) honest under concurrent CLI revoke + in-flight server request.
 
 ### 6.3.5 No in-process validation cache (Phase 2)
 
@@ -178,9 +186,11 @@ Token validation MUST hit the manifest on every authenticated request at Phase 2
 
 ### 6.4 Locking (single-process Phase 2)
 
-OLP at v0.2.0 is a single Node process per host. Concurrent manifest writes from inside the process are serialized via an in-process Map of per-key write-locks (`Map<key-id, Promise>`). Concurrent writes from outside the process (e.g., maintainer running `olp keys revoke` while server is running) are not protected by file locks at Phase 2 — the atomic-rename pattern eliminates corruption (worst case: the CLI write or the server's `touchLastUsed` wins last, both states are valid), and the failure mode (one stale `last_used_at` field) is observability-grade, not security-grade.
+OLP at v0.2.0 is a single Node process per host. Concurrent manifest writes from inside the process are serialized via an in-process Map of per-key write-locks (`Map<key-id, Promise>`). Concurrent writes from outside the process (e.g., maintainer running `olp keys revoke` while server is running) are not protected by file locks at Phase 2.
 
-Forward path: file-locking (`flock(2)`) is reserved if a future Phase introduces multi-writer scenarios (e.g., a setup wizard process running alongside the server).
+Safety frame: the atomic-rename pattern guarantees corruption-free file content (no partial-merge state on disk), and the **read-before-write discipline in §6.3** makes the worst case "stale `last_used_at` field" (observability-grade) rather than "revoked_at silently cleared" (security-grade). Without §6.3, a touch carrying a pre-revoke snapshot could overwrite revoke and break acceptance criterion #6; with §6.3, any interleaving of revoke and touch leaves a revoked manifest. The CLI `revoke` writer always wins the dimension that matters; the touch writer may lose its `last_used_at` update if it raced a revoke (acceptable — the revoked key will not be used again).
+
+Forward path: file-locking (`flock(2)`) is reserved if a future Phase introduces multi-writer scenarios (e.g., a setup wizard process running alongside the server). With multi-writer, §6.3's read-before-write still holds the revoke-dominates-touch contract; file-locking only adds defense-in-depth against rare time-of-check-time-of-use windows where two processes both re-read a non-revoked manifest, then both write back with the touch path silently dropping a concurrent in-flight revoke from a third writer.
 
 ---
 
@@ -313,7 +323,7 @@ Implementation D-days (D44+) MUST land tests covering:
 4. **Owner-vs-guest /health gating (with default `auth.owner_only_endpoints` config)** — Owner key sees the full per-provider `providers` map in `/health`; guest key + anonymous see only `{ status, version }`. Test rephrases if the operator's `owner_only_endpoints` config does not include `/health` (test must assert the same gating predicate the config produces, not a hardcoded trimmed payload shape).
 5. **Owner-vs-guest X-OLP-Fallback-Detail gating** — Same response payload for both owner and guest; header present for owner only.
 6. **Key revocation** — After `revoke`, subsequent requests with that token return `401 key_revoked` within the next request (no caching of validation).
-7. **Manifest atomicity** — Concurrent `revoke` + `touchLastUsed` writes do not corrupt the manifest. Test: spawn two writers racing on the same key, assert the final file parses as valid JSON and matches one of the two writers' outcomes (not a partial merge).
+7. **Manifest atomicity + revoke-dominates-touch (§ 6.3, § 6.4)** — Concurrent `revoke` + `touchLastUsed` writes do not corrupt the manifest AND revoke always survives. Test: spawn two writers racing on the same key (revoke vs `touchLastUsed`) under three orderings — revoke-then-touch, touch-then-revoke, and interleaved (touch reads pre-revoke snapshot, then revoke writes, then touch attempts write). For all three orderings, assert: (a) final file parses as valid JSON; (b) `revoked_at` is non-null and equals the revoke writer's timestamp; (c) `last_used_at` may have either writer's value. The test FAILS if any interleaving produces `revoked_at: null` after the revoke writer completed. This pins the §6.3 read-before-write discipline.
 8. **Audit ndjson round-trip** — Every line in `audit.ndjson` parses as valid JSON; every required field present; PII fields (message content, response content) absent.
 9. **Bootstrap keygen surface** — The minimal keygen command (whatever shape D44 chooses) runs end-to-end without manual file editing, produces a working owner key, and prints the plaintext exactly once.
 10. **`OLP_OWNER_TOKEN` env override** — With the env var set, a request bearing the env token validates as `keyId="__env_owner__"` with `owner_tier="owner"`; the raw token does NOT appear in any log line, audit event, or stack trace.
@@ -333,7 +343,7 @@ Evidence:
 
 Adopting `node:sqlite` at v0.2.0 would require, in this order:
 
-1. Raise `engines.node` to a version where the API is at minimum non-flag-gated (Node v22.5.0+ for unflagged but RC; Node TBD for stable).
+1. Raise `engines.node` to a version where the API is at minimum non-flag-gated. Per Node's release-history docs — v22.5.0 added the API behind `--experimental-sqlite` (source: https://nodejs.org/download/release/v22.12.0/docs/api/sqlite.html confirms v22.12 still required the flag); the module moved past flag-gating in **v22.13.0 (LTS line)** and **v23.4.0 (current line)**; the API entered **Release Candidate at v25.7.0** per current docs (https://nodejs.org/api/sqlite.html). The minimum non-flag-gated baseline for `engines.node` is therefore `>=22.13.0` (or `>=23.4.0` on the non-LTS path). A stable (post-RC) baseline is TBD pending future Node releases beyond v25.x.
 2. Update the CI test matrix to drop Node 20 (or move the SQLite-using code behind a runtime feature check that exercises both code paths in CI).
 3. Accept Release-Candidate API stability risk in the project's storage layer for the period until the API moves to stable.
 

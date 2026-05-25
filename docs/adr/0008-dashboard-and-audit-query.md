@@ -195,7 +195,7 @@ The dashboard sets a 30s `setInterval` that calls `fetch('/v0/management/dashboa
 
 ### 6.6 Localhost-bound by default
 
-The dashboard is served from the existing OLP HTTP port (default 3456) which is already bound to `127.0.0.1` per `server.mjs` startup (`server.listen(PORT, '127.0.0.1', ...)`). No additional binding logic. Remote operators access via SSH tunnel; ADR 0007 § 7 owner-only auth provides the per-request gate.
+The dashboard is served from the existing OLP HTTP port (default 4567 since v0.4.0 / D60; 3456 pre-v0.4.0) which is already bound to `127.0.0.1` per `server.mjs` startup (`server.listen(PORT, '127.0.0.1', ...)`). No additional binding logic. Remote operators access via SSH tunnel; ADR 0007 § 7 owner-only auth provides the per-request gate.
 
 ---
 

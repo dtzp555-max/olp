@@ -31,10 +31,12 @@ npm install -g @dtzp555-max/olp
 # run setup (writes ~/.olp/config.json, asks which providers to enable)
 olp setup
 
-# start the proxy (default port 3456 — same as OCP if you migrate)
+# start the proxy (default port 4567 since v0.4.0 — moved off OCP's 3456 so
+# OLP and OCP can co-host on the same machine. Set OLP_PORT=3456 if you have
+# no OCP on the machine and want the old default.)
 olp start
 
-# point your IDE at http://localhost:3456/v1/chat/completions with the OLP API key from `olp keys list`.
+# point your IDE at http://localhost:4567/v1/chat/completions with the OLP API key from `olp keys list`.
 ```
 
 ---
@@ -112,7 +114,7 @@ _placeholder — full table lands per-phase as variables are introduced._
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLP_PORT` | `3456` | HTTP listener port. |
+| `OLP_PORT` | `4567` | HTTP listener port. Moved off `3456` at D60 / v0.4.0 to co-host with OCP — set `OLP_PORT=3456` to restore the pre-D60 default. |
 | `OLP_CLAUDE_BIN` | `claude` (from PATH) | Override path to the `claude` binary (Anthropic provider). Useful when multiple `claude` installs are present. |
 | `OLP_CODEX_BIN` | `codex` (from PATH) | Override path to the `codex` binary (OpenAI provider). |
 | `OLP_VIBE_BIN` | `vibe` (from PATH) | Override path to the `vibe` binary (Mistral provider). |
@@ -216,7 +218,7 @@ Behaviors that work correctly at personal/family scale but have ratified follow-
   npm start
 
   # 4. Validate the key works (substitute the captured plaintext token)
-  curl -H "Authorization: Bearer olp_..." http://localhost:3456/health
+  curl -H "Authorization: Bearer olp_..." http://localhost:4567/health
   ```
 
   **Recovery if owner token is lost:** `npx olp-keys keygen --owner --force` revokes the previous owner key + creates a fresh one (plaintext printed once).
@@ -270,7 +272,7 @@ Anticipated user-facing flow (target: <5 minutes):
 1. Stop OCP (`launchctl bootout` the OCP service or `ocp stop`).
 2. Install OLP.
 3. Run `olp migrate-from-ocp` — copies `~/.ocp/keys/` to `~/.olp/keys/` and points provider plugins at OCP's existing auth artifacts where applicable.
-4. Start OLP. Clients pointing at port 3456 keep working; their existing OLP API keys remain valid.
+4. Start OLP. Clients pointing at port 4567 (or 3456 with `OLP_PORT=3456`) keep working; their existing OLP API keys remain valid. **Note (v0.4.0+):** default port moved from 3456 → 4567 so OCP and OLP can co-host during migration; set `OLP_PORT=3456` if you want the pre-D60 default.
 
 OCP's cache directory is *not* migrated: OLP's cache key format includes provider+model and warms cold naturally. OCP enters maintenance mode (stability fixes only) when OLP v0.1 ships; new development happens in OLP.
 

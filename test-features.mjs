@@ -4343,14 +4343,20 @@ import {
   __resetAuthConfig,
 } from './server.mjs';
 
-// ── Phase 2 / D45 server-side default override ────────────────────────────
-// Override the auth.allow_anonymous default (false in production) so that
-// existing pre-D45 HTTP integration tests (Suite 18 etc.) that make /v1/*
-// requests without an Authorization header continue to pass as anonymous.
-// New Suite 20 tests explicitly call __setAuthConfig per-case to exercise
-// the production-default-off path + valid key / revoked / providers_enabled
-// scopes.
-__setAuthConfig({ allow_anonymous: true });
+// ── Phase 2 / D45+D46 server-side default override ────────────────────────
+// Override the production-off defaults so that existing pre-D45 HTTP
+// integration tests (Suite 18 etc.) continue to pass:
+//   - allow_anonymous: true  → /v1/* requests without Authorization → anonymous
+//   - owner_only_endpoints: []  → /health full payload (D46 trimming opt-out)
+//   - fallback_detail_header_policy: 'all'  → X-OLP-Fallback-Detail emitted to
+//                                              all identities (D40 v0.1.1 behaviour)
+// New Suite 20 (D45) + Suite 21 (D46) explicitly call __setAuthConfig per-case
+// to exercise the production-default paths.
+__setAuthConfig({
+  allow_anonymous: true,
+  owner_only_endpoints: [],
+  fallback_detail_header_policy: 'all',
+});
 
 // ── 13a: Trigger taxonomy ────────────────────────────────────────────────
 
@@ -10331,6 +10337,27 @@ describe('Suite 20 — server.mjs auth integration (D45, ADR 0007)', () => {
 
   // ── 20l: /v1/models also enforces auth ───────────────────────────────────
 
+  describe('20m — /health with no auth + allow_anonymous=false → 401 (D46 consistent gating)', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-20m-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: false });
+      ({ server, port } = await makeSuite20Server());
+    });
+    after(async () => {
+      await teardownSuite20(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('20m: GET /health with no auth and allow_anonymous=false → 401', async () => {
+      const r = await fetch({ port, method: 'GET', path: '/health' });
+      assert.equal(r.status, 401);
+    });
+  });
+
   describe('20l — /v1/models also enforces auth', () => {
     let TMP, server, port;
     before(async () => {
@@ -10361,6 +10388,272 @@ describe('Suite 20 — server.mjs auth integration (D45, ADR 0007)', () => {
       const body = JSON.parse(r.body);
       assert.equal(body.object, 'list');
       assert.ok(Array.isArray(body.data));
+    });
+  });
+});
+
+// ── Suite 21: D46 owner-vs-guest gating (ADR 0007 § 7.1 + § 7.2) ──────────
+//
+// HTTP-level tests for:
+//   - /health payload trimming (criterion #4): owner sees full per-provider
+//     statuses; guest + anonymous see trimmed { ok, version }
+//   - X-OLP-Fallback-Detail emission gating (criterion #5): policy
+//     'owner_only' (default) emits only to owner; 'all' emits to everyone;
+//     'none' suppresses entirely
+
+describe('Suite 21 — D46 owner-vs-guest gating (ADR 0007 §§ 7.1, 7.2)', () => {
+  const GLOBAL_OLP_HOME = process.env.OLP_HOME;
+
+  let _suite21SavedOAuth;
+  function ensureSuite21FakeOAuth() {
+    _suite21SavedOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'suite21-fake-oauth-token';
+  }
+  function restoreSuite21OAuth() {
+    if (_suite21SavedOAuth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = _suite21SavedOAuth;
+    else delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  }
+
+  function makeSuite21Server() {
+    __setProvidersEnabled({ anthropic: true });
+    __setSpawnImpl(makeMockSpawn(['suite21-response']));
+    ensureSuite21FakeOAuth();
+    const server = createOlpServer();
+    return new Promise(resolve => {
+      server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+    });
+  }
+
+  function teardownSuite21(server) {
+    return new Promise(resolve => {
+      __resetSpawnImpl();
+      __setProvidersEnabled({});
+      __clearCache();
+      restoreSuite21OAuth();
+      if (server) server.close(() => resolve());
+      else resolve();
+    });
+  }
+
+  // ── 21a-d: /health payload trimming (criterion #4) ──────────────────────
+
+  describe('21a-d — /health payload trimming (criterion #4)', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-21ad-'));
+      process.env.OLP_HOME = TMP;
+      // Default-tight gating: /health is owner-only-endpoint
+      __setAuthConfig({
+        allow_anonymous: true,
+        owner_only_endpoints: ['/health'],
+        fallback_detail_header_policy: 'owner_only',
+      });
+      ({ server, port } = await makeSuite21Server());
+    });
+    after(async () => {
+      await teardownSuite21(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('21a: anonymous /health (allow_anonymous=true) → trimmed { ok, version }', async () => {
+      const r = await fetch({ port, method: 'GET', path: '/health' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.equal(body.ok, true);
+      assert.equal(typeof body.version, 'string');
+      assert.ok(!('providers' in body), 'anonymous /health MUST NOT include providers field');
+    });
+
+    it('21b: guest /health → trimmed { ok, version }', async () => {
+      const { plaintext_token } = createKey({ name: '21b-guest', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/health',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.equal(body.ok, true);
+      assert.ok(!('providers' in body), 'guest /health MUST NOT include providers field');
+    });
+
+    it('21c: owner /health → full payload with providers', async () => {
+      const { plaintext_token } = createKey({ name: '21c-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/health',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.equal(body.ok, true);
+      assert.ok('providers' in body, 'owner /health MUST include providers field');
+      assert.equal(typeof body.providers, 'object');
+      assert.equal(typeof body.providers.enabled, 'number');
+      assert.ok('status' in body.providers, 'owner /health providers.status must be present');
+    });
+
+    it('21d: owner_only_endpoints config opt-out — empty list → guest gets full payload', async () => {
+      __setAuthConfig({
+        allow_anonymous: true,
+        owner_only_endpoints: [],
+        fallback_detail_header_policy: 'owner_only',
+      });
+      try {
+        const { plaintext_token } = createKey({ name: '21d-guest-optout', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+        const r = await fetch({
+          port, method: 'GET', path: '/health',
+          headers: { Authorization: `Bearer ${plaintext_token}` },
+        });
+        assert.equal(r.status, 200);
+        const body = JSON.parse(r.body);
+        assert.ok('providers' in body, 'with owner_only_endpoints: [], guest /health MUST get full payload');
+      } finally {
+        __setAuthConfig({
+          allow_anonymous: true,
+          owner_only_endpoints: ['/health'],
+          fallback_detail_header_policy: 'owner_only',
+        });
+      }
+    });
+  });
+
+  // ── 21e-h: X-OLP-Fallback-Detail emission gating (criterion #5) ─────────
+
+  describe('21e-h — X-OLP-Fallback-Detail emission gating (criterion #5)', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-21eh-'));
+      process.env.OLP_HOME = TMP;
+      // We will swap fallback_detail_header_policy per-case via __setAuthConfig.
+      __setAuthConfig({
+        allow_anonymous: false,
+        owner_only_endpoints: [],
+        fallback_detail_header_policy: 'owner_only',
+      });
+      // Wire a 2-hop chain with anthropic primary failing + openai secondary
+      // succeeding so X-OLP-Fallback-Detail has content to emit.
+      __setProvidersEnabled({ anthropic: true, openai: true });
+      __setFallbackConfig({
+        chains: {
+          'claude-sonnet-4-6': [
+            { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+            { provider: 'openai', model: 'gpt-5.5' },
+          ],
+        },
+        soft_triggers: {},
+        providersEnabled: { anthropic: true, openai: true },
+      });
+      // Mock: anthropic spawn fails (exit code 1); openai succeeds.
+      // Use a custom spawn impl that branches on the bin name to distinguish.
+      // Simpler: spy on both providers — for simplicity here we use the global
+      // anthropic spawn mock that returns exit 1, and a real-looking codex one.
+      // The easier path: use the mistral-codex paired spawn — but our existing
+      // makeMockSpawn doesn't distinguish providers. Pattern used in Suite 18k:
+      // an executeHopFn that itself fails primary. Here we re-use the global
+      // anthropic mock that fails so the chain advances and openai serves.
+      __setSpawnImpl(makeMockSpawn([], 1)); // anthropic spawn fails
+      // Codex provider has its own __setSpawnImpl pattern; mock it separately.
+      ensureSuite21FakeOAuth();
+      // Codex auth needs CODEX env or its own auth artifact. For tests:
+      process.env.OPENAI_CODEX_AUTH_PATH = '/dev/null'; // bypass to no-auth
+      const codexMod = await import('./lib/providers/codex.mjs');
+      codexMod.__setSpawnImpl?.(makeMockSpawn(['suite21-codex-served']));
+
+      const serverInst = createOlpServer();
+      await new Promise(resolve => {
+        serverInst.listen(0, '127.0.0.1', () => resolve());
+      });
+      server = serverInst;
+      port = serverInst.address().port;
+    });
+    after(async () => {
+      __resetSpawnImpl();
+      __setProvidersEnabled({});
+      __resetFallbackConfig();
+      __clearCache();
+      restoreSuite21OAuth();
+      delete process.env.OPENAI_CODEX_AUTH_PATH;
+      const codexMod = await import('./lib/providers/codex.mjs');
+      codexMod.__resetSpawnImpl?.();
+      await new Promise(resolve => server.close(() => resolve()));
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    // NOTE: 21e-h tests use a contract-level audit on the header alone.
+    // The header surfaces ONLY for non-empty fallbackDetail (D40) AND when
+    // the identity is permitted per fallback_detail_header_policy (D46).
+    // The 2-hop chain with primary-fail provides the non-empty trail.
+
+    it('21e: policy=owner_only + guest → X-OLP-Fallback-Detail header ABSENT', async () => {
+      __setAuthConfig({
+        allow_anonymous: false,
+        owner_only_endpoints: [],
+        fallback_detail_header_policy: 'owner_only',
+      });
+      const { plaintext_token } = createKey({ name: '21e-guest', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '21e' }] },
+      });
+      // success or 502 both valid here — what matters is whether the
+      // detail header is present. We just need to invoke fallback.
+      assert.ok(r.headers['x-olp-fallback-detail'] === undefined,
+        'guest identity MUST NOT receive X-OLP-Fallback-Detail under owner_only policy');
+    });
+
+    it('21f: policy=owner_only + owner → X-OLP-Fallback-Detail header PRESENT', async () => {
+      __setAuthConfig({
+        allow_anonymous: false,
+        owner_only_endpoints: [],
+        fallback_detail_header_policy: 'owner_only',
+      });
+      const { plaintext_token } = createKey({ name: '21f-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '21f' }] },
+      });
+      assert.ok(r.headers['x-olp-fallback-detail'] !== undefined,
+        'owner identity MUST receive X-OLP-Fallback-Detail when fallback chain has failures');
+      // Validate header is JSON-parseable per D40 contract
+      const parsed = JSON.parse(r.headers['x-olp-fallback-detail']);
+      assert.ok(Array.isArray(parsed));
+    });
+
+    it('21g: policy=all + guest → X-OLP-Fallback-Detail header PRESENT (v0.1.1 opt-back-in)', async () => {
+      __setAuthConfig({
+        allow_anonymous: false,
+        owner_only_endpoints: [],
+        fallback_detail_header_policy: 'all',
+      });
+      const { plaintext_token } = createKey({ name: '21g-guest-all', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '21g' }] },
+      });
+      assert.ok(r.headers['x-olp-fallback-detail'] !== undefined,
+        'policy=all MUST emit X-OLP-Fallback-Detail to guest identity (D46 opt-back-in to v0.1.1)');
+    });
+
+    it('21h: policy=none + owner → X-OLP-Fallback-Detail header ABSENT (full suppression)', async () => {
+      __setAuthConfig({
+        allow_anonymous: false,
+        owner_only_endpoints: [],
+        fallback_detail_header_policy: 'none',
+      });
+      const { plaintext_token } = createKey({ name: '21h-owner-none', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '21h' }] },
+      });
+      assert.ok(r.headers['x-olp-fallback-detail'] === undefined,
+        'policy=none MUST suppress X-OLP-Fallback-Detail even for owner identity');
     });
   });
 });

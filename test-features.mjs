@@ -9484,3 +9484,384 @@ describe('D38 — maxConcurrent runtime enforcement (Suite 18)', () => {
   });
 
 });
+
+// ── Suite 19: lib/keys.mjs — multi-key auth (ADR 0007, D44) ───────────────
+
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join as pathJoin } from 'node:path';
+import {
+  createKey, listKeys, revokeKey, validateKey, touchLastUsed,
+  generateToken, hashToken, validateManifest,
+  readManifest, writeManifestAtomic,
+  SCHEMA_VERSION, ENV_OWNER_KEY_ID, ANONYMOUS_KEY_ID, ENV_OWNER_VAR,
+  __setTouchInterleaveHook, __resetWriteLocks, __writeLockSize,
+} from './lib/keys.mjs';
+
+describe('Suite 19 — lib/keys.mjs multi-key auth (ADR 0007, D44)', () => {
+
+  describe('19a-d — Token generation (§ 5)', () => {
+    it('19a: generateToken produces olp_<43-char base64url> (47 chars total)', () => {
+      const t = generateToken();
+      assert.match(t, /^olp_[A-Za-z0-9_-]{43}$/);
+      assert.equal(t.length, 47);
+    });
+
+    it('19b: consecutive generateToken calls produce different tokens', () => {
+      assert.notEqual(generateToken(), generateToken());
+    });
+
+    it('19c: hashToken returns 64-char lowercase hex sha256', () => {
+      assert.match(hashToken('olp_test'), /^[a-f0-9]{64}$/);
+    });
+
+    it('19d: hashToken is deterministic', () => {
+      assert.equal(hashToken('hello'), hashToken('hello'));
+    });
+  });
+
+  describe('19e-j — Manifest write + read (§ 4, § 6.1)', () => {
+    let TMP;
+    before(() => { TMP = mkdtempSync(pathJoin(tmpdir(), 'olp-keys-19e-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetWriteLocks(); });
+
+    it('19e: createKey writes a valid manifest readable by readManifest', () => {
+      const { id, plaintext_token, manifest } = createKey({
+        name: 'test-key',
+        owner_tier: 'owner',
+        providers_enabled: ['anthropic'],
+        olpHome: TMP,
+      });
+      assert.match(plaintext_token, /^olp_[A-Za-z0-9_-]{43}$/);
+      assert.equal(manifest.schema_version, SCHEMA_VERSION);
+      assert.equal(manifest.id, id);
+      assert.equal(manifest.owner_tier, 'owner');
+      assert.deepEqual(manifest.providers_enabled, ['anthropic']);
+      assert.equal(manifest.token_hash_algo, 'sha256');
+      assert.equal(manifest.token_hash, hashToken(plaintext_token));
+      assert.equal(manifest.revoked_at, null);
+      assert.equal(manifest.last_used_at, null);
+
+      const reread = readManifest(id, { olpHome: TMP });
+      assert.deepEqual(reread, manifest);
+    });
+
+    it('19f: manifest file mode 0600 + key dir mode 0700 enforced', () => {
+      const { id } = createKey({ name: 'mode-test', olpHome: TMP });
+      const fileMode = statSync(pathJoin(TMP, 'keys', id, 'manifest.json')).mode & 0o777;
+      const dirMode = statSync(pathJoin(TMP, 'keys', id)).mode & 0o777;
+      assert.equal(fileMode, 0o600, 'manifest must be 0600');
+      assert.equal(dirMode, 0o700, 'key dir must be 0700');
+    });
+
+    it('19g: readManifest returns null for non-existent key', () => {
+      assert.equal(readManifest('does-not-exist', { olpHome: TMP }), null);
+    });
+
+    it('19h: validateManifest rejects unrecognized schema_version', () => {
+      assert.throws(
+        () => validateManifest({
+          schema_version: 99, id: 'x', name: 'x', token_hash: 'x',
+          token_hash_algo: 'sha256', owner_tier: 'owner',
+          providers_enabled: '*', created_at: 'x',
+        }),
+        /manifest_invalid: unrecognized schema_version 99/,
+      );
+    });
+
+    it('19i: validateManifest rejects bad owner_tier', () => {
+      assert.throws(
+        () => validateManifest({
+          schema_version: 1, id: 'x', name: 'x', token_hash: 'x',
+          token_hash_algo: 'sha256', owner_tier: 'admin',
+          providers_enabled: '*', created_at: 'x',
+        }),
+        /owner_tier must be "owner" or "guest"/,
+      );
+    });
+
+    it('19j: createKey rejects empty name + bad owner_tier + bad providers_enabled', () => {
+      assert.throws(() => createKey({ name: '', olpHome: TMP }), /name is required/);
+      assert.throws(() => createKey({ name: 'x', owner_tier: 'admin', olpHome: TMP }), /owner_tier must be "owner" or "guest"/);
+      assert.throws(() => createKey({ name: 'x', providers_enabled: 'invalid', olpHome: TMP }), /providers_enabled must be/);
+    });
+  });
+
+  describe('19k-p — validateKey (§ 5, § 6.3.5, § 9.4)', () => {
+    let TMP;
+    before(() => { TMP = mkdtempSync(pathJoin(tmpdir(), 'olp-keys-19k-')); });
+    after(() => {
+      rmSync(TMP, { recursive: true, force: true });
+      delete process.env[ENV_OWNER_VAR];
+      __resetWriteLocks();
+    });
+
+    it('19k: valid plaintext returns key identity from filesystem', () => {
+      const { id, plaintext_token } = createKey({
+        name: 'valid-test',
+        owner_tier: 'guest',
+        providers_enabled: ['anthropic', 'openai'],
+        olpHome: TMP,
+      });
+      const identity = validateKey(plaintext_token, { olpHome: TMP });
+      assert.ok(identity);
+      assert.equal(identity.id, id);
+      assert.equal(identity.owner_tier, 'guest');
+      assert.deepEqual(identity.providers_enabled, ['anthropic', 'openai']);
+      assert.equal(identity.source, 'filesystem');
+    });
+
+    it('19l: wrong plaintext returns null', () => {
+      createKey({ name: 'wrong-test', olpHome: TMP });
+      const wrong = 'olp_' + 'a'.repeat(43);
+      assert.equal(validateKey(wrong, { olpHome: TMP }), null);
+    });
+
+    it('19m: missing plaintext with allowAnonymous:false → null', () => {
+      assert.equal(validateKey(null, { olpHome: TMP, allowAnonymous: false }), null);
+      assert.equal(validateKey('', { olpHome: TMP, allowAnonymous: false }), null);
+      assert.equal(validateKey(undefined, { olpHome: TMP, allowAnonymous: false }), null);
+      // Default allowAnonymous is false (§ 7.2)
+      assert.equal(validateKey(null, { olpHome: TMP }), null);
+    });
+
+    it('19m-extra: non-string truthy plaintext (number / object / array) → null (no throw)', () => {
+      // D44 fold-in P2 #2: prior version threw TypeError on these inputs.
+      assert.equal(validateKey(42, { olpHome: TMP }), null);
+      assert.equal(validateKey({}, { olpHome: TMP }), null);
+      assert.equal(validateKey([], { olpHome: TMP }), null);
+      assert.equal(validateKey({ token: 'olp_xxx' }, { olpHome: TMP }), null);
+      // Same guard for allowAnonymous: true (env path doesn't change behaviour)
+      assert.equal(validateKey(42, { olpHome: TMP, allowAnonymous: true }), null);
+    });
+
+    it('19n: missing plaintext with allowAnonymous:true → anonymous identity', () => {
+      const id = validateKey(null, { olpHome: TMP, allowAnonymous: true });
+      assert.ok(id);
+      assert.equal(id.id, ANONYMOUS_KEY_ID);
+      assert.equal(id.owner_tier, 'anonymous');
+      assert.equal(id.source, 'anonymous');
+    });
+
+    it('19o: revoked key returns null on validation (criterion #6 validation-side)', async () => {
+      const { id, plaintext_token } = createKey({ name: 'revoke-test', olpHome: TMP });
+      assert.ok(validateKey(plaintext_token, { olpHome: TMP }), 'valid before revoke');
+      await revokeKey({ id, olpHome: TMP });
+      assert.equal(validateKey(plaintext_token, { olpHome: TMP }), null, '401 path after revoke');
+    });
+
+    it('19p: OLP_OWNER_TOKEN env override returns __env_owner__ identity (§ 9.4)', () => {
+      const envToken = 'olp_' + 'e'.repeat(43);
+      process.env[ENV_OWNER_VAR] = envToken;
+      try {
+        const id = validateKey(envToken, { olpHome: TMP });
+        assert.ok(id);
+        assert.equal(id.id, ENV_OWNER_KEY_ID);
+        assert.equal(id.owner_tier, 'owner');
+        assert.equal(id.providers_enabled, '*');
+        assert.equal(id.source, 'env');
+      } finally {
+        delete process.env[ENV_OWNER_VAR];
+      }
+    });
+  });
+
+  describe('19q-r — revokeKey (§ 6.1)', () => {
+    let TMP;
+    before(() => { TMP = mkdtempSync(pathJoin(tmpdir(), 'olp-keys-19q-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetWriteLocks(); });
+
+    it('19q: revokeKey marks revoked_at and is idempotent', async () => {
+      const { id } = createKey({ name: 'rev-idem', olpHome: TMP });
+      assert.equal(await revokeKey({ id, olpHome: TMP }), true);
+      const m1 = readManifest(id, { olpHome: TMP });
+      assert.ok(m1.revoked_at !== null);
+      assert.equal(await revokeKey({ id, olpHome: TMP }), true);
+      const m2 = readManifest(id, { olpHome: TMP });
+      assert.equal(m1.revoked_at, m2.revoked_at, 'second revoke must not rewrite timestamp');
+    });
+
+    it('19r: revokeKey returns false for non-existent id', async () => {
+      assert.equal(await revokeKey({ id: 'no-such-key-zzz', olpHome: TMP }), false);
+    });
+  });
+
+  describe('19s-t — listKeys', () => {
+    let TMP;
+    before(() => { TMP = mkdtempSync(pathJoin(tmpdir(), 'olp-keys-19s-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetWriteLocks(); });
+
+    it('19s: empty dir returns []', () => {
+      assert.deepEqual(listKeys({ olpHome: TMP }), []);
+    });
+
+    it('19t: lists all keys with token_hash redacted', () => {
+      createKey({ name: 'k1', owner_tier: 'owner', olpHome: TMP });
+      createKey({ name: 'k2', owner_tier: 'guest', olpHome: TMP });
+      const list = listKeys({ olpHome: TMP });
+      assert.equal(list.length, 2);
+      for (const m of list) {
+        assert.ok(m.token_hash === undefined, 'token_hash must be redacted from listKeys output');
+        assert.ok(['k1', 'k2'].includes(m.name));
+        assert.ok(['owner', 'guest'].includes(m.owner_tier));
+      }
+    });
+  });
+
+  describe('19u-x — touchLastUsed read-modify-write (§ 6.3)', () => {
+    let TMP;
+    before(() => { TMP = mkdtempSync(pathJoin(tmpdir(), 'olp-keys-19u-')); });
+    after(() => {
+      rmSync(TMP, { recursive: true, force: true });
+      __resetWriteLocks();
+      __setTouchInterleaveHook(null);
+    });
+
+    it('19u: updates last_used_at on non-revoked key (preserves all other fields)', async () => {
+      const { id, manifest: m_before } = createKey({
+        name: 'touch-test', owner_tier: 'owner', providers_enabled: ['mistral'], olpHome: TMP,
+      });
+      assert.equal(m_before.last_used_at, null);
+      await touchLastUsed(id, { olpHome: TMP });
+      const m_after = readManifest(id, { olpHome: TMP });
+      assert.ok(m_after.last_used_at !== null);
+      assert.equal(m_after.revoked_at, null);
+      assert.equal(m_after.owner_tier, 'owner');
+      assert.deepEqual(m_after.providers_enabled, ['mistral']);
+      assert.equal(m_after.token_hash, m_before.token_hash);
+    });
+
+    it('19v: NO-OPs on already-revoked key (preserves revoked_at, does not set last_used_at)', async () => {
+      const { id } = createKey({ name: 'touch-revoked', olpHome: TMP });
+      await revokeKey({ id, olpHome: TMP });
+      const revokedTs = readManifest(id, { olpHome: TMP }).revoked_at;
+      assert.ok(revokedTs !== null);
+
+      await touchLastUsed(id, { olpHome: TMP });
+      const m_after_touch = readManifest(id, { olpHome: TMP });
+      assert.equal(m_after_touch.revoked_at, revokedTs, 'revoked_at must be preserved (revoke dominates touch)');
+      assert.equal(m_after_touch.last_used_at, null, 'NO-OP must not write last_used_at on revoked key');
+    });
+
+    it('19w: NO-OPs silently on anonymous + env-owner identities (no manifest exists)', async () => {
+      await touchLastUsed(ANONYMOUS_KEY_ID, { olpHome: TMP });
+      await touchLastUsed(ENV_OWNER_KEY_ID, { olpHome: TMP });
+    });
+
+    it('19x: failure is best-effort (no throw on missing key)', async () => {
+      await touchLastUsed('phantom-key-xyz', { olpHome: TMP });
+    });
+
+    it('19x-extra: per-key write-lock Map is cleaned up after sequential calls (D44 fold-in P2 #1 regression)', async () => {
+      __resetWriteLocks();
+      assert.equal(__writeLockSize(), 0, 'lock map starts empty');
+      const { id } = createKey({ name: 'lock-cleanup-test', olpHome: TMP });
+      // Sequential touch calls
+      for (let i = 0; i < 5; i++) {
+        await touchLastUsed(id, { olpHome: TMP });
+      }
+      assert.equal(__writeLockSize(), 0,
+        'lock map MUST be empty after sequential awaited calls (prior bug: stored derived promise never matched cleanup identity check, leaving stale entry per unique key-id)');
+    });
+
+    it('19x-extra-2: per-key write-lock Map cleans up after concurrent contention resolves', async () => {
+      __resetWriteLocks();
+      const ids = [];
+      for (let i = 0; i < 3; i++) {
+        const { id } = createKey({ name: `concurrent-${i}`, olpHome: TMP });
+        ids.push(id);
+      }
+      // Race: 3 keys, each with 3 concurrent touches
+      const calls = [];
+      for (const id of ids) {
+        for (let j = 0; j < 3; j++) {
+          calls.push(touchLastUsed(id, { olpHome: TMP }));
+        }
+      }
+      await Promise.all(calls);
+      assert.equal(__writeLockSize(), 0,
+        'lock map MUST drain to 0 after all queued callers across all keys finish');
+    });
+  });
+
+  describe('19y-1 to 19y-4 — Acceptance criterion #7: concurrent revoke + touch (§ 6.3, § 6.4)', () => {
+    let TMP;
+    before(() => { TMP = mkdtempSync(pathJoin(tmpdir(), 'olp-keys-19y-')); });
+    after(() => {
+      rmSync(TMP, { recursive: true, force: true });
+      __resetWriteLocks();
+      __setTouchInterleaveHook(null);
+    });
+
+    it('19y-1: revoke-then-touch — revoked_at preserved', async () => {
+      const { id } = createKey({ name: 'race-1', olpHome: TMP });
+      await revokeKey({ id, olpHome: TMP });
+      const revokedTs = readManifest(id, { olpHome: TMP }).revoked_at;
+      await touchLastUsed(id, { olpHome: TMP });
+      const m = readManifest(id, { olpHome: TMP });
+      assert.equal(m.revoked_at, revokedTs, 'revoked_at must survive subsequent touch');
+      assert.equal(m.last_used_at, null, 'touch must NO-OP on revoked key');
+    });
+
+    it('19y-2: touch-then-revoke — revoked_at present + last_used_at preserved from prior touch', async () => {
+      const { id } = createKey({ name: 'race-2', olpHome: TMP });
+      await touchLastUsed(id, { olpHome: TMP });
+      const lastUsedAtBeforeRevoke = readManifest(id, { olpHome: TMP }).last_used_at;
+      assert.ok(lastUsedAtBeforeRevoke !== null);
+      await revokeKey({ id, olpHome: TMP });
+      const m = readManifest(id, { olpHome: TMP });
+      assert.ok(m.revoked_at !== null, 'revoked_at must be set');
+      assert.equal(m.last_used_at, lastUsedAtBeforeRevoke, 'last_used_at from prior touch must persist through revoke');
+    });
+
+    it('19y-3: interleaved external revoke fires inside touch lock before read — revoked_at preserved', async () => {
+      // SCENARIO TESTED: external revoke lands after touch acquires its lock
+      // but before touch's read. touch's subsequent read sees the revoke and
+      // NO-OPs per § 6.3 step 2.
+      //
+      // SCENARIO NOT TESTED (and currently UNREACHABLE in implementation):
+      // external revoke between touch's read and touch's write. The current
+      // touchLastUsed has SYNCHRONOUS read→write (no await between
+      // readManifest and writeManifestAtomic), so no external write can
+      // interleave between them at the JS event-loop level. If a future
+      // refactor introduces an await between read and write, this guarantee
+      // breaks and a post-read hook + matching test would be required to
+      // catch the regression. ADR § 10 criterion #7 scenario 3 is satisfied
+      // by the synchronous-read-write property of the current implementation.
+      const { id } = createKey({ name: 'race-3', olpHome: TMP });
+      let hookFired = false;
+      __setTouchInterleaveHook(async () => {
+        // Simulates an external (out-of-process / CLI) revoke landing
+        // between touch's lock acquisition and touch's read. Bypasses
+        // _withKeyLock because external writers do not see in-process
+        // locks at Phase 2 (§ 6.4).
+        const fresh = readManifest(id, { olpHome: TMP });
+        fresh.revoked_at = new Date().toISOString();
+        writeManifestAtomic(id, fresh, { olpHome: TMP });
+        hookFired = true;
+      });
+      try {
+        await touchLastUsed(id, { olpHome: TMP });
+      } finally {
+        __setTouchInterleaveHook(null);
+      }
+      assert.ok(hookFired, 'hook must have fired');
+      const m = readManifest(id, { olpHome: TMP });
+      assert.ok(m.revoked_at !== null, 'revoked_at must NOT be cleared by an interleaved touch — § 6.3 contract');
+      assert.equal(m.last_used_at, null, 'touch must NO-OP after observing the interleaved revoke');
+    });
+
+    it('19y-4: stress — 30 iterations of concurrent revoke + touch never lose revoked_at', async () => {
+      for (let i = 0; i < 30; i++) {
+        const { id } = createKey({ name: `stress-${i}`, olpHome: TMP });
+        await Promise.all([
+          revokeKey({ id, olpHome: TMP }),
+          touchLastUsed(id, { olpHome: TMP }),
+        ]);
+        const m = readManifest(id, { olpHome: TMP });
+        assert.ok(m.revoked_at !== null, `iter ${i}: revoked_at lost — race regression`);
+      }
+    });
+  });
+
+});

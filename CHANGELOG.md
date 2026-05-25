@@ -4,6 +4,36 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D44 — `lib/keys.mjs` core landed (multi-key auth, no server wire-up yet)
+
+First Phase 2 implementation D-day. Lands the `lib/keys.mjs` module per ADR 0007 §§ 5/6.1/6.3/6.3.5/6.4/9.4. Identity / lifecycle layer for OLP API keys is now in-tree; `server.mjs` integration scheduled D45 (until then, requests still use the hardcoded `'__anonymous__'` cache namespace — no behavioural change at v0.1.1 / D44).
+
+- **New file `lib/keys.mjs`** (~462 lines after fold-in) — public API surface:
+  - `createKey({ name, owner_tier, providers_enabled, notes, olpHome })` — generates opaque `olp_<32-byte base64url>` token (47-char total), SHA-256 hashes it for manifest storage, atomically writes `keys/<id>/manifest.json` (mode 0600, dir 0700). Returns `{ id, plaintext_token, manifest }` — plaintext token is printed once and never persisted.
+  - `validateKey(plaintext, { allowAnonymous, olpHome })` — three-tier resolution per § 5 / § 7 / § 9.4: env override (`OLP_OWNER_TOKEN` → `__env_owner__` synthetic identity) → anonymous (only when `allowAnonymous: true`, returns `__anonymous__` identity) → filesystem manifest lookup (constant-time hash compare via `crypto.timingSafeEqual`). Revoked manifests return null (caller produces 401). Per § 6.3.5 — MUST hit manifest every request; no in-process validation cache.
+  - `revokeKey({ id, olpHome })` — idempotent; sets `revoked_at` via atomic write inside per-key write-lock.
+  - `listKeys({ olpHome })` — returns manifest objects with `token_hash` redacted.
+  - `touchLastUsed(id, { olpHome })` — async best-effort lazy update per § 6.3 revoke-dominates-touch: re-reads latest manifest inside the per-key lock, NO-OPs if `revoked_at` is non-null, otherwise merges `last_used_at` preserving all other fields. Failure logs warn and never throws.
+- **§ 6.4 in-process per-key write-lock** — `Map<key-id, Promise>` chain; serializes intra-process writes. External (CLI) writes not lock-protected at Phase 2; atomic-rename + § 6.3 read-before-write give the `revoke dominates touch` safety property.
+- **Test-only hooks** — `__setTouchInterleaveHook` (inject deterministic pause between touch's lock acquisition and read for race tests) + `__resetWriteLocks` (test cleanup).
+- **What is NOT in D44 (split per ADR §§ 6.2 / 9.1 separation):** audit ndjson append (request-layer concern; D45 server glue); keygen CLI bootstrap surface (D45+); `server.mjs` integration replacing the hardcoded `'__anonymous__'` keyId at `server.mjs:502, :531` (D45); owner-vs-guest gating for `/health` and `X-OLP-Fallback-Detail` (D46).
+- **Test count:** 468 → 496 (+28 tests in new Suite 19):
+  - 19a-d token generation (§ 5)
+  - 19e-j manifest write+read + chmod 0600/0700 + schema validation (§ 4, § 6.1)
+  - 19k-p validateKey: filesystem / wrong / missing / anonymous / revoked / env override (§ 5, § 6.3.5, § 9.4)
+  - 19q-r revokeKey idempotency + non-existent id
+  - 19s-t listKeys empty + redaction
+  - 19u-x touchLastUsed updates + NO-OP on revoked + NO-OP on anonymous/env identities + best-effort failure
+  - **19y-1 to 19y-4 acceptance criterion #7 (concurrent revoke + touch race tests)**: revoke→touch, touch→revoke, interleaved external-revoke-via-hook (deterministically reproduces the § 6.3 race the maintainer's text review caught), 30-iteration concurrent-promise stress
+- **Documentation:** AGENTS.md `lib/keys.mjs` 📋 marker → 🟡 "core landed at D44"; AGENTS.md Implementation-status-note + shipped-set updated to include `lib/keys.mjs`; README.md Implementation Status row + Known limitations "Multi-key auth" note updated to "core landed, server integration pending D45".
+- **Fold-in (fresh-context opus reviewer findings, 2 P2 correctness + 2 P3 polish):**
+  - **P2 #1 lock-map cleanup** (`lib/keys.mjs` `_withKeyLock`): prior version stored `prev.then(() => next)` as the Map tail, but the cleanup-identity check `_writeLocks.get(id) === next` could never match the derived promise — Map entries leaked one-per-unique-key-id. Bounded impact at family scale (~5–10 entries) but a real correctness bug. Fixed by storing `next` directly. New regression tests `19x-extra` (sequential) + `19x-extra-2` (concurrent 3-key × 3-touch contention) assert `__writeLockSize() === 0` post-drain.
+  - **P2 #2 `validateKey` non-string defensive coding**: prior version threw `TypeError` when called with a non-string truthy plaintext (`validateKey(42)` / `validateKey({})`), reaching `hashToken(<non-string>)` → `createHash().update(<non-string>)`. Q2 promised "bad inputs return null." Fixed via top-of-function `if (plaintextToken != null && typeof plaintextToken !== 'string') return null;`. New test `19m-extra` covers number / object / array / `allowAnonymous: true` paths.
+  - **P3 #3 19y-3 test scope comment**: test simulates external revoke landing BEFORE touch's read, not BETWEEN touch's read and write (which is currently unreachable because `touchLastUsed` has synchronous read→write — no await between `readManifest` and `writeManifestAtomic`). Added explanatory comment documenting the synchronous-read-write property as the satisfaction mechanism for ADR § 10 criterion #7 scenario 3, with a note that a post-read hook + matching test would be required if a future refactor introduces an await between read and write.
+  - **P3 #4 CHANGELOG line count**: corrected `~330 lines` to `~462 lines after fold-in` (matches `wc -l lib/keys.mjs`).
+- **Test count after fold-in:** 468 → 499 (+31 tests: 28 initial + 3 fold-in regression tests).
+- **Authority:** ADR 0007 (multi-key auth — Decision: Option 2 filesystem manifest + opaque token; §§ 5/6.1/6.3/6.3.5/6.4/9.4 implementation contracts; § 10 acceptance criteria #6/#7 partially-covered by D44 tests, full coverage requires D45+ server integration); CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; Phase 2 kickoff handoff (`~/.cc-rules/memory/handoffs/2026-05-25-phase-2-kickoff.md` in cc-rules `d9da966`); PR #20 fresh-context opus reviewer findings.
+
 ### D43-B — ADR 0007 multi-key auth design draft (design-only, no code change)
 
 Phase 2 mainline design ADR. Ratifies the storage / token / manifest / atomic-write / owner-gating / bootstrap / Node-baseline decisions ahead of D44+ implementation D-days. Pure design doc — no `.mjs` / no tests / 4 files touched.

@@ -37,7 +37,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - `lib/ir/` — Intermediate Representation definition + serializers. Governed by ADR 0003.
 - `lib/cache/` — content-addressed cache layer (per-key isolation, `cache_control` bypass, chunked stream replay, singleflight). Governed by ADR 0005.
 - `lib/fallback/` — fallback engine (trigger detection, chain advancement, idempotent-failure safety, header annotation). Governed by ADR 0004.
-- `lib/keys.mjs` — multi-key auth, per-key namespacing, audit log. Carries OCP's per-key isolation model into OLP. **📋 Phase 2 active per ADR 0007 (drafting at D43-B) — not yet authored.**
+- `lib/keys.mjs` — multi-key auth, per-key namespacing, audit log. Carries OCP's per-key isolation model into OLP. **🟡 Phase 2 — core landed at D44 (createKey / validateKey / listKeys / revokeKey / touchLastUsed per ADR 0007 §§ 5/6.1/6.3/6.3.5/6.4/9.4). server.mjs integration scheduled D45; audit ndjson + keygen CLI surface in subsequent D-days.**
 - `dashboard.html` — owner-only multi-provider dashboard (quota panels, fallback rate, cache hit rate). **📋 Planned (Phase 6) — not yet authored.**
 - `models-registry.json` — single source of truth for `(provider, model) → metadata`. SPOT.
 - `ALIGNMENT.md` — the constitution. Binding for any plugin / entry-surface / IR change.
@@ -45,7 +45,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - `.github/workflows/alignment.yml` — CI blacklist grep + per-provider citation soft check; fails the build on known-hallucinated tokens.
 - `CLAUDE.md` — Claude-Code-specific session instructions + `release_kit` overlay (Iron Rule 5.5).
 
-**Implementation status note (as of 2026-05-25):** Files marked 📋 above are designed and documented but not yet on disk. For the full status table see `README.md § "Implementation status"`. Do not attempt to read or import these files — they will not be found. The shipped set as of Phase 1 close (v0.1.1, 2026-05-25) is: `server.mjs`, `lib/ir/`, `lib/providers/{anthropic,codex,mistral}.mjs`, `lib/cache/{keys,store}.mjs`, `lib/fallback/engine.mjs`, `models-registry.json`, `test-features.mjs`. Phase 2 active scope: `lib/keys.mjs` per ADR 0007 (drafting at D43-B).
+**Implementation status note (as of 2026-05-25):** Files marked 📋 above are designed and documented but not yet on disk; files marked 🟡 are partially shipped (specific components landed; others scheduled). For the full status table see `README.md § "Implementation status"`. The shipped set as of D44 is: `server.mjs`, `lib/ir/`, `lib/providers/{anthropic,codex,mistral}.mjs`, `lib/cache/{keys,store}.mjs`, `lib/fallback/engine.mjs`, `lib/keys.mjs` (core only — D44), `models-registry.json`, `test-features.mjs`. Phase 2 in progress: `lib/keys.mjs` server integration (D45), owner gating for /health + X-OLP-Fallback-Detail (D46), E2E + multi-key fixtures (D47), Phase 2 close → v0.2.0.
 
 ---
 

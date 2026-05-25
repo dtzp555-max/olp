@@ -1117,32 +1117,21 @@ async function handleChatCompletions(req, res) {
   // truncate the response (end with no [DONE]). On error before any chunk:
   // throw so the outer handler can surface a clean error (no bytes written).
   //
-  // On success: write chunks to res AND cache so subsequent identical requests
-  // hit the burst-replay path.
-  // D38 (issue #1): pre-acquire a concurrency slot for the streaming path so
-  // saturation here behaves identically to saturation on the buffered path.
-  // If acquire fails, fall through (skip this branch) — the buffered path
-  // below also gates via tryAcquireSpawn and will surface a chain-exhausted
-  // error through executeWithFallback (correct behaviour: a single-hop chain
-  // at maxConcurrent has no other hop to advance to).
+  // On success: chunks are written to res, and the cache layer (via
+  // getOrComputeStreaming) writes accumulated chunks on source completion.
   //
-  // Acquired here, released in the `finally` below. The gate intentionally
-  // lives BEFORE the streaming-branch entry check so the buffered fallthrough
-  // can re-attempt acquire from a clean slate.
-  // TODO(v1.x — ADR 0005 Amendment 8 / issue #16): replace this peek+spawn
-  // pattern with cacheStore.getOrComputeStreaming(...) to close the TOCTOU
-  // window between line ~782 peek and the spawn at line ~846, and to make N
-  // concurrent identical streaming requests share one spawn (tee-streaming).
-  // Design ratified in D42; see docs/v1x-roadmap.md #1 for the trigger and
-  // acceptance criteria. DO NOT remove this comment until the v1.x impl lands.
-  let streamingAcquired = false;
+  // D58 — ADR 0005 Amendment 8 §§7, 11, 12: streaming singleflight via
+  // cacheStore.getOrComputeStreaming(...). The peek+spawn TOCTOU window
+  // (server.mjs:1104 peek vs. spawn) is collapsed by the synchronous Map
+  // check+insert in the cache layer (D57). The D38 tryAcquireSpawn gate now
+  // lives INSIDE the sourceFactory closure: only the first caller acquires a
+  // slot; attached joiners share it. On factory-throw CONCURRENCY_LIMIT, the
+  // cache layer rejects → we fall through to the buffered path (same outcome
+  // as today). preCheckHit gates entry exactly as before — the cache_hit
+  // outcome from getOrComputeStreaming is the TTL-race safety net; in
+  // practice it should not fire because preCheckHit excludes alive entries.
+  // See docs/adr/0005-cache-cross-provider.md Amendment 8 + issue #16.
   if (ir.stream && chain.length === 1 && !bypassCacheForFirstHop && !preCheckHit && cacheableForFirstHop) {
-    const candidatePlugin = loadedProviders.get(chain[0].provider);
-    const candidateMax = candidatePlugin?.hints?.maxConcurrent ?? DEFAULT_MAX_CONCURRENT_SPAWNS;
-    streamingAcquired = candidatePlugin ? tryAcquireSpawn(chain[0].provider, candidateMax) : false;
-  }
-
-  if (ir.stream && chain.length === 1 && !bypassCacheForFirstHop && !preCheckHit && cacheableForFirstHop && streamingAcquired) {
     const streamProvider = chain[0].provider;
     const streamModel = chain[0].model;
     const streamCacheKey = computeCacheKey(streamProvider, streamModel, ir);
@@ -1150,63 +1139,214 @@ async function handleChatCompletions(req, res) {
 
     if (!streamPlugin) {
       // Provider disappeared between chain build and here (edge case).
-      // Release the slot we acquired above so the counter stays balanced.
       auditCtx.provider = streamProvider;
       auditCtx.error_code = 'no_enabled_provider';
-      releaseSpawn(streamProvider);
       return sendError(res, 503, `Provider ${streamProvider} is not enabled`, 'no_enabled_provider',
         olpErrorHeaders({ startMs, model: ir.model }));
     }
 
-    // D45 fold-in P1: populate audit ctx for the real-streaming path. Each
-    // exit below (success, error-after-first-chunk, pre-first-chunk-error,
-    // 503 above) leaves these fields representing the streaming attempt.
-    // Error paths amend `error_code`; success leaves it null.
-    auditCtx.provider = streamProvider;
-    auditCtx.tried_providers = [streamProvider];
-    auditCtx.cache_status = 'miss';
+    // D58 — ADR 0005 Amendment 8 §7: sourceFactory wraps acquire + spawn.
+    // Acquire fires ONLY for the first caller; attached clients share the
+    // slot. Release fires EXACTLY ONCE when the source iterator's
+    // try/finally executes (normal exhaustion, error, or iterator.return()
+    // propagated from sourceAbortController via the cache layer).
+    const candidateMax = streamPlugin.hints?.maxConcurrent ?? DEFAULT_MAX_CONCURRENT_SPAWNS;
+    const sourceFactory = () => {
+      if (!tryAcquireSpawn(streamProvider, candidateMax)) {
+        const err = new ProviderError(
+          `provider ${streamProvider} at maxConcurrent (${candidateMax})`,
+          'CONCURRENCY_LIMIT',
+        );
+        err.providerName = streamProvider;
+        err.maxConcurrent = candidateMax;
+        err.activeSpawns = getActiveSpawnCount(streamProvider);
+        throw err;
+      }
+      // Wrap streamPlugin.spawn in an async generator that guarantees
+      // releaseSpawn fires exactly once in finally — regardless of normal
+      // exhaustion, mid-stream throw, or iterator.return() from cache-layer
+      // sourceAbortController propagation (§9).
+      return (async function* sourceWithRelease() {
+        try {
+          for await (const irChunk of streamPlugin.spawn(ir, authContext)) {
+            yield irChunk;
+          }
+        } finally {
+          releaseSpawn(streamProvider);
+        }
+      })();
+    };
 
-    const streamHeaders = olpHeaders({
-      providerUsed: streamProvider,
-      modelUsed: streamModel,
-      startMs,
-      cacheStatus: 'miss',
-      fallbackHops: 0,
-    });
-
-    // D14: writeHead is deferred until just before the first res.write so that
-    // pre-first-chunk errors can still produce a JSON 502 (matching the buffered
-    // path). Calling writeHead unconditionally here was the D14 defect.
-
-    const streamedChunks = [];
-    let firstChunkEmitted = false;
+    // D58 — invoke the cache-layer coordinator. CONCURRENCY_LIMIT from the
+    // factory falls through to the buffered path (the buffered fallback
+    // engine re-attempts acquire). Any other pre-stream error surfaces 502.
+    let stream;
+    let role;
     try {
-      for await (const irChunk of streamPlugin.spawn(ir, authContext)) {
-        if (irChunk.type === 'error') {
-          // Error chunk from provider
-          if (firstChunkEmitted) {
-            // Past first-chunk boundary — can't fallback; emit truncation marker + [DONE]
-            // so clients can detect the incomplete response in-band (aligns D26 F19
-            // stop-less exhaustion behaviour and the catch-block fix in D35 #10).
-            logEvent('warn', 'streaming_error_after_first_chunk', {
-              provider: streamProvider,
-              model: streamModel,
-              error: irChunk.error,
+      const result = await cacheStore.getOrComputeStreaming(
+        keyId,
+        streamCacheKey,
+        sourceFactory,
+        { clientId: requestId },
+      );
+      stream = result.stream;
+      role = result.role;
+    } catch (e) {
+      if (e instanceof ProviderError && e.code === 'CONCURRENCY_LIMIT') {
+        // Fall through to the buffered path — the existing executeHopFn /
+        // executeWithFallback machinery re-attempts acquire and surfaces a
+        // chain-exhausted 502 for a single-hop chain at maxConcurrent, which
+        // matches today's pre-D58 behaviour for this saturation scenario.
+        logEvent('debug', 'streaming_concurrency_limit_fallthrough', {
+          provider: streamProvider,
+          model: streamModel,
+        });
+        // (proceed past this block)
+      } else {
+        // Any other pre-first-chunk error — surface a clean 502.
+        auditCtx.provider = streamProvider;
+        auditCtx.tried_providers = [streamProvider];
+        auditCtx.cache_status = 'miss';
+        auditCtx.error_code = e?.code ?? 'provider_error';
+        logEvent('error', 'streaming_error_before_first_chunk', {
+          provider: streamProvider,
+          model: streamModel,
+          error: e.message,
+        });
+        return sendError(res, 502, e.message ?? 'Provider error', 'provider_error',
+          olpHeaders({ providerUsed: streamProvider, modelUsed: streamModel, startMs, cacheStatus: 'miss', fallbackHops: 0 }));
+      }
+    }
+
+    if (stream) {
+      // D58 — ADR 0005 Amendment 8 §11: cache_status reflects role-of-this-
+      // client at attach-time. `source` did real work (miss); `attached`
+      // shared a live spawn (streaming_attached); `cache_hit` served from
+      // cache (hit). See lib/audit.mjs cache_status JSDoc for the enum.
+      auditCtx.provider = streamProvider;
+      auditCtx.tried_providers = [streamProvider];
+      if (role === 'cache_hit') {
+        auditCtx.cache_status = 'hit';
+      } else if (role === 'attached') {
+        auditCtx.cache_status = 'streaming_attached';
+      } else {
+        auditCtx.cache_status = 'miss';
+      }
+
+      // D58 — ADR 0005 Amendment 8 §9: wire HTTP req close → iterator
+      // return() so a client disconnect propagates into the cache layer.
+      // Without this the cache layer never learns of disconnect and the
+      // source spawn may orphan (last-client-gone abort would not fire).
+      // try/catch guards against concurrent return() throws (Node async
+      // generators can throw if return() is invoked while iteration is
+      // pending). The cache layer's iterator return() is idempotent.
+      // D58 — ADR 0005 Amendment 8 §9: detect client disconnect via res
+      // 'close' event (not req 'close'). For SSE responses Node emits
+      // res.on('close') when the underlying socket goes away while the
+      // response is still streaming. req.on('close') in Node 18+ fires only
+      // after the response is fully sent, which is too late for our abort
+      // propagation needs. Without this wire-up the cache layer would never
+      // learn of disconnect → potential orphan spawns.
+      const onClose = () => {
+        try { stream.return?.(); } catch { /* best-effort */ }
+      };
+      res.on('close', onClose);
+
+      // D58 — ADR 0005 Amendment 8 §11: X-OLP-Streaming-Inflight header.
+      //   role === 'source'   → 'source' (first caller; may upgrade to
+      //                          'solo' post-stream if no joiners ever
+      //                          attached — see deferral note below).
+      //   role === 'attached' → 'attached'
+      //   role === 'cache_hit'→ omitted; the existing X-OLP-Cache: hit
+      //                          already signals that path.
+      // 'solo' (no joiners ever attached) is observable only post-stream —
+      // emitted via streaming_inflight_source_done log event with
+      // attached_count=0; the wire header reports `source` initially and
+      // does NOT flip mid-stream. Future ADR may expose it on a trailer.
+      const cacheStatusForHeader = (role === 'cache_hit') ? 'hit' : 'miss';
+      const streamHeaders = olpHeaders({
+        providerUsed: streamProvider,
+        modelUsed: streamModel,
+        startMs,
+        cacheStatus: cacheStatusForHeader,
+        fallbackHops: 0,
+      });
+      if (role === 'source' || role === 'attached') {
+        streamHeaders['X-OLP-Streaming-Inflight'] = role;
+      }
+
+      // D14: writeHead is deferred until just before the first res.write so
+      // that pre-first-chunk errors can still produce a JSON 502 (matching
+      // the buffered path). Calling writeHead unconditionally was the D14
+      // defect.
+
+      const streamedChunks = [];
+      let firstChunkEmitted = false;
+      try {
+        for await (const irChunk of stream) {
+          if (irChunk.type === 'error') {
+            // Error chunk from provider
+            if (firstChunkEmitted) {
+              // Past first-chunk boundary — emit truncation marker + [DONE].
+              logEvent('warn', 'streaming_error_after_first_chunk', {
+                provider: streamProvider,
+                model: streamModel,
+                error: irChunk.error,
+              });
+              auditCtx.error_code = 'streaming_error_after_first_chunk';
+              res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
+              res.write(SSE_DONE);
+              res.end();
+              return;
+            }
+            throw new ProviderError(irChunk.error ?? 'Provider emitted error chunk', 'SPAWN_FAILED');
+          }
+
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              Connection: 'keep-alive',
+              'X-Accel-Buffering': 'no',
+              ...streamHeaders,
             });
-            auditCtx.error_code = 'streaming_error_after_first_chunk';
-            res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
+          }
+          streamedChunks.push(irChunk);
+          res.write(irChunkToOpenAISSE(irChunk, requestId, ir.model));
+          firstChunkEmitted = true;
+
+          if (irChunk.type === 'stop') {
             res.write(SSE_DONE);
             res.end();
+            // D58 — ADR 0005 Amendment 8 §4: cache write is performed by the
+            // cache layer's tee task on source completion. Server no longer
+            // calls cacheStore.set from this branch; the cache layer applies
+            // the same write conditions (truncated-not-cached, cacheable:false
+            // opt-out, replay-cap, maxEntryBytes cap) internally.
             return;
           }
-          // No bytes written yet — throw to surface a clean error.
-          // auditCtx.error_code is set by the downstream catch handler (the
-          // outer streaming-path catch block fills it from the thrown error).
-          throw new ProviderError(irChunk.error ?? 'Provider emitted error chunk', 'SPAWN_FAILED');
         }
 
-        // Defer writeHead until the moment we are about to emit the first byte.
-        // After this point firstChunkEmitted===true ↔ res.headersSent===true.
+        // Generator exhausted without a stop chunk — emit truncation marker
+        // + [DONE]. D58 — the cache layer (per ADR 0005 Amendment 8 §4) writes
+        // accumulatedChunks on normal source exhaustion regardless of stop-
+        // chunk semantics; IR-level stop-chunk inspection is the server's
+        // responsibility. Mirror D16 truncation-eviction: the source role
+        // explicitly deletes the just-written entry so subsequent identical
+        // requests respawn (matches D16 buffered-path truncation behaviour
+        // and ADR 0005 § "Cache write conditions" item 1). Only the source
+        // role performs the delete; attached clients did not trigger the
+        // write. Idempotent across concurrent source-truncation observers.
+        if (streamedChunks.length > 0) {
+          const truncMarker = { type: 'stop', finish_reason: 'length' };
+          res.write(irChunkToOpenAISSE(truncMarker, requestId, ir.model));
+        }
+        if (role === 'source' && cacheableForFirstHop) {
+          cacheStore.delete(keyId, streamCacheKey);
+        }
+
+        // D35 #9: zero-chunk empty-stream — writeHead deferred (no chunks
+        // yielded), emit headers + [DONE] so the response is still valid SSE.
         if (!res.headersSent) {
           res.writeHead(200, {
             'Content-Type': 'text/event-stream',
@@ -1216,114 +1356,51 @@ async function handleChatCompletions(req, res) {
             ...streamHeaders,
           });
         }
-        streamedChunks.push(irChunk);
-        res.write(irChunkToOpenAISSE(irChunk, requestId, ir.model));
-        firstChunkEmitted = true;
 
-        if (irChunk.type === 'stop') {
-          res.write(SSE_DONE);
-          res.end();
-          // Cache the buffered chunks for burst-replay on subsequent identical requests.
-          // D23 defense-in-depth: cacheableForFirstHop is true here (cacheable: false
-          // falls through to the buffered path, never enters this block), but the guard
-          // makes the intent explicit and survives future refactors.
-          if (cacheableForFirstHop) {
-            await cacheStore.set(keyId, streamCacheKey, streamedChunks);
-            logEvent('info', 'streaming_response_cached', {
-              provider: streamProvider,
-              model: streamModel,
-              chunks: streamedChunks.length,
-            });
-          }
-          return;
-        }
-      }
-
-      // Generator exhausted without a stop chunk — emit [DONE] but do NOT cache.
-      // A stop-less exhaustion means the response is truncated (the generator
-      // ended without the model signalling completion). Caching a truncated
-      // response would serve wrong answers to future identical requests.
-      // Compare: D16's buffered-path truncation eviction explicitly avoids
-      // persisting truncated entries for the same reason.
-      //
-      // D26 round-3 F19: emit a synthetic truncation marker BEFORE [DONE] so
-      // clients can detect the incomplete response in-band. Only emit when there
-      // is actual partial content (streamedChunks.length > 0) — emitting a
-      // truncation marker on an empty response is misleading.
-      // The buffered D16 path synthesizes {type:'stop', finish_reason:'length'}
-      // before returning; this aligns the streaming branch with that behaviour.
-      if (streamedChunks.length > 0) {
-        const truncMarker = { type: 'stop', finish_reason: 'length' };
-        res.write(irChunkToOpenAISSE(truncMarker, requestId, ir.model));
-      }
-
-      // D35 #9: Zero-chunk empty-stream path — writeHead is still deferred
-      // (firstChunkEmitted===false) when the generator yields no chunks at all and
-      // exits cleanly. Without an explicit writeHead Node auto-emits 200 with the
-      // default Content-Type and none of the X-OLP-* headers.
-      // A provider that yielded nothing still constitutes an attempted call, so we
-      // emit the full olpHeaders (provider WAS attempted, just yielded zero chunks).
-      if (!res.headersSent) {
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          Connection: 'keep-alive',
-          'X-Accel-Buffering': 'no',
-          ...streamHeaders,
-        });
-      }
-
-      res.write(SSE_DONE);
-      res.end();
-      // Loop exhausted without stop chunk = truncation. The stop-chunk completion
-      // path returns earlier (above, inside the for-await loop); reaching here means
-      // the generator returned without emitting stop. Never cache (per ADR 0005 cache
-      // write conditions item 1: truncated responses must not persist in cache).
-      if (streamedChunks.length > 0 && cacheableForFirstHop) {
-        logEvent('warn', 'streaming_no_stop_chunk', {
-          chunks_count: streamedChunks.length,
-          provider: streamProvider,
-          model: streamModel,
-        });
-      }
-    } catch (e) {
-      if (firstChunkEmitted) {
-        // Past first-chunk boundary — can't fallback; emit truncation marker + [DONE]
-        // so clients can detect the incomplete response in-band (aligns with D26 F19
-        // stop-less exhaustion behaviour). ADR 0004 § Fallback safety: no fallback
-        // after first-chunk boundary; truncation is the correct recovery.
-        logEvent('warn', 'streaming_error_after_first_chunk', {
-          provider: streamProvider,
-          model: streamModel,
-          error: e.message,
-        });
-        res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
         res.write(SSE_DONE);
         res.end();
-      } else {
-        // No bytes written — surface a clean JSON error.
-        logEvent('error', 'streaming_error_before_first_chunk', {
-          provider: streamProvider,
-          model: streamModel,
-          error: e.message,
-        });
-        auditCtx.error_code = e?.code ?? 'provider_error';
-        if (!res.headersSent) {
-          sendError(res, 502, e.message ?? 'Provider error', 'provider_error',
-            olpHeaders({ providerUsed: streamProvider, modelUsed: streamModel, startMs, cacheStatus: 'miss', fallbackHops: 0 }));
-        } else {
-          res.end();
+        if (streamedChunks.length > 0 && cacheableForFirstHop) {
+          logEvent('warn', 'streaming_no_stop_chunk', {
+            chunks_count: streamedChunks.length,
+            provider: streamProvider,
+            model: streamModel,
+          });
         }
+      } catch (e) {
+        if (firstChunkEmitted) {
+          logEvent('warn', 'streaming_error_after_first_chunk', {
+            provider: streamProvider,
+            model: streamModel,
+            error: e.message,
+          });
+          res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
+          res.write(SSE_DONE);
+          res.end();
+        } else {
+          // No bytes written — surface a clean JSON error.
+          logEvent('error', 'streaming_error_before_first_chunk', {
+            provider: streamProvider,
+            model: streamModel,
+            error: e.message,
+          });
+          auditCtx.error_code = e?.code ?? 'provider_error';
+          if (!res.headersSent) {
+            sendError(res, 502, e.message ?? 'Provider error', 'provider_error',
+              olpHeaders({ providerUsed: streamProvider, modelUsed: streamModel, startMs, cacheStatus: 'miss', fallbackHops: 0 }));
+          } else {
+            res.end();
+          }
+        }
+      } finally {
+        // D58 — releaseSpawn lives inside sourceFactory's finally (only the
+        // source caller acquired). The req-close listener is detached here
+        // so it doesn't leak past the response lifetime.
+        res.removeListener('close', onClose);
       }
-    } finally {
-      // D38 (issue #1): streaming spawn lifecycle ended — drain completed,
-      // stop chunk seen, generator exhausted without stop, or any catch
-      // path returned via res.end(). Release the slot acquired before
-      // entering the streaming branch. The finally fires on every JS exit
-      // path including the `return;` statements inside the try/catch body.
-      releaseSpawn(streamProvider);
+      return;
     }
-    return;
+    // CONCURRENCY_LIMIT fallthrough — flow continues into the buffered path
+    // below.
   }
 
   let fallbackResult;

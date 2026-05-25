@@ -4,6 +4,30 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D46 — owner-vs-guest gating for `/health` + `X-OLP-Fallback-Detail` (Phase 2 closes header observability gap)
+
+Third Phase 2 implementation D-day. Closes ADR 0007 § 10 acceptance criteria #4 (`/health` payload trimming for non-owner) + #5 (`X-OLP-Fallback-Detail` emission gating per `fallback_detail_header_policy`). Phase 2 server surface is now fully gated end-to-end; remaining D-days are keygen CLI surface (D47+) and Phase 2 close (v0.2.0, maintainer-triggered).
+
+- **`server.mjs` `handleHealth` identity-aware payload** per ADR § 7.1:
+  - Auth gate at top — `authenticate(req)` returns 401 for unauth + `allow_anonymous: false` (consistent with /v1/* routes); 200 with trimmed payload for anonymous / guest; 200 with full payload for owner.
+  - Trim controlled by `_authConfig.owner_only_endpoints` — if `/health` is in the list, non-owner gets `{ ok: true, version }`; else (operator removes it) full payload to everyone (v0.1.1 opt-out knob).
+  - `touchLastUsed` fired on `res.on('finish')` for filesystem identities (matches /v1/* pattern). No audit row on /health — high-volume monitoring endpoint, audit volume noise not justified at Phase 2 (would land with Phase 3 Dashboard if aggregate /health stats become needed).
+- **`server.mjs` `withFallbackDetailHeader` identity-aware emission** per ADR § 7.2:
+  - New helper `shouldEmitFallbackDetailHeader(olpIdentity)` reads `_authConfig.fallback_detail_header_policy`:
+    - `'owner_only'` (default) → emit only when `olpIdentity.owner_tier === 'owner'`
+    - `'all'` → emit unconditionally (v0.1.1 opt-back-in for operators who want the diagnostic header for all identities)
+    - `'none'` → suppress unconditionally
+  - When `olpIdentity` is null (pre-auth error paths), defaults to emit — preserves the v0.1.1 ungated behaviour for pre-auth errors where identity is unknown.
+  - `withFallbackDetailHeader` signature gains a third `olpIdentity` argument; both call sites in `handleChatCompletions` updated to pass `olpIdentity`.
+- **Test surface (Suite 21, +9 tests + 1 added in Suite 20 — 515 → 524):**
+  - **20m** /health with no auth + `allow_anonymous=false` → 401 (consistency with /v1/* routes)
+  - **21a-d** /health payload trimming (criterion #4): anonymous trimmed; guest trimmed; owner full; `owner_only_endpoints: []` opts out (guest gets full)
+  - **21e-h** X-OLP-Fallback-Detail emission gating (criterion #5): `owner_only` + guest → header absent; `owner_only` + owner → header present + valid JSON; `'all'` + guest → header present (v0.1.1 opt-back); `'none'` + owner → header absent (full suppression). Tests use a 2-hop chain (anthropic primary fail + openai secondary) to produce non-empty `fallbackDetail` for the header content.
+- **Test-mode setup updated:** the global `__setAuthConfig({ allow_anonymous: true })` was extended to also pass `owner_only_endpoints: []` + `fallback_detail_header_policy: 'all'` so pre-D46 tests (Suite 18, F5 /health tests, D40 fallback-detail tests, etc.) continue to pass without modification — Suite 21 explicitly overrides per-case to exercise the production-default-gated paths.
+- **Documentation:** AGENTS.md `lib/keys.mjs` marker updated to reflect D46 ship; Implementation-status-note updated. README.md Implementation Status row + Known limitations "Multi-key auth" note rewritten to reflect D46 ship + remaining keygen CLI.
+- **Test count:** 515 → 524 (+9 D46 tests).
+- **Authority:** ADR 0007 (multi-key auth — §§ 7.1 + 7.2 implementation contracts + § 10 acceptance criteria #4 + #5 covered); ADR 0004 Amendment 5 (D40 ratification of "Phase 2 will re-introduce owner-vs-non-owner gating when `lib/keys.mjs` lands" — this D-day fulfils the deferral); CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; standing autopilot grant (`~/.cc-rules/memory/auto/standing_autopilot_phase_2.md` in cc-rules `bf0ed9a`).
+
 ### D45 — `server.mjs` auth integration + `lib/audit.mjs` (Phase 2 wire-up)
 
 Second Phase 2 implementation D-day. Wires the D44 `lib/keys.mjs` identity layer into the request flow + lands `lib/audit.mjs` per ADR 0007 § 6.2 + § 8. Closes acceptance criteria #1 (per-key cache isolation, validation-side end-to-end), #2 (anonymous prod-default off), #3 (anonymous dev-mode on), #6 (post-revoke 401 within next request — full), #8 (audit ndjson round-trip), #10 (`OLP_OWNER_TOKEN` env override — full server-side), #11 (`providers_enabled` 403 scope). Owner-vs-guest gating for `/health` + `X-OLP-Fallback-Detail` (criteria #4, #5) remains in D46 scope.

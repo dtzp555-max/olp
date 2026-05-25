@@ -393,16 +393,42 @@ function jsonStringifyAscii(value) {
 }
 
 /**
- * Merges X-OLP-Fallback-Detail into a base header object when the per-hop
- * failure tuples are non-empty. Returns the base object unchanged otherwise.
+ * Identity-aware gate for X-OLP-Fallback-Detail emission per ADR 0007 § 7.2.
+ * Reads `_authConfig.fallback_detail_header_policy`:
+ *   - 'owner_only' (default) → emit only when olpIdentity.owner_tier === 'owner'
+ *   - 'all'                  → emit unconditionally (v0.1.1 behaviour, opt-in)
+ *   - 'none'                 → suppress unconditionally
+ * When olpIdentity is null (early-error paths before auth completed),
+ * defaults to 'all' → emit (preserves the v0.1.1 ungated behaviour for
+ * pre-auth errors where we don't yet know identity).
  *
- * D40 (issue #7).
+ * @param {{owner_tier?: string}|null|undefined} olpIdentity
+ * @returns {boolean}
+ */
+function shouldEmitFallbackDetailHeader(olpIdentity) {
+  const policy = _authConfig?.fallback_detail_header_policy ?? 'owner_only';
+  if (policy === 'none') return false;
+  if (policy === 'all') return true;
+  // 'owner_only' — gate by identity tier
+  if (!olpIdentity) return true; // pre-auth path: don't suppress diagnostic info
+  return olpIdentity.owner_tier === 'owner';
+}
+
+/**
+ * Merges X-OLP-Fallback-Detail into a base header object when the per-hop
+ * failure tuples are non-empty AND the per-request identity is permitted
+ * to see the header per the policy (ADR 0007 § 7.2). Returns the base
+ * object unchanged otherwise.
+ *
+ * D40 (issue #7) — gating added at D46 per ADR 0004 Amendment 5 ratification.
  *
  * @param {Record<string,string>} baseHeaders
  * @param {Array<object>|null|undefined} fallbackDetail
+ * @param {{owner_tier?: string}|null|undefined} olpIdentity - request identity; null on pre-auth paths
  * @returns {Record<string,string>}
  */
-function withFallbackDetailHeader(baseHeaders, fallbackDetail) {
+function withFallbackDetailHeader(baseHeaders, fallbackDetail, olpIdentity) {
+  if (!shouldEmitFallbackDetailHeader(olpIdentity)) return baseHeaders;
   const value = serializeFallbackDetailHeader(fallbackDetail);
   if (value === null) return baseHeaders;
   return { ...baseHeaders, 'X-OLP-Fallback-Detail': value };
@@ -486,14 +512,57 @@ function isProviderEnabled(authContext, providerKey) {
 
 /**
  * GET /health
- * Returns server health including count of loaded providers and per-provider
- * healthCheck() snapshots (ADR 0002 § Provider contract: healthCheck is used
- * by startup and /health endpoint per ADR 0002 § Provider contract description).
  *
- * Phase 2 / D45: no auth gate at this endpoint yet. Owner-vs-guest /health
- * payload trimming per ADR 0007 § 7.1 lands at D46.
+ * Phase 2 / D46 (ADR 0007 § 7.1): identity-aware payload.
+ *   - owner identity     → full per-provider details (existing payload)
+ *   - guest / anonymous  → trimmed { ok, version } only
+ *   - no auth, allow_anonymous=false → 401 (consistent with /v1/* routes)
+ *
+ * The trimming behavior is gated on `_authConfig.owner_only_endpoints` —
+ * the entry `/health` lives there by default. Removing `/health` from
+ * the list reverts to v0.1.1 full-payload-to-everyone behaviour.
+ *
+ * Authority: ADR 0007 § 7.1 (Identity-class table) + § 7.2 (owner_only_endpoints).
+ * Closes acceptance criterion #4.
  */
 async function handleHealth(req, res) {
+  const startMs = Date.now();
+
+  // D46: audit on /health is intentionally NOT enabled at Phase 2 —
+  // /health is a high-volume monitoring endpoint and § 8 schema doesn't
+  // mandate auditing it. Adding /health audit would generate operational
+  // noise without observability benefit until a Dashboard (Phase 3+)
+  // surfaces aggregate /health stats.
+
+  const authResult = authenticate(req);
+  if (!authResult.ok) {
+    return sendError(res, authResult.status, authResult.message, authResult.code);
+  }
+  const olpIdentity = authResult.authContext;
+
+  // Per § 7.1: owner sees full payload; guest + anonymous see trimmed.
+  // Per § 7.2: gating is opt-out via `owner_only_endpoints` config; if
+  // `/health` is removed from the list, all identities see the full
+  // payload (operators wanting v0.1.1 behaviour have this knob).
+  const gatedEndpoints = Array.isArray(_authConfig?.owner_only_endpoints)
+    ? _authConfig.owner_only_endpoints
+    : ['/health'];
+  const isGated = gatedEndpoints.includes('/health');
+  const isOwner = olpIdentity.owner_tier === 'owner';
+
+  // Touch last_used_at for filesystem identities post-response.
+  if (olpIdentity.keyId !== ANONYMOUS_KEY_ID && olpIdentity.keyId !== '__env_owner__') {
+    res.on('finish', () => {
+      touchLastUsed(olpIdentity.keyId).catch(() => {});
+    });
+  }
+
+  if (isGated && !isOwner) {
+    // Trimmed payload per § 7.1.
+    return sendJSON(res, 200, { ok: true, version: VERSION });
+  }
+
+  // Full payload (owner OR /health removed from owner_only_endpoints).
   const enabled = loadedProviders.size;
   const available = listAllProviderNames().length;
   const providerStatuses = {};
@@ -1323,7 +1392,7 @@ async function handleChatCompletions(req, res) {
         type: 'provider_error',
       },
     });
-    const detailHeader = withFallbackDetailHeader({}, fallbackDetail);
+    const detailHeader = withFallbackDetailHeader({}, fallbackDetail, olpIdentity);
     res.writeHead(errStatus, {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(payload),
@@ -1355,6 +1424,7 @@ async function handleChatCompletions(req, res) {
   const headers = withFallbackDetailHeader(
     olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus, fallbackHops }),
     fallbackDetail,
+    olpIdentity,
   );
 
   // Audit ctx capture for success path (audit fires on res.on('finish');

@@ -4,7 +4,21 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-(empty — Phase 3 entries land here once Phase 3 opens)
+### D48 — ADR 0008 Phase 3 design draft (Dashboard + audit query layer)
+
+First Phase 3 D-day. Design-only. Ratifies the storage / query model / rotation / dashboard / refresh / scope decisions ahead of D49+ implementation D-days. Opens ADR 0007 § 12 deferral for Dashboard + audit query layer + rotation.
+
+- **New file `docs/adr/0008-dashboard-and-audit-query.md`** (~390 lines): 13 sections + Consequences + Authority citations. Decisions per maintainer-pinned lanes:
+  - Lane 1 (tech stack): static HTML + vanilla JS + fetch (no build step; matches OLP "no bundler" ethos)
+  - Lane 2 (query model): in-memory scan of audit ndjson per request (defers SQLite hybrid per ADR 0007 § 13)
+  - Lane 3 (rotation): daily rotation, `audit-YYYY-MM-DD.ndjson` on first append after UTC midnight + optional `bin/olp-audit-rotate.mjs` external cron
+  - Lane 4 (refresh): 30s page poll (no SSE infra at v0.3.0)
+  - Lane 5 (dashboard scope): full per spec § 4.6 — 4 panels (quota / per-provider 24h counts / 30d spend trend / top fallback chains)
+- **`docs/adr/README.md` index**: added ADR 0008 row with one-paragraph summary.
+- **CHANGELOG.md** Unreleased: this entry.
+- **Phase 3 sprint shape:** D49 `lib/audit-query.mjs` + Suite 23 → D50 `/v0/management/*` endpoints + Suite 24 → D51 `dashboard.html` → D52 daily audit rotation + Suite 25 → D53 `tried_providers` schema fix (D45 P2 deferral) → D54 E2E + docs → D55 Phase 3 close → v0.3.0 (maintainer-triggered).
+- **Test count:** 544 → 544 (design-only, no test change).
+- **Authority:** ADR 0007 § 12 (opens deferral) + § 13 (rejects SQLite at Phase 3 per Node baseline); v0.1 spec § 4.6 / § 4.7 (Dashboard + observability endpoints planning authority); OCP `dashboard.html` (prior art); CC 开发铁律 v1.6 § 10 — fresh-context opus reviewer required for design ADR; Phase 3 kickoff via maintainer "go" 2026-05-25 + standing-autopilot grant.
 
 ## v0.2.0 — 2026-05-25
 

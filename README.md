@@ -39,6 +39,18 @@ olp start
 # point your IDE at http://localhost:4567/v1/chat/completions with the OLP API key from `olp keys list`.
 ```
 
+**Family-on-LAN onboarding (D68-D70).** For other devices on the same network, run on the client device:
+
+```bash
+# Detects Cline / Continue.dev / Cursor / Aider / OpenClaw installed locally
+# and writes per-tool config pointing at the OLP host. Requires `python3`.
+olp-connect <olp-host-ip>
+```
+
+If the OLP host has `auth.advertise_anonymous_key: true` AND a key was created with `olp-keys keygen --anonymous --advertise`, `olp-connect` picks up the token from `/health.anonymousKey` — zero out-of-band token paste required. See [ADR 0011](./docs/adr/0011-anonymous-key-deployment-context.md) for the trusted-LAN-only invariant.
+
+Per-IDE setup details: [`docs/integrations/`](./docs/integrations/README.md).
+
 ---
 
 ## Supported Providers
@@ -178,6 +190,65 @@ Every response served through OLP carries:
 - `X-OLP-Latency-Ms: <ms>` — end-to-end latency observed at the proxy.
 
 If a fallback chain is exhausted, `X-OLP-Fallback-Exhausted` lists the tried providers in order.
+
+---
+
+## IDE Setup
+
+Per-tool setup pages live under [`docs/integrations/`](./docs/integrations/README.md). Index:
+
+| Tool | Status | Notes |
+|---|---|---|
+| [Continue.dev](./docs/integrations/continue.md) | ✅ Supported | `config.yaml` `apiBase` (not `baseURL`); supports OLP custom headers |
+| [Cline](./docs/integrations/cline.md) | ✅ Supported | "OpenAI Compatible" provider; watch Cline issue [#7128](https://github.com/cline/cline/issues/7128) |
+| [Cursor](./docs/integrations/cursor.md) | ⚠️ Best-effort | "Override OpenAI Base URL" — known fragile across Cursor updates |
+| [Aider](./docs/integrations/aider.md) | ✅ Supported | `OPENAI_API_BASE` env + `openai/` model prefix; no custom-header support |
+| [Claude Code](./docs/integrations/claude-code.md) | ❌ Not supported | Anthropic wire format only; OLP serves OpenAI wire format. Use Cline + OLP instead |
+| [OpenClaw](./docs/integrations/openclaw.md) | ✅ Supported | Telegram + Discord gateway via [`olp-plugin/`](./olp-plugin/) |
+
+The fastest path is `olp-connect <olp-host-ip>` on the client device — it auto-detects what's installed and writes the per-tool config. See [Quick Start](#quick-start).
+
+---
+
+## Telegram / Discord Usage
+
+OLP ships [`olp-plugin/`](./olp-plugin/) as a native OpenClaw gateway plugin. After install, family members get a read-only `/olp` slash command on whichever chat surfaces OpenClaw exposes (Telegram + Discord today).
+
+**Install:**
+
+```bash
+# Option A — OpenClaw CLI
+openclaw plugins install /path/to/olp/olp-plugin/
+
+# Option B — symlink (equivalent)
+mkdir -p ~/.openclaw/extensions/
+ln -s /path/to/olp/olp-plugin/ ~/.openclaw/extensions/olp
+```
+
+**Configure:** edit `~/.openclaw/openclaw.json` and set the plugin's `apiKey` to an owner-tier OLP token created with:
+
+```bash
+npx olp-keys keygen --owner --name=openclaw-bot
+```
+
+Use a dedicated bot key — not the maintainer's personal owner key — so revocation is scoped.
+
+```json
+{
+  "plugins": {
+    "olp": {
+      "proxyUrl": "http://127.0.0.1:4567",
+      "apiKey": "olp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    }
+  }
+}
+```
+
+**Restart:** `openclaw gateway restart`.
+
+**Use:** `/olp status`, `/olp usage`, `/olp models`, `/olp health`, `/olp cache`, `/olp providers`, `/olp doctor`, `/olp help`.
+
+**Read-only by design.** Mutating subcommands (`keygen`, `revoke`, `restart`, `logs`) are deliberately NOT exposed via chat — those are SSH-only via the local `olp` CLI. See [`olp-plugin/README.md`](./olp-plugin/README.md#what-you-can-not-do-from-chat-by-design) for the rationale.
 
 ---
 

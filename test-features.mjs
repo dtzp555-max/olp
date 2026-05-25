@@ -14394,3 +14394,400 @@ describe('Suite 34 — D68-D70 /health.anonymousKey + plaintext_advertise (ADR 0
     });
   });
 });
+
+// ── Suite 35: D71 olp-plugin/ smoke tests (ADR 0010 § Phase 4 D71-D73) ─────
+//
+// The plugin's default export takes an OpenClaw `api` object and registers a
+// command — we can't fully unit-test the registration without mocking the
+// gateway. Instead we test the exported helpers + dispatcher with the global
+// fetch swapped out for a mock. These cover:
+//
+//   35a — mono() wrapping for chat surfaces
+//   35b — bar() boundary behaviour (clamping + width)
+//   35c — resolveProxyUrl precedence (env > env-port > config > default)
+//   35d — truncateForChat truncation behaviour
+//   35e — fmtStatus / fmtHealth / fmtUsage / fmtModels / fmtCache /
+//         fmtProviders / fmtChainShow / fmtDoctor render expected fields
+//   35f — dispatch() unknown subcommand → help message
+//   35g — dispatch() routes status/health/usage/models/cache to the right URL
+//         with Authorization: Bearer header
+//   35h — dispatch() doctor returns the "use SSH" advisory (HTTP doctor
+//         endpoint not yet shipped)
+//   35i — dispatch() catches fetch errors and emits "OLP error: ..."
+
+import {
+  mono as plugMono,
+  bar as plugBar,
+  statusIcon as plugStatusIcon,
+  truncateForChat as plugTruncate,
+  resolveProxyUrl as plugResolveProxyUrl,
+  fmtStatus as plugFmtStatus,
+  fmtHealth as plugFmtHealth,
+  fmtUsage as plugFmtUsage,
+  fmtModels as plugFmtModels,
+  fmtCache as plugFmtCache,
+  fmtProviders as plugFmtProviders,
+  fmtChainShow as plugFmtChainShow,
+  fmtDoctor as plugFmtDoctor,
+  cmdHelp as plugCmdHelp,
+  dispatch as plugDispatch,
+} from './olp-plugin/index.js';
+
+describe('Suite 35 — D71 olp-plugin/ smoke tests (ADR 0010 § Phase 4 D71-D73)', () => {
+
+  // ── 35a — mono() ────────────────────────────────────────────────────────
+
+  it('35a — mono() wraps text in triple-backtick code block', () => {
+    const out = plugMono('hello\nworld');
+    assert.equal(out, '```\nhello\nworld\n```');
+  });
+
+  // ── 35b — bar() ─────────────────────────────────────────────────────────
+
+  it('35b — bar() clamps pct ∈ [0,1] and respects width', () => {
+    assert.equal(plugBar(0, 8), '░░░░░░░░');
+    assert.equal(plugBar(1, 8), '████████');
+    assert.equal(plugBar(0.5, 8), '████░░░░');
+    assert.equal(plugBar(-1, 8), '░░░░░░░░', 'negative pct clamps to 0');
+    assert.equal(plugBar(2, 8), '████████', 'pct > 1 clamps to 1');
+    assert.equal(plugBar(NaN, 8), '░░░░░░░░', 'NaN treated as 0');
+    assert.equal(plugBar(0.5).length, 16, 'default width = 16');
+  });
+
+  it('35b-icon — statusIcon() maps ok/degraded/fail to expected glyphs', () => {
+    assert.equal(plugStatusIcon('ok'), '🟢');
+    assert.equal(plugStatusIcon(true), '🟢');
+    assert.equal(plugStatusIcon('degraded'), '🟡');
+    assert.equal(plugStatusIcon('warn'), '🟡');
+    assert.equal(plugStatusIcon('fail'), '🔴');
+    assert.equal(plugStatusIcon(false), '🔴');
+  });
+
+  // ── 35c — resolveProxyUrl precedence ────────────────────────────────────
+
+  it('35c — resolveProxyUrl precedence: OLP_PROXY_URL > OLP_PORT > config.proxyUrl > default', () => {
+    // 1. Default fallback
+    assert.equal(plugResolveProxyUrl({ env: {}, config: {} }), 'http://127.0.0.1:4567');
+    // 2. config.proxyUrl wins over default
+    assert.equal(
+      plugResolveProxyUrl({ env: {}, config: { proxyUrl: 'http://10.0.0.5:9999' } }),
+      'http://10.0.0.5:9999',
+    );
+    // 3. OLP_PORT wins over config.proxyUrl
+    assert.equal(
+      plugResolveProxyUrl({ env: { OLP_PORT: '8000' }, config: { proxyUrl: 'http://config:1' } }),
+      'http://127.0.0.1:8000',
+    );
+    // 4. OLP_PROXY_URL wins over OLP_PORT + config
+    assert.equal(
+      plugResolveProxyUrl({
+        env: { OLP_PROXY_URL: 'http://env-url:1234', OLP_PORT: '8000' },
+        config: { proxyUrl: 'http://config:1' },
+      }),
+      'http://env-url:1234',
+    );
+  });
+
+  // ── 35d — truncateForChat ───────────────────────────────────────────────
+
+  it('35d — truncateForChat passes short text untouched + truncates long text with marker', () => {
+    const short = 'hello world';
+    assert.equal(plugTruncate(short), short);
+    const long = 'A'.repeat(5000);
+    const truncated = plugTruncate(long, 1000);
+    assert.ok(truncated.length <= 1000);
+    assert.match(truncated, /truncated, use SSH for full/);
+    assert.ok(truncated.startsWith('AAA'));
+  });
+
+  // ── 35e — Formatters ────────────────────────────────────────────────────
+
+  it('35e-1 — fmtStatus() renders version + uptime + provider list + recent errors', () => {
+    const body = {
+      ok: true,
+      version: '0.4.0-phase4',
+      uptime_human: '1h 2m 3s',
+      providers: {
+        enabled: 2,
+        available: 3,
+        status: {
+          anthropic: { ok: true, activeSpawns: 0 },
+          openai: { ok: false, error: 'CLI not found', activeSpawns: 0 },
+        },
+      },
+      stats: { total_requests: 42, active_requests: 1, cache: { hits: 10, misses: 5, size: 7 } },
+      recent_errors: [{ time: '2026-05-26T11:22:33Z', provider: 'openai', message: 'spawn EACCES' }],
+    };
+    const out = plugFmtStatus(body);
+    assert.match(out, /0\.4\.0-phase4/);
+    assert.match(out, /1h 2m 3s/);
+    assert.match(out, /Providers: 2 enabled \/ 3 available/);
+    assert.match(out, /anthropic/);
+    assert.match(out, /openai.*CLI not found/);
+    assert.match(out, /Requests: 42 total/);
+    assert.match(out, /Cache: 10 hit \/ 5 miss/);
+    assert.match(out, /Recent errors \(1\)/);
+    assert.match(out, /spawn EACCES/);
+  });
+
+  it('35e-2 — fmtHealth() renders ok + version + provider list', () => {
+    const body = {
+      ok: true,
+      version: '0.4.0-phase4',
+      uptime_human: '5m',
+      providers: { anthropic: { ok: true }, openai: { ok: false } },
+    };
+    const out = plugFmtHealth(body);
+    assert.match(out, /Status: ok/);
+    assert.match(out, /v0\.4\.0-phase4/);
+    assert.match(out, /anthropic/);
+    assert.match(out, /openai/);
+  });
+
+  it('35e-3 — fmtUsage() renders 24h window + per-provider quota + top fallback chains', () => {
+    const body = {
+      cache_hit_24h: 0.42,
+      quota: [
+        { name: 'anthropic', percent_used: 33 },
+        { name: 'mistral', percent_used: null },
+      ],
+      top_fallback_chains_24h: [
+        { count: 5, chain: ['anthropic', 'openai'] },
+      ],
+    };
+    const out = plugFmtUsage(body);
+    assert.match(out, /Cache hit \(24h\): 42\.0%/);
+    assert.match(out, /anthropic.*33%/);
+    assert.match(out, /mistral.*no quota api/);
+    assert.match(out, /5 {2}anthropic → openai/);
+  });
+
+  it('35e-4 — fmtModels() handles empty + populated', () => {
+    assert.equal(plugFmtModels({ data: [] }), 'No models.');
+    const out = plugFmtModels({
+      data: [
+        { id: 'claude-sonnet-4-5', owned_by: 'anthropic' },
+        { id: 'gpt-5', owned_by: 'openai' },
+      ],
+    });
+    assert.match(out, /Models \(2\)/);
+    assert.match(out, /claude-sonnet-4-5\s+\(anthropic\)/);
+    assert.match(out, /gpt-5\s+\(openai\)/);
+  });
+
+  it('35e-5 — fmtCache() renders hit/miss/size/inflight', () => {
+    const out = plugFmtCache({ size: 12, hits: 100, misses: 25, inflightCount: 2, evictions: 1 });
+    assert.match(out, /Entries: {8}12/);
+    assert.match(out, /Hits: {11}100/);
+    assert.match(out, /Misses: {9}25/);
+    assert.match(out, /Inflight: {7}2/);
+    assert.match(out, /Evictions: {6}1/);
+  });
+
+  it('35e-6 — fmtProviders() lists registry providers + enabled flags', () => {
+    const registry = {
+      providers: {
+        anthropic: { tier: 'D', models: ['m1', 'm2'] },
+        openai: { tier: 'D', models: ['m3'], candidate: true },
+      },
+    };
+    const out = plugFmtProviders(registry, { anthropic: true });
+    assert.match(out, /anthropic\s+enabled/);
+    assert.match(out, /openai\s+disabled.*\(candidate\)/);
+  });
+
+  it('35e-7 — fmtChainShow() handles empty / all / single-target', () => {
+    assert.equal(plugFmtChainShow({}), 'No chains configured.');
+    const chains = {
+      'claude-sonnet-4-5': [{ provider: 'anthropic', model: 'claude-sonnet-4-5' }],
+      'gpt-5': ['openai:gpt-5'],
+    };
+    const all = plugFmtChainShow(chains);
+    assert.match(all, /claude-sonnet-4-5/);
+    assert.match(all, /gpt-5/);
+    const one = plugFmtChainShow(chains, 'gpt-5');
+    assert.match(one, /gpt-5:/);
+    assert.match(one, /→ openai:gpt-5/);
+    const missing = plugFmtChainShow(chains, 'no-such-model');
+    assert.match(missing, /not in routing\.chains/);
+  });
+
+  it('35e-8 — fmtDoctor() renders summary + checks + next_action', () => {
+    const body = {
+      summary: '2 OK, 1 WARN',
+      checks: [
+        { id: 'server.running', status: 'ok', message: 'reachable' },
+        { id: 'auth.owner_key_exists', status: 'warn', message: 'no owner key configured' },
+      ],
+      fail_count: 0, warn_count: 1, ok_count: 1,
+      kind: 'fix_config',
+      next_action: {
+        ai_executable: ['npx olp-keys keygen --owner'],
+        human_required: ['capture the printed token'],
+      },
+    };
+    const out = plugFmtDoctor(body);
+    assert.match(out, /2 OK, 1 WARN/);
+    assert.match(out, /server\.running/);
+    assert.match(out, /auth\.owner_key_exists/);
+    assert.match(out, /fail=0 warn=1 ok=1/);
+    assert.match(out, /kind=fix_config/);
+    assert.match(out, /npx olp-keys keygen --owner/);
+    assert.match(out, /capture the printed token/);
+  });
+
+  // ── 35f — dispatch: unknown / help / "" ──────────────────────────────────
+
+  it('35f-1 — dispatch("") returns cmdHelp() body', async () => {
+    const r = await plugDispatch('', { proxyUrl: 'http://x', registry: { providers: {} } });
+    assert.equal(r.text, plugCmdHelp());
+  });
+
+  it('35f-2 — dispatch("frobnicate") returns "Unknown subcommand:" + help', async () => {
+    const r = await plugDispatch('frobnicate', { proxyUrl: 'http://x', registry: { providers: {} } });
+    assert.match(r.text, /Unknown subcommand: frobnicate/);
+    assert.match(r.text, /OLP Commands/);
+  });
+
+  it('35f-3 — dispatch("help") returns cmdHelp() with read-only disclaimer', async () => {
+    const r = await plugDispatch('help', { proxyUrl: 'http://x', registry: { providers: {} } });
+    assert.match(r.text, /OLP Commands/);
+    assert.match(r.text, /Mutating commands.*NOT/);
+  });
+
+  // ── 35g — dispatch: routes status/health/usage/models/cache ──────────────
+
+  it('35g — dispatch routes each subcommand to the right URL with Authorization header', async () => {
+    const calls = [];
+    const mockFetch = async (url, opts) => {
+      calls.push({ url, headers: opts?.headers ?? {} });
+      // Per-route response stubs
+      if (url.endsWith('/v0/management/status')) {
+        return { ok: true, status: 200, json: async () => ({
+          ok: true, version: '0.4.0', uptime_human: '1m',
+          providers: { enabled: 0, available: 3, status: {} },
+          stats: { total_requests: 0, active_requests: 0 },
+          recent_errors: [],
+        }) };
+      }
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, version: '0.4.0' }) };
+      }
+      if (url.endsWith('/v0/management/dashboard-data')) {
+        return { ok: true, status: 200, json: async () => ({ cache_hit_24h: 0.5 }) };
+      }
+      if (url.endsWith('/v1/models')) {
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: 'm1' }] }) };
+      }
+      if (url.endsWith('/cache/stats')) {
+        return { ok: true, status: 200, json: async () => ({ size: 0, hits: 0, misses: 0, inflightCount: 0 }) };
+      }
+      throw new Error(`unmocked url: ${url}`);
+    };
+
+    const opts = {
+      proxyUrl: 'http://test:9999',
+      apiKey: 'olp_TESTKEY',
+      registry: { providers: { anthropic: { tier: 'D', models: [] } } },
+      fetchFn: mockFetch,
+    };
+
+    for (const sub of ['status', 'health', 'usage', 'models', 'cache']) {
+      calls.length = 0;
+      const r = await plugDispatch(sub, opts);
+      assert.equal(calls.length, 1, `${sub} should make exactly 1 HTTP call`);
+      assert.equal(calls[0].headers.Authorization, 'Bearer olp_TESTKEY', `${sub} must include Bearer header`);
+      assert.ok(r.text.length > 0, `${sub} should produce non-empty output`);
+      assert.ok(!/^OLP error/.test(r.text), `${sub} should not error; got: ${r.text}`);
+    }
+
+    // URL routing per subcommand
+    calls.length = 0;
+    await plugDispatch('status', opts);
+    assert.equal(calls[0].url, 'http://test:9999/v0/management/status');
+
+    calls.length = 0;
+    await plugDispatch('usage', opts);
+    assert.equal(calls[0].url, 'http://test:9999/v0/management/dashboard-data');
+  });
+
+  it('35g-providers — dispatch("providers") uses registry locally without HTTP', async () => {
+    let calls = 0;
+    const r = await plugDispatch('providers', {
+      proxyUrl: 'http://test:9999',
+      registry: { providers: { anthropic: { tier: 'D', models: [] }, openai: { tier: 'D', models: [] } } },
+      fetchFn: async () => { calls++; return { ok: true, status: 200, json: async () => ({}) }; },
+    });
+    assert.equal(calls, 0, 'providers must NOT make an HTTP call');
+    assert.match(r.text, /anthropic/);
+    assert.match(r.text, /openai/);
+  });
+
+  it('35g-chain — dispatch("chain show <model>") uses local chainsLocal arg', async () => {
+    const r = await plugDispatch('chain show foo-model', {
+      proxyUrl: 'http://test:9999',
+      registry: { providers: {} },
+      chainsLocal: { 'foo-model': [{ provider: 'anthropic', model: 'foo' }] },
+      fetchFn: async () => { throw new Error('should not fetch'); },
+    });
+    assert.match(r.text, /foo-model:/);
+    assert.match(r.text, /→.*anthropic/);
+  });
+
+  it('35g-chain-usage — dispatch("chain bogus") prints usage hint', async () => {
+    const r = await plugDispatch('chain bogus', {
+      proxyUrl: 'http://test:9999',
+      registry: { providers: {} },
+      fetchFn: async () => { throw new Error('should not fetch'); },
+    });
+    assert.match(r.text, /Usage: \/olp chain show \[model\]/);
+  });
+
+  // ── 35h — dispatch: doctor advisory ─────────────────────────────────────
+
+  it('35h — dispatch("doctor") returns the "use SSH" advisory (HTTP endpoint not yet shipped)', async () => {
+    let calls = 0;
+    const r = await plugDispatch('doctor', {
+      proxyUrl: 'http://test:9999',
+      registry: { providers: {} },
+      fetchFn: async () => { calls++; return { ok: true, status: 200, json: async () => ({}) }; },
+    });
+    assert.equal(calls, 0, 'doctor must NOT make an HTTP call yet (Phase 4 surface is local only)');
+    assert.match(r.text, /not yet wired through HTTP/);
+    assert.match(r.text, /Run `olp doctor` over SSH/);
+  });
+
+  // ── 35i — dispatch: error catching ──────────────────────────────────────
+
+  it('35i — dispatch catches fetch errors and emits "OLP error: ..."', async () => {
+    const r = await plugDispatch('status', {
+      proxyUrl: 'http://test:9999',
+      apiKey: 'olp_X',
+      registry: { providers: {} },
+      fetchFn: async () => { throw new Error('ECONNREFUSED'); },
+    });
+    assert.match(r.text, /^OLP error: ECONNREFUSED/);
+  });
+
+  it('35i-401 — dispatch surfaces 401 unauthorized with helpful hint', async () => {
+    const r = await plugDispatch('status', {
+      proxyUrl: 'http://test:9999',
+      apiKey: 'olp_BAD',
+      registry: { providers: {} },
+      fetchFn: async () => ({ ok: false, status: 401, statusText: 'Unauthorized', json: async () => ({}) }),
+    });
+    assert.match(r.text, /OLP error.*401 unauthorized/);
+    assert.match(r.text, /owner-tier/);
+  });
+
+  it('35i-403 — dispatch surfaces 403 forbidden with helpful hint', async () => {
+    const r = await plugDispatch('cache', {
+      proxyUrl: 'http://test:9999',
+      apiKey: 'olp_GUEST',
+      registry: { providers: {} },
+      fetchFn: async () => ({ ok: false, status: 403, statusText: 'Forbidden', json: async () => ({}) }),
+    });
+    assert.match(r.text, /OLP error.*403 forbidden/);
+    assert.match(r.text, /not owner-tier/);
+  });
+});

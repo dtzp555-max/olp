@@ -189,15 +189,14 @@
       rect.appendChild(title);
       svg.appendChild(rect);
     }
-    // Y-axis max label
-    svg.appendChild(svgEl('text', { x: 4, y: padding.top + 8, 'font-size': 10, fill: '#6b7280' }));
+    // Y-axis labels (max + min)
     const maxLabel = svgEl('text', { x: 4, y: padding.top + 10, 'font-size': 10, fill: '#6b7280' });
     maxLabel.textContent = fmtNum(maxCount);
     svg.appendChild(maxLabel);
     const minLabel = svgEl('text', { x: 4, y: height - 4, 'font-size': 10, fill: '#6b7280' });
     minLabel.textContent = '0';
     svg.appendChild(minLabel);
-    // Date labels (first / mid / last)
+    // Date labels (first + last only at v0.3.0; mid labels deferred — added if needed by Phase 4 UX feedback)
     if (spendTrend30d.length > 0) {
       const firstDate = svgEl('text', { x: padding.left, y: height - 4, 'font-size': 10, fill: '#6b7280' });
       firstDate.textContent = spendTrend30d[0].date.slice(5);

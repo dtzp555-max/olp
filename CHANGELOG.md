@@ -4,18 +4,88 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-### D60 — Phase 4 charter (ADR 0010) + default port 3456 → 4567
+(empty — Phase 5 entries land here once Phase 5 opens)
 
-Opens Phase 4 (Operator + Client UX). No functional code change beyond the default port value; the substantive D-day work lands D61 onward. Per `release_kit.phase_rolling_mode`, the version bump fires at Phase 4 close (v0.4.0), not at this D-day.
+## v0.4.0 — 2026-05-26
 
-- **Default `OLP_PORT` changed from `3456` to `4567`.** Rationale: OCP defaults to 3456; OLP and OCP can now co-host on the same machine without `OLP_PORT` env override. Existing deployments wanting the pre-D60 default can set `OLP_PORT=3456` in launchd plist / shell env. Tests use `port: 0` (ephemeral) — no test-surface impact. Cache / fallback / provider plugins are port-agnostic. Dashboard uses relative paths.
-- **ADR 0010 (Phase 4 charter) ratified.** Records: (a) Phase 4 scope as 5 D-day groups (~13 D-days total) culminating in v0.4.0; (b) explicit DEFER of `/v1/messages` Anthropic-shape entry surface with re-open trigger gated on ADR 0009 P0 success + maintainer-named family CC user; (c) opportunistic Phase 4 micro-additions and Phase 5+ deferrals.
-- **ADR 0001 amendment.** § "Decision" paragraph about port conflict struck and amended: the OCP-OLP port-conflict assumption is lifted by the 3456 → 4567 default move + per-project launchd labels (`dev.ocp.proxy` vs `dev.olp.proxy`).
-- **ADR 0008 amendment.** § 6.6 default-port reference updated.
-- **README quick start + Environment Variables table + Migration from OCP § note** updated for the new default.
-- **Authority:** ADR 0010 (Phase 4 charter), ADR 0009 (interactive-mode placeholder — `/v1/messages` defer rationale), 2026-05-26 brainstorm (OCP feature audit + multi-provider proxy / IDE integration prior-art survey).
+### Phase 4 — Operator + Client UX (D60 → D73)
 
+**Overview.** v0.4.0 closes Phase 4 — the "operator + client UX" track that grew OLP from "I built a multi-provider proxy" to "my family can use it without me holding their hand." 5 D-day groups (D60 → D73), ~13 D-days, all under standing-autopilot grant + per-D-day fresh-context opus reviewer per Iron Rule 10. The maintainer-triggered close PR lands all of it under one version tag.
 
+**Test count: 623 (v0.3.2) → 696 (v0.4.0).** +73 tests across the Phase 4 arc.
+
+**Strategic decision recorded:** Phase 4 explicitly DEFERS `/v1/messages` (Anthropic-shape entry surface) per ADR 0010 — re-open strictly gated on ADR 0009 P0 success AND maintainer-named family CC user. README posture: Claude Code listed as Not supported as an OLP client; recommended alternative "Cline + OLP" (same fallback chain available, better cross-provider compatibility because OpenAI tool schema is the multi-provider lingua franca).
+
+**Phase 4 release_kit checklist**
+
+- [x] All 5 D-day groups landed on main (D60 + D61-D63 + D64-D67 + D68-D70 + D71-D73)
+- [x] CI green on every D-day merge commit + on this release commit's head
+- [x] Fresh-context opus reviewer on every implementation D-day group + per-D-day P0/P1/P2 fold-ins where applicable
+- [x] CHANGELOG "Unreleased" promoted to "## v0.4.0 — 2026-05-26"
+- [x] `package.json` bumped 0.3.2 → 0.4.0
+- [x] `CLAUDE.md release_kit.phase_rolling_mode.current_phase` Phase 4 → Phase 5; `current_pre_release_identifier` `0.4.0-phase4` → `0.5.0-phase5`
+- [x] README § IDE Setup + § Telegram/Discord Usage + § Operator CLI surfaces (env var table extension)
+- [x] ADR 0010 (Phase 4 charter), ADR 0011 (anonymous-key deployment-context limits), ADR 0002 Amendment 7 (provider doctorChecks contract) all on disk
+- [ ] Tag pushed (next step in this PR's lifecycle)
+- [ ] `release.yml` triggered + GitHub Release created (auto on tag push)
+
+---
+
+### D60 (PR #40) — Phase 4 charter (ADR 0010) + default port 3456 → 4567
+
+Opens Phase 4. No functional code change beyond the default port value; substantive D-day work lands D61 onward.
+
+- **Default `OLP_PORT` changed `3456 → 4567`.** OCP defaults to 3456; OLP and OCP can now co-host on the same machine without `OLP_PORT` env override. Tests use `port: 0` ephemeral — no test-surface impact.
+- **ADR 0010 (Phase 4 charter) ratified.** Records 5 D-day group scope + explicit DEFER of `/v1/messages` with re-open trigger.
+- **ADR 0001 + ADR 0008 amendments.** Port-conflict assumption struck-and-amended; § 6.6 default-port reference updated.
+- **README quick start + Environment Variables table + Migration from OCP § note** updated.
+
+### D61-D63 (PR #41) — SSE heartbeat + recentErrors[20] + /v0/management/status
+
+First substantive Phase 4 implementation. 3 D-days bundled per Iron Rule 11 IDR (shared observability surface).
+
+- **SSE heartbeat** via `streaming.heartbeat_interval_ms` config (default `0` = disabled, matches OCP safe default). When enabled, streaming branch emits `: keepalive\n\n` SSE comment every interval during silent windows; resets on real chunk; cleans up on stream end/error/abort/disconnect. Eager-headers-post-spawn from day one (the OCP `db11105` lesson). `X-Accel-Buffering: no` centralized via new `SSE_DEFAULT_HEADERS` constant. Per-attached-client lifecycle (each tee output gets its own timer).
+- **`recentErrors[20]` ring buffer.** Module-scope bounded ring, populated from 5 server-side error paths. Filter: only `ProviderError` OR `statusCode >= 500` (401/403 brute-force noise excluded; D61-D63 reviewer P2-1 explicit-401/403-reject fold-in). Path sanitization via OCP `server.mjs:1395` port. In-memory only (per OCP precedent).
+- **`GET /v0/management/status` combined endpoint** (owner-only_block). Returns `{ ok, version, uptime_ms, uptime_human, started_at, providers, stats, recent_errors, generated_at }`. `_totalRequests` + `_activeRequests` module-scope counters with idempotent-decrement guard.
+- **Authority:** ADR 0010 § D61-D63; OCP `server.mjs:660-685` (startHeartbeat), `301, 354-358` (ring), `1151-1188` (/status), `1395` (path sanitization), commit `db11105` (eager-headers); ADR 0007 § 7 + ADR 0008 (owner-only_block pattern).
+- **Test count delta:** 623 → 636 (+13).
+
+### D64-D67 (PR #42) — `olp` Node CLI + `olp doctor` framework + per-provider doctor checks + ADR 0002 Amendment 7
+
+Second substantive Phase 4 implementation. 4 D-days bundled — CLI dispatches to doctor; doctor calls plugins via new contract method; ADR amendment authorizes the contract change.
+
+- **`bin/olp.mjs` Node CLI** with 11 subcommands: `status / health / usage / models / cache / providers / chain show / logs / restart / keys / doctor / help`. Node not bash (per ADR 0010 § Notes — bash's python3 JSON-parsing fragility avoided). Token resolution: `OLP_API_KEY` env → `OLP_OWNER_TOKEN` env → helpful 401 message (filesystem manifest tokens are one-way SHA-256 per ADR 0007 § 5, not recoverable). Output: human-readable ANSI text by default, `--json` for scripting. Exit codes `0=ok / 1=usage / 2=network|HTTP / 3=auth`. Installed via `package.json bin.olp` so `npx olp <subcommand>` works.
+- **`lib/doctor.mjs` framework** with machine-readable `next_action.ai_executable[]` for AI-driven self-repair. Per check: `{ id, category, async run(): { status: 'ok'|'fail'|'warn', message, evidence? } }`. Built-in checks: `server.running / server.version / config.exists / config.providers_enabled / config.chains_configured / auth.owner_key_exists / system.node_version`. Per-provider checks dynamically collected via the new `provider.doctorChecks()` contract method. `--json` output emits `{ checks, kind: noop|update|fix_oauth|fix_config|fresh_install|fix_server|fix_provider, next_action: { ai_executable, human_required, verify }, summary }`. `--check <id|category>` for tight repair-loop fast paths. Reviewer P2 fold-in: `_shellQuote()` helper hardens `ai_executable[]` against malicious `OLP_HOME` shell-metacharacter injection.
+- **Per-provider `doctorChecks()`** in anthropic / codex / mistral plugins: CLI-availability probe + auth-presence probe. Each fail returns `evidence.fix_commands` (for `ai_executable[]`) or `evidence.human_required`.
+- **ADR 0002 Amendment 7** adds OPTIONAL `provider.doctorChecks(): DoctorCheck[]` to the Provider contract — backwards compatible (plugins without it contribute no provider checks).
+- **`olp restart`** documented caveat (reviewer P2-2): `launchctl kickstart -k` does NOT re-read plist `EnvironmentVariables`; bootout/bootstrap dance noted for env reloads.
+- **Authority:** ADR 0010 § D64-D67; ADR 0002 Amendment 7 (new); OCP `ocp` bash wrapper + `scripts/doctor.mjs` (port references); 2026-05-26 brainstorm Top 5 inheritance candidate #2.
+- **Test count delta:** 636 → 658 (+22).
+
+### D68-D70 (PR #43) — `bin/olp-connect` + `/health.anonymousKey` + ADR 0011
+
+Third substantive Phase 4 implementation. 3 D-days bundled — olp-connect consumes /health.anonymousKey; both governed by ADR 0011 trusted-LAN invariant.
+
+- **`bin/olp-connect <host-ip>` (bash, 564 lines)** zero-config LAN client setup. Bash over Node so client machines without recent Node still work. Auto-detects 6 IDEs and configures each: Claude Code (detect + warn — NOT supported per ADR 0010), Cline (print VSCode-settings snippet — manual), Continue.dev (write idempotent `models:` entry to `~/.continue/config.yaml`), Cursor (snippet + WARNING about known base-URL fragility), Aider (write `OPENAI_API_BASE` + `OPENAI_API_KEY` to rc files), OpenClaw (detect + point at `olp-plugin/`). macOS `launchctl setenv` / Linux `~/.config/environment.d/olp.conf` for GUI-app env inheritance. `--dry-run` exercises every state-change site without modifying anything. Idempotent rc-file writes via bracketed `# OLP LAN ... # /OLP LAN` block.
+- **`/health.anonymousKey` opt-in field** + `auth.advertise_anonymous_key` config. Field appears in both trimmed AND full `/health` payloads when ALL THREE prerequisites hold: `auth.advertise_anonymous_key: true` + `auth.allow_anonymous: true` + at least one non-revoked guest-tier key has `plaintext_advertise` set. Default off — field ABSENT (not null), preserves v0.3.x `/health` shape. Three-prereq gate is graceful-degrade (server warns + boots; request-time re-checks).
+- **`bin/olp-keys keygen --anonymous --advertise`** new flag. Writes plaintext into manifest `plaintext_advertise` field AND prints WARNING + ADR 0011 pointer. Owner-tier rejected at BOTH CLI and lib layers (defense-in-depth). Reviewer P2-1 fold-in: `listKeys()` strips `plaintext_advertise` alongside `token_hash` — callers wanting the advertised plaintext for the `/health` publication path MUST go through `findAdvertisedKey()` (the only sanctioned read site).
+- **ADR 0011 (anonymous-key deployment-context)** new ADR codifying the trusted-LAN-only invariant. Threat model explicit; deployment-context table concrete; soft enforcement via startup warn if `BIND_ADDRESS` resolves to public IP AND `advertise_anonymous_key: true`. No hard allowlist (TLS-fronted private networks indistinguishable from public from server's perspective). Re-evaluation triggers named (Cloudflare Tunnel guidance / Phase 5 multi-tenant).
+- **Authority:** ADR 0010 § D68-D70; ADR 0011 (new); ADR 0007 § 4 (manifest forward-compat unknown fields) + § 7 (identity classes) + § 9 (keygen flow); OCP `ocp-connect` (port reference); 2026-05-26 brainstorm Top 5 inheritance candidate #3.
+- **Test count delta:** 658 → 672 (+14).
+
+### D71-D73 (PR #44) — `olp-plugin/` (OpenClaw /olp Telegram+Discord) + `docs/integrations/*.md` + README cross-refs
+
+Final Phase 4 substantive D-day group. 3 D-days bundled — plugin consumes existing endpoints; integration docs reference plugin + olp CLI + olp-connect together.
+
+- **`olp-plugin/` OpenClaw gateway plugin** (482 lines). Port of OCP `ocp-plugin/index.js` minus mutations. Subcommand parity with `olp` CLI: `/olp status / usage / cache` (owner-only) + `/olp health / models / providers / chain show / doctor / help` (informational). **Explicitly NOT ported** for security: `/olp keys keygen` (chat = brute-force-prone), `/olp keys revoke` (mutation), `/olp restart` (misclick risk), `/olp logs` (PII risk). Port resolution: `OLP_PROXY_URL` env → `OLP_PORT` env → plugin config `proxyUrl` → `http://127.0.0.1:4567` (D60 default). Output: Telegram/Discord monospace code block with status icons (🟢🟡🔴). Long responses truncated for 4096-char Telegram limit. No npm deps (OpenClaw provides Telegram/Discord transport).
+- **`docs/integrations/*.md` bundle** (6 pages + index). Per-IDE setup docs with status icons: Continue.dev ✅, Cline ✅ (cites Cline issue #7128 base-URL UI bug), Cursor ⚠️ (documented base-URL fragility), Aider ✅, **Claude Code ❌** (Anthropic wire format only; recommended alternative "Cline + OLP" per ADR 0010 § /v1/messages defer), OpenClaw ✅. Each ~60-120 lines: status / quick setup / known issues / OLP-specific notes / test-it command. `docs/integrations/README.md` is the index.
+- **README updates.** New § "IDE Setup" linking `docs/integrations/README.md`. New § "Telegram / Discord Usage" with install + configure + restart + use. Quick Start mentions `olp-connect <ip>` as family-onboarding command. `package.json files` field extended to include `olp-plugin/` so the published tarball ships it.
+- **Authority:** ADR 0010 § D71-D73; OCP `ocp-plugin/index.js` (port reference); 2026-05-26 brainstorm prior-art survey IDE-specific quirks.
+- **Test count delta:** 672 → 696 (+24).
+
+---
+
+**Phase 4 close authority chain:** ADR 0010 (charter); CLAUDE.md `release_kit.phase_rolling_mode` (close trigger = explicit maintainer action — fired by maintainer 2026-05-26); standing autopilot grant covering D-day-by-D-day execution; 5 fresh-context opus reviewer passes (one per D-day group); 696/696 tests pass on this release commit head.
 
 ## v0.3.2 — 2026-05-25
 

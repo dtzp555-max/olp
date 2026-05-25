@@ -560,7 +560,8 @@ function handleModels(req, res) {
   const authResult = authenticate(req);
   if (!authResult.ok) {
     auditCtx.error_code = authResult.code;
-    return sendError(res, authResult.status, authResult.message, authResult.code);
+    return sendError(res, authResult.status, authResult.message, authResult.code,
+      olpErrorHeaders({ startMs }));
   }
   auditCtx.key_id = authResult.authContext.keyId;
   auditCtx.owner_tier = authResult.authContext.owner_tier;
@@ -1056,10 +1057,20 @@ async function handleChatCompletions(req, res) {
     if (!streamPlugin) {
       // Provider disappeared between chain build and here (edge case).
       // Release the slot we acquired above so the counter stays balanced.
+      auditCtx.provider = streamProvider;
+      auditCtx.error_code = 'no_enabled_provider';
       releaseSpawn(streamProvider);
       return sendError(res, 503, `Provider ${streamProvider} is not enabled`, 'no_enabled_provider',
         olpErrorHeaders({ startMs, model: ir.model }));
     }
+
+    // D45 fold-in P1: populate audit ctx for the real-streaming path. Each
+    // exit below (success, error-after-first-chunk, pre-first-chunk-error,
+    // 503 above) leaves these fields representing the streaming attempt.
+    // Error paths amend `error_code`; success leaves it null.
+    auditCtx.provider = streamProvider;
+    auditCtx.tried_providers = [streamProvider];
+    auditCtx.cache_status = 'miss';
 
     const streamHeaders = olpHeaders({
       providerUsed: streamProvider,
@@ -1088,12 +1099,15 @@ async function handleChatCompletions(req, res) {
               model: streamModel,
               error: irChunk.error,
             });
+            auditCtx.error_code = 'streaming_error_after_first_chunk';
             res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
             res.write(SSE_DONE);
             res.end();
             return;
           }
           // No bytes written yet — throw to surface a clean error.
+          // auditCtx.error_code is set by the downstream catch handler (the
+          // outer streaming-path catch block fills it from the thrown error).
           throw new ProviderError(irChunk.error ?? 'Provider emitted error chunk', 'SPAWN_FAILED');
         }
 
@@ -1199,6 +1213,7 @@ async function handleChatCompletions(req, res) {
           model: streamModel,
           error: e.message,
         });
+        auditCtx.error_code = e?.code ?? 'provider_error';
         if (!res.headersSent) {
           sendError(res, 502, e.message ?? 'Provider error', 'provider_error',
             olpHeaders({ providerUsed: streamProvider, modelUsed: streamModel, startMs, cacheStatus: 'miss', fallbackHops: 0 }));

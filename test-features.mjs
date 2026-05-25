@@ -35,7 +35,20 @@ import { CacheStore } from './lib/cache/store.mjs';
 // server.mjs's startup loadAuthConfigSync() — complete before this body
 // code runs. Setting OLP_HOME + __setAuthConfig here applies to all
 // suites below.)
-process.env.OLP_HOME = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-home-'));
+const _GLOBAL_TEST_OLP_HOME = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-home-'));
+process.env.OLP_HOME = _GLOBAL_TEST_OLP_HOME;
+// Clean up the global test tmpdir on process exit so successive npm test runs
+// don't accumulate /var/folders/.../olp-test-home-* directories. process.on
+// ('exit') fires synchronously after node:test reports all results.
+process.on('exit', () => {
+  try {
+    // rmSync is imported lower in the file (Suite 19 imports it from 'node:fs').
+    // ESM hoists all imports to top-of-module so the binding is available here.
+    rmSync(_GLOBAL_TEST_OLP_HOME, { recursive: true, force: true });
+  } catch {
+    // best-effort; do not throw at exit
+  }
+});
 // __setAuthConfig is imported below from './server.mjs'; deferring the call
 // to a later block (after server.mjs's import-time loadAuthConfigSync runs)
 // is necessary because ESM hoists imports before this body code. See the
@@ -9922,9 +9935,27 @@ describe('Suite 20 — server.mjs auth integration (D45, ADR 0007)', () => {
   // isolated and verifiable. Restore the global test default in after().
   const GLOBAL_OLP_HOME = process.env.OLP_HOME;
 
+  // Each Suite 20 server requires the anthropic auth-check to pass before the
+  // mock spawn runs. lib/providers/anthropic.mjs _spawnAndStream checks for an
+  // OAuth token BEFORE calling the (mock) spawn — without a token the AUTH_MISSING
+  // pre-check fires and the request 502s before the mock can return chunks. Same
+  // pattern as Suite 9 cache HTTP tests (line ~2154 "test-fake-oauth-token-for-
+  // cache-tests"). CI Node 24 has no OAuth env; local dev machines may; CI was
+  // the trigger that caught this.
+  let _suite20SavedOAuth;
+  function ensureSuite20FakeOAuth() {
+    _suite20SavedOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'suite20-fake-oauth-token';
+  }
+  function restoreSuite20OAuth() {
+    if (_suite20SavedOAuth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = _suite20SavedOAuth;
+    else delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  }
+
   function makeSuite20Server() {
     __setProvidersEnabled({ anthropic: true });
     __setSpawnImpl(makeMockSpawn(['suite20-mock-response']));
+    ensureSuite20FakeOAuth();
     const server = createOlpServer();
     return new Promise(resolve => {
       server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
@@ -9936,6 +9967,7 @@ describe('Suite 20 — server.mjs auth integration (D45, ADR 0007)', () => {
       __resetSpawnImpl();
       __setProvidersEnabled({});
       __clearCache();
+      restoreSuite20OAuth();
       if (server) server.close(() => resolve());
       else resolve();
     });
@@ -10214,6 +10246,31 @@ describe('Suite 20 — server.mjs auth integration (D45, ADR 0007)', () => {
       assert.ok(!('content' in lastRow), 'no message content in audit row (§ 8 no PII)');
       assert.ok(JSON.stringify(lastRow).indexOf('20j') === -1,
         'request payload text must NOT appear in audit row (§ 8 no PII)');
+    });
+
+    it('20j-stream: streaming-path audit row populates provider + cache_status (D45 fold-in P1 regression)', async () => {
+      const { plaintext_token } = createKey({ name: '20j-stream', owner_tier: 'guest', providers_enabled: ['anthropic'], olpHome: TMP });
+      const r = await fetch({
+        port, method: 'POST', path: '/v1/chat/completions',
+        headers: { Authorization: `Bearer ${plaintext_token}`, Accept: 'text/event-stream' },
+        body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: '20j-stream' }], stream: true },
+      });
+      assert.equal(r.status, 200);
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      const auditPath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      const lines = fsReadFileSync(auditPath, 'utf-8').trim().split('\n').filter(Boolean);
+      const streamingRows = lines.map(l => JSON.parse(l)).filter(row =>
+        row.path === '/v1/chat/completions' && row.status_code === 200 && row.key_id !== ANONYMOUS_KEY_ID,
+      );
+      assert.ok(streamingRows.length >= 1, 'at least one successful authed row expected');
+      const lastStreamingRow = streamingRows[streamingRows.length - 1];
+      // Prior to D45 fold-in P1: provider was null on real-streaming success path.
+      assert.equal(lastStreamingRow.provider, 'anthropic',
+        'streaming-path audit row MUST populate provider (D45 fold-in P1 regression)');
+      assert.equal(lastStreamingRow.cache_status, 'miss',
+        'streaming-path audit row MUST populate cache_status');
+      assert.deepEqual(lastStreamingRow.tried_providers, ['anthropic']);
     });
 
     it('20j-401: 401 unauth request still appends audit row with error_code', async () => {

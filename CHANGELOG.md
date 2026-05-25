@@ -4,6 +4,29 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D52 — Daily audit rotation (`lib/audit.mjs` extension + `bin/olp-audit-rotate.mjs`)
+
+Fifth Phase 3 D-day. Adds daily UTC-aware rotation to `lib/audit.mjs` per ADR 0008 § 5 + ships an external cron tool. Rotation is **synchronous** at v0.3.0 (Lane 3 = B daily rotation; synchronous design eliminates the race that an async wrapper would create between date-change-detection and the append).
+
+- **`lib/audit.mjs` extended**:
+  - New `_maybeRotateAudit({ olpHome, logEvent })` (synchronous): probes the live `audit.ndjson`; if it holds events from a past UTC date, renames it to `audit-YYYY-MM-DD.ndjson`. Idempotent. If the target file already exists (cron beat the in-server check), logs warn + skips per ADR 0008 § 5.3 race safety.
+  - `appendAuditEvent` extended: cheap fast-path date check via module-cached `_lastSeenUtcDate`. On date change, calls `_maybeRotateAudit` synchronously BEFORE `appendFileSync` — so old-date events land in the rotated file and new-date events land in the fresh live file. No event straddles the boundary.
+  - Why synchronous instead of async: an async wrapper would let the sync `appendFileSync` race the not-yet-completed `renameSync`, landing today's event in the about-to-be-renamed file. Sync rotation is the only correct ordering at the append-fired-from-many-routes scale OLP runs.
+  - New exports: `_maybeRotateAudit` (sync), `getAuditRotateCount`, `getAuditRotateFailCount`, `__resetAuditRotateState`, `__setLastSeenUtcDateForTesting`.
+  - First-event-date discovery: when probing the live file's date, reads only the first ndjson line + parses its `ts`. Falls back to file mtime if events absent (corrupt/empty edge).
+- **`bin/olp-audit-rotate.mjs`** (~95 lines): external cron tool per ADR 0008 § 5.2. Calls `_maybeRotateAudit` once + reports outcome. Exit codes 0 (success or no-op), 1 (bad usage), 2 (rotation failed). Installed via `package.json bin` so `npx olp-audit-rotate [--olp-home=<path>]` works. Example cron line documented in the file header.
+- **Concurrent-safety semantics** (ADR 0008 § 5.3): in-process sequential appends after the first date-change detection short-circuit via the updated `_lastSeenUtcDate` cache → exactly 1 rename even under N sequential appends. Cross-process (cron + server) coexistence handled by the "target already exists → skip + warn" branch.
+- **Test surface (Suite 26, +12 tests — 588 → 600):**
+  - 26a-1..5: `_maybeRotateAudit` (no live file / today already / yesterday→rotate / idempotent re-call / cron-race target-exists warn)
+  - 26b-1: `appendAuditEvent` past UTC date change triggers sync rotation + append lands in fresh live file
+  - 26c-1: 10 sequential `appendAuditEvent` across date change → exactly 1 rotation + all 10 events in new live file
+  - 26d-1..4: `bin/olp-audit-rotate.mjs` CLI (--help / no-live-file / yesterday-file-rotates / unknown-flag exit 1)
+  - 26e-1: rotated files queryable via `lib/audit-query.mjs` `discoverAuditFiles` + `readAuditWindow` cross-file read
+- **`package.json`**: `bin.olp-audit-rotate` + `scripts.olp-audit-rotate` entries added.
+- **Documentation:** AGENTS.md `lib/audit.mjs` marker promoted to ✅ (D45 append + D52 rotation both shipped); new `bin/olp-audit-rotate.mjs` entry.
+- **Test count:** 588 → 600 (+12 D52 tests in Suite 26).
+- **Authority:** ADR 0008 § 5.1 (first-append-after-UTC-midnight trigger), § 5.2 (external cron alternative), § 5.3 (concurrent-rotation safety + cron-coexistence semantics), § 5.4 (renamed-file query path consumed by D49 lib/audit-query.mjs); CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; standing autopilot grant.
+
 ### D51 — `dashboard.html` full multi-panel UI (Phase 3)
 
 Fourth Phase 3 D-day. Replaces the D50 `dashboard.html` placeholder with the full 4-panel UI per ADR 0008 § 6. Vanilla HTML + JS + fetch — no build step, no framework, no CDN (Lane 1 = A). 30s page poll with `document.visibilityState` pause/resume (Lane 4 = A).

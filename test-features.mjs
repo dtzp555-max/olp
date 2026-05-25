@@ -11726,3 +11726,236 @@ describe('Suite 25 — D51 dashboard.html UI smoke (Phase 3, ADR 0008 § 6)', ()
     assert.match(r.body, /401.*owner-tier/i, 'dashboard error banner must mention owner-tier in 401 case');
   });
 });
+
+// ── Suite 26: D52 audit rotation (Phase 3, ADR 0008 § 5) ──────────────────
+//
+// Tests for daily audit rotation:
+//   - First append after UTC date change triggers rename
+//   - Concurrent appends during rotation produce exactly one rename
+//   - External cron tool (bin/olp-audit-rotate.mjs) coexists with in-server
+//   - Rotated files readable by lib/audit-query.mjs after rotation
+
+import {
+  appendAuditEvent as appendAuditEventS26,
+  _maybeRotateAudit,
+  getAuditRotateCount,
+  __resetAuditRotateState,
+  __setLastSeenUtcDateForTesting,
+} from './lib/audit.mjs';
+import { runCli as runAuditRotateCli } from './bin/olp-audit-rotate.mjs';
+
+describe('Suite 26 — D52 audit rotation (Phase 3, ADR 0008 § 5)', () => {
+
+  function writeAuditFile(tmp, filename, events) {
+    mkdirSync(_pathJoinForSetup(tmp, 'logs'), { recursive: true, mode: 0o700 });
+    const path = _pathJoinForSetup(tmp, 'logs', filename);
+    const lines = events.map(ev => JSON.stringify(ev)).join('\n') + '\n';
+    fsWriteFileSyncForS23(path, lines, { mode: 0o600 });
+  }
+
+  function makeEvent(ts) {
+    return {
+      ts,
+      key_id: 'k1',
+      owner_tier: 'owner',
+      method: 'POST',
+      path: '/v1/chat/completions',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+      status_code: 200,
+      latency_ms: 100,
+      cache_status: 'miss',
+      fallback_hops: 0,
+      tried_providers: ['anthropic'],
+    };
+  }
+
+  describe('26a — _maybeRotateAudit', () => {
+    let TMP;
+    before(() => { TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-26a-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetAuditRotateState(); });
+
+    it('26a-1: no live file → no rotation, returns { rotated: false }', () => {
+      __resetAuditRotateState();
+      const r = _maybeRotateAudit({ olpHome: TMP });
+      assert.equal(r.rotated, false);
+    });
+
+    it('26a-2: live file already on today → no rotation', () => {
+      __resetAuditRotateState();
+      const today = new Date().toISOString().slice(0, 10);
+      writeAuditFile(TMP, 'audit.ndjson', [makeEvent(`${today}T10:00:00Z`)]);
+      const r = _maybeRotateAudit({ olpHome: TMP });
+      assert.equal(r.rotated, false);
+    });
+
+    it('26a-3: live file holds yesterday\'s events → rotated to audit-YYYY-MM-DD.ndjson', () => {
+      __resetAuditRotateState();
+      const livePath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      rmSync(livePath, { force: true });
+      const yesterday = new Date(Date.now() - 86400 * 1000).toISOString().slice(0, 10);
+      writeAuditFile(TMP, 'audit.ndjson', [makeEvent(`${yesterday}T15:00:00Z`)]);
+      const r = _maybeRotateAudit({ olpHome: TMP });
+      assert.equal(r.rotated, true);
+      assert.equal(r.dateUsed, yesterday);
+      const rotatedPath = _pathJoinForSetup(TMP, 'logs', `audit-${yesterday}.ndjson`);
+      assert.ok(fsExistsSync(rotatedPath));
+      assert.ok(!fsExistsSync(livePath));
+      assert.equal(getAuditRotateCount(), 1);
+    });
+
+    it('26a-4: idempotent — second call after rotation is a no-op', () => {
+      const r = _maybeRotateAudit({ olpHome: TMP });
+      assert.equal(r.rotated, false);
+      assert.equal(getAuditRotateCount(), 1);
+    });
+
+    it('26a-5: rotation target already exists → skip + warn (cron-race safety)', () => {
+      __resetAuditRotateState();
+      const livePath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      rmSync(livePath, { force: true });
+      const yesterday = new Date(Date.now() - 86400 * 1000).toISOString().slice(0, 10);
+      writeAuditFile(TMP, `audit-${yesterday}.ndjson`, [makeEvent(`${yesterday}T08:00:00Z`)]);
+      writeAuditFile(TMP, 'audit.ndjson', [makeEvent(`${yesterday}T20:00:00Z`)]);
+
+      let warned = false;
+      const r = _maybeRotateAudit({
+        olpHome: TMP,
+        logEvent: (level, ev) => { if (level === 'warn' && ev === 'audit_rotate_target_exists') warned = true; },
+      });
+      assert.equal(r.rotated, false);
+      assert.ok(warned, 'must warn when rotation target already exists');
+      assert.ok(fsExistsSync(livePath));
+    });
+  });
+
+  describe('26b — appendAuditEvent triggers rotation on date change', () => {
+    let TMP;
+    before(() => { TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-26b-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetAuditRotateState(); });
+
+    it('26b-1: appending past a UTC date change triggers sync rotation + append lands in new file', () => {
+      __resetAuditRotateState();
+      const livePath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      rmSync(livePath, { force: true });
+      const yesterday = new Date(Date.now() - 86400 * 1000).toISOString().slice(0, 10);
+      writeAuditFile(TMP, 'audit.ndjson', [makeEvent(`${yesterday}T10:00:00Z`)]);
+      __setLastSeenUtcDateForTesting(yesterday);
+
+      const todayTs = new Date().toISOString();
+      appendAuditEventS26(makeEvent(todayTs), { olpHome: TMP });
+
+      const rotatedPath = _pathJoinForSetup(TMP, 'logs', `audit-${yesterday}.ndjson`);
+      assert.ok(fsExistsSync(rotatedPath), `yesterday's rotated file must exist (${rotatedPath})`);
+      assert.ok(fsExistsSync(livePath), 'live file must exist (with today\'s new event)');
+      const liveContent = fsReadFileSync(livePath, 'utf-8');
+      assert.ok(liveContent.includes(todayTs), 'live file must contain today\'s appended event');
+      assert.ok(!liveContent.includes(`${yesterday}T10:00:00Z`), 'live file must NOT contain yesterday\'s content (it rotated)');
+      assert.equal(getAuditRotateCount(), 1);
+    });
+  });
+
+  describe('26c — concurrent appends during rotation', () => {
+    let TMP;
+    before(() => { TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-26c-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetAuditRotateState(); });
+
+    it('26c-1: N sequential appendAuditEvent during date change → exactly 1 rotation + all events land in live', () => {
+      __resetAuditRotateState();
+      const livePath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      rmSync(livePath, { force: true });
+      const yesterday = new Date(Date.now() - 86400 * 1000).toISOString().slice(0, 10);
+      writeAuditFile(TMP, 'audit.ndjson', [makeEvent(`${yesterday}T10:00:00Z`)]);
+      __setLastSeenUtcDateForTesting(yesterday);
+
+      // 10 sync appends in quick succession. The first triggers rotation
+      // (date change detected); subsequent appends short-circuit the date
+      // check because _lastSeenUtcDate was updated inside the first call's
+      // _maybeRotateAudit. Result: exactly 1 rotation + all 10 events in
+      // the new live file.
+      const todayTs = new Date().toISOString();
+      for (let i = 0; i < 10; i++) {
+        appendAuditEventS26(makeEvent(todayTs), { olpHome: TMP });
+      }
+
+      assert.equal(getAuditRotateCount(), 1, 'exactly 1 rotation despite 10 sequential appends past date change');
+      const rotatedPath = _pathJoinForSetup(TMP, 'logs', `audit-${yesterday}.ndjson`);
+      assert.ok(fsExistsSync(rotatedPath));
+      const liveContent = fsReadFileSync(livePath, 'utf-8');
+      const liveLines = liveContent.split('\n').filter(Boolean);
+      assert.equal(liveLines.length, 10, 'live file has all 10 appended events');
+    });
+  });
+
+  describe('26d — bin/olp-audit-rotate.mjs CLI', () => {
+    let TMP;
+    before(() => { TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-26d-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetAuditRotateState(); });
+
+    it('26d-1: --help → exit 0 with usage', async () => {
+      let out = '';
+      const code = await runAuditRotateCli(['--help'], { out: s => { out += s; }, err: () => {} });
+      assert.equal(code, 0);
+      assert.match(out, /OLP audit rotation cron tool/);
+    });
+
+    it('26d-2: no live file → exit 0 "no rotation needed"', async () => {
+      __resetAuditRotateState();
+      let out = '';
+      const code = await runAuditRotateCli([`--olp-home=${TMP}`], { out: s => { out += s; }, err: () => {} });
+      assert.equal(code, 0);
+      assert.match(out, /No rotation needed/);
+    });
+
+    it('26d-3: live file with yesterday events → CLI rotates + exit 0', async () => {
+      __resetAuditRotateState();
+      const yesterday = new Date(Date.now() - 86400 * 1000).toISOString().slice(0, 10);
+      writeAuditFile(TMP, 'audit.ndjson', [makeEvent(`${yesterday}T10:00:00Z`)]);
+
+      let out = '';
+      const code = await runAuditRotateCli([`--olp-home=${TMP}`], { out: s => { out += s; }, err: () => {} });
+      assert.equal(code, 0);
+      assert.match(out, /Rotated.*dateUsed=/);
+      const rotatedPath = _pathJoinForSetup(TMP, 'logs', `audit-${yesterday}.ndjson`);
+      assert.ok(fsExistsSync(rotatedPath));
+    });
+
+    it('26d-4: unknown flag → exit 1', async () => {
+      let err = '';
+      const code = await runAuditRotateCli([`--olp-home=${TMP}`, '--unknown'], {
+        out: () => {}, err: s => { err += s; },
+      });
+      assert.equal(code, 1);
+      assert.match(err, /unknown flag --unknown/);
+    });
+  });
+
+  describe('26e — rotated files queryable via lib/audit-query.mjs', () => {
+    let TMP;
+    before(() => { TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-26e-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); __resetAuditRotateState(); });
+
+    it('26e-1: after rotation, discoverAuditFiles + readAuditWindow see both live + rotated', () => {
+      __resetAuditRotateState();
+      const yesterday = new Date(Date.now() - 86400 * 1000).toISOString().slice(0, 10);
+      const today = new Date().toISOString().slice(0, 10);
+      writeAuditFile(TMP, 'audit.ndjson', [
+        makeEvent(`${yesterday}T10:00:00Z`),
+        makeEvent(`${yesterday}T11:00:00Z`),
+      ]);
+      __setLastSeenUtcDateForTesting(yesterday);
+
+      // Sync rotation: completes before append returns
+      appendAuditEventS26(makeEvent(`${today}T05:00:00Z`), { olpHome: TMP });
+
+      const files = discoverAuditFiles({ olpHome: TMP });
+      assert.ok(files.has('live'), 'live file present');
+      assert.ok(files.has(yesterday), `rotated file for ${yesterday} present`);
+
+      const startMs = Date.parse(`${yesterday}T00:00:00Z`);
+      const endMs = Date.parse(`${today}T23:59:59Z`);
+      const events = [...readAuditWindow({ startMs, endMs, olpHome: TMP })];
+      assert.equal(events.length, 3, 'cross-file read yields yesterday(2) + today(1) = 3 events');
+    });
+  });
+});

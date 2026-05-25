@@ -5,12 +5,14 @@
   "type": "module",
   "main": "server.mjs",
   "bin": {
-    "olp-keys": "./bin/olp-keys.mjs"
+    "olp-keys": "./bin/olp-keys.mjs",
+    "olp-audit-rotate": "./bin/olp-audit-rotate.mjs"
   },
   "scripts": {
     "start": "node server.mjs",
     "test": "node test-features.mjs",
-    "olp-keys": "node bin/olp-keys.mjs"
+    "olp-keys": "node bin/olp-keys.mjs",
+    "olp-audit-rotate": "node bin/olp-audit-rotate.mjs"
   },
   "engines": {
     "node": ">=18"

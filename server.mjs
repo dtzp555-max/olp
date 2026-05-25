@@ -54,6 +54,7 @@ import {
   touchLastUsed,
   loadAuthConfigSync,
   ANONYMOUS_KEY_ID,
+  ENV_OWNER_KEY_ID,
 } from './lib/keys.mjs';
 import { appendAuditEvent } from './lib/audit.mjs';
 
@@ -528,11 +529,10 @@ function isProviderEnabled(authContext, providerKey) {
 async function handleHealth(req, res) {
   const startMs = Date.now();
 
-  // D46: audit on /health is intentionally NOT enabled at Phase 2 —
-  // /health is a high-volume monitoring endpoint and § 8 schema doesn't
-  // mandate auditing it. Adding /health audit would generate operational
-  // noise without observability benefit until a Dashboard (Phase 3+)
-  // surfaces aggregate /health stats.
+  // D46: audit on /health is intentionally NOT enabled at Phase 2.
+  // /health is a high-volume monitoring endpoint; per-call audit rows would
+  // generate operational noise that has no observability value until a
+  // Phase 3+ Dashboard aggregates /health stats. Deferred to Phase 3.
 
   const authResult = authenticate(req);
   if (!authResult.ok) {
@@ -550,8 +550,11 @@ async function handleHealth(req, res) {
   const isGated = gatedEndpoints.includes('/health');
   const isOwner = olpIdentity.owner_tier === 'owner';
 
-  // Touch last_used_at for filesystem identities post-response.
-  if (olpIdentity.keyId !== ANONYMOUS_KEY_ID && olpIdentity.keyId !== '__env_owner__') {
+  // Touch last_used_at for filesystem identities post-response. The callee
+  // also early-returns on ANONYMOUS / ENV_OWNER keyIds (lib/keys.mjs § 6.3
+  // wrapper) — this guard is defense-in-depth + skip the async call entirely
+  // for non-filesystem identities.
+  if (olpIdentity.keyId !== ANONYMOUS_KEY_ID && olpIdentity.keyId !== ENV_OWNER_KEY_ID) {
     res.on('finish', () => {
       touchLastUsed(olpIdentity.keyId).catch(() => {});
     });

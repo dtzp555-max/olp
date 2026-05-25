@@ -37,7 +37,8 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - `lib/ir/` — Intermediate Representation definition + serializers. Governed by ADR 0003.
 - `lib/cache/` — content-addressed cache layer (per-key isolation, `cache_control` bypass, chunked stream replay, singleflight). Governed by ADR 0005.
 - `lib/fallback/` — fallback engine (trigger detection, chain advancement, idempotent-failure safety, header annotation). Governed by ADR 0004.
-- `lib/keys.mjs` — multi-key auth, per-key namespacing, audit log. Carries OCP's per-key isolation model into OLP. **🟡 Phase 2 — core landed at D44 (createKey / validateKey / listKeys / revokeKey / touchLastUsed per ADR 0007 §§ 5/6.1/6.3/6.3.5/6.4/9.4). server.mjs integration scheduled D45; audit ndjson + keygen CLI surface in subsequent D-days.**
+- `lib/keys.mjs` — multi-key auth, per-key namespacing, identity layer. Carries OCP's per-key isolation model into OLP. **🟡 Phase 2 — D44 core + D45 server integration shipped (validateKey is invoked on every /v1/* request; chain filtered by providers_enabled; touchLastUsed fires post-response). Remaining: D46 owner-vs-guest /health + X-OLP-Fallback-Detail gating; keygen CLI bootstrap surface (D46+).**
+- `lib/audit.mjs` — append-only ndjson audit per ADR 0007 § 6.2 + § 8. **🟡 D45 — appendAuditEvent + getAuditDropCount shipped. Fires per /v1/chat/completions + /v1/models request including 401/403/5xx paths. Warn+1-retry on append failure; no memory buffer at Phase 2 (forward path).**
 - `dashboard.html` — owner-only multi-provider dashboard (quota panels, fallback rate, cache hit rate). **📋 Planned (Phase 6) — not yet authored.**
 - `models-registry.json` — single source of truth for `(provider, model) → metadata`. SPOT.
 - `ALIGNMENT.md` — the constitution. Binding for any plugin / entry-surface / IR change.
@@ -45,7 +46,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - `.github/workflows/alignment.yml` — CI blacklist grep + per-provider citation soft check; fails the build on known-hallucinated tokens.
 - `CLAUDE.md` — Claude-Code-specific session instructions + `release_kit` overlay (Iron Rule 5.5).
 
-**Implementation status note (as of 2026-05-25):** Files marked 📋 above are designed and documented but not yet on disk; files marked 🟡 are partially shipped (specific components landed; others scheduled). For the full status table see `README.md § "Implementation status"`. The shipped set as of D44 is: `server.mjs`, `lib/ir/`, `lib/providers/{anthropic,codex,mistral}.mjs`, `lib/cache/{keys,store}.mjs`, `lib/fallback/engine.mjs`, `lib/keys.mjs` (core only — D44), `models-registry.json`, `test-features.mjs`. Phase 2 in progress: `lib/keys.mjs` server integration (D45), owner gating for /health + X-OLP-Fallback-Detail (D46), E2E + multi-key fixtures (D47), Phase 2 close → v0.2.0.
+**Implementation status note (as of 2026-05-25):** Files marked 📋 above are designed and documented but not yet on disk; files marked 🟡 are partially shipped (specific components landed; others scheduled). For the full status table see `README.md § "Implementation status"`. The shipped set as of D45 is: `server.mjs` (with Phase 2 auth middleware + audit wire), `lib/ir/`, `lib/providers/{anthropic,codex,mistral}.mjs`, `lib/cache/{keys,store}.mjs`, `lib/fallback/engine.mjs`, `lib/keys.mjs` (core + loadAuthConfigSync — D44 + D45), `lib/audit.mjs` (D45), `models-registry.json`, `test-features.mjs` (Suites 19 + 20). Phase 2 in progress: D46 owner gating for /health + X-OLP-Fallback-Detail; keygen CLI bootstrap surface; Phase 2 close → v0.2.0.
 
 ---
 

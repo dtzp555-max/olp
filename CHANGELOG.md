@@ -4,6 +4,37 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D45 — `server.mjs` auth integration + `lib/audit.mjs` (Phase 2 wire-up)
+
+Second Phase 2 implementation D-day. Wires the D44 `lib/keys.mjs` identity layer into the request flow + lands `lib/audit.mjs` per ADR 0007 § 6.2 + § 8. Closes acceptance criteria #1 (per-key cache isolation, validation-side end-to-end), #2 (anonymous prod-default off), #3 (anonymous dev-mode on), #6 (post-revoke 401 within next request — full), #8 (audit ndjson round-trip), #10 (`OLP_OWNER_TOKEN` env override — full server-side), #11 (`providers_enabled` 403 scope). Owner-vs-guest gating for `/health` + `X-OLP-Fallback-Detail` (criteria #4, #5) remains in D46 scope.
+
+- **New file `lib/audit.mjs`** (~75 lines): `appendAuditEvent(event, opts)` writes one JSON event per line to `~/.olp/logs/audit.ndjson` (file 0600, dir 0700). § 6.2 retry semantics: warn + 1 retry on first failure; per-process drop counter + warn on second failure; NEVER throws. Per-call `OLP_HOME` env resolution (matches `lib/keys.mjs`). Exports `getAuditDropCount` for future /health surface.
+- **`lib/keys.mjs`** extended with `loadAuthConfigSync({ olpHome })` reading the `auth` block from `~/.olp/config.json` with defaults per ADR § 7.2 (`allow_anonymous: false`, `owner_only_endpoints: ['/health']`, `fallback_detail_header_policy: 'owner_only'`). Both `lib/keys.mjs` + `lib/audit.mjs` now resolve `OLP_HOME` env per call (precedence: opts.olpHome → process.env.OLP_HOME → ~/.olp) so tests and operator deployments can redirect without code edits.
+- **`server.mjs` auth middleware integration:**
+  - `extractToken(req)` parses `Authorization: Bearer <token>` first, then `x-api-key: <token>`.
+  - `authenticate(req)` calls `validateKey(token, { allowAnonymous: _authConfig.allow_anonymous })`; returns identity on success, 401 `{ auth_required | invalid_or_revoked_key }` on failure.
+  - `isProviderEnabled(olpIdentity, providerKey)` enforces `providers_enabled` allowlist (`'*'` = all).
+  - `_authConfig` loaded at startup; warn `auth_allow_anonymous_enabled` fires if `allow_anonymous: true` so the relaxed posture is visible. Test seams `__setAuthConfig` / `__resetAuthConfig`.
+  - `handleChatCompletions` and `handleModels` both gated by `authenticate(req)` at top. Audit ctx object built throughout the handler lifecycle; `res.on('finish')` appends the row + fires `touchLastUsed` async (best-effort).
+  - **Identity-vs-credentials separation:** `olpIdentity` (the new validated identity) is consumed for cache namespacing + providers_enabled + audit; `authContext` passed to `provider.spawn()` REMAINS `null` so providers continue their own credential discovery (env / keychain / file). Per-provider per-key credential mapping is Phase 3+ scope per ADR § 12.
+  - `handleChatCompletions` chain filtered by `chain.filter(hop => isProviderEnabled(olpIdentity, hop.provider))`; empty result returns 403 `key_no_provider_access` with helpful diagnostic message.
+  - `keyId = olpIdentity.keyId` (replacing hardcoded `'__anonymous__'` at the cache call sites).
+  - Audit captures fields throughout: post-auth (key_id, owner_tier); post-IR (model); post-chain-success (provider, fallback_hops, tried_providers, cache_status); post-chain-exhausted (error_code, providerUsed=chain[0], cache_status='miss'). Status code + latency populated on `res.on('finish')`.
+- **Test surface (Suite 20, +15 tests, 499 → 514):**
+  - 20a-d: header parsing + valid key happy paths (Bearer / x-api-key / invalid → 401)
+  - 20e: revoked key 401 (closes criterion #6 end-to-end)
+  - 20f: `OLP_OWNER_TOKEN` env override returns 200 (criterion #10 full coverage)
+  - 20g: `allow_anonymous: true` + no header returns 200 (criterion #3)
+  - 20h + 20h-extra: `providers_enabled: ['mistral']` for anthropic model → 403; `'*'` baseline returns 200 (criterion #11)
+  - 20i: per-key cache namespace isolation — keys A/B with identical payload do not share cache (criterion #1 end-to-end)
+  - 20j + 20j-401: audit.ndjson written with § 8 schema fields including PII guard; 401 path also appends (criterion #8)
+  - 20k: filesystem key `last_used_at` populated after first successful request (D45 touchLastUsed wire)
+  - 20l + 20l-200: `/v1/models` also enforces auth (consistent gating across `/v1/*`)
+- **Test-mode setup:** test-features.mjs sets `process.env.OLP_HOME` to a tmpdir at module load so audit + key writes don't pollute `~/.olp/`. After the server.mjs import resolves, calls `__setAuthConfig({ allow_anonymous: true })` so pre-D45 HTTP integration tests (Suite 18 etc.) that don't pass an Authorization header continue to pass as anonymous; Suite 20 explicitly overrides per-case for production-default-off coverage.
+- **Documentation:** AGENTS.md `lib/keys.mjs` 🟡 marker updated + new `lib/audit.mjs` entry; AGENTS.md Implementation-status-note + shipped-set updated. README.md Implementation Status table gains `lib/audit.mjs` row + `lib/keys.mjs` row updated; Known limitations "Multi-key auth" note rewritten to reflect D45 ship + D46 follow-up; new env-vars and config block surfaced for users.
+- **Test count:** 499 → 514 (+15 D45 tests in Suite 20, includes audit-fixture-based PII guard assertions).
+- **Authority:** ADR 0007 (multi-key auth — §§ 5/6.2/7/9.4 implementation contracts + § 10 acceptance criteria #1/#2/#3/#6/#8/#10/#11); CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; Phase 2 kickoff handoff (`~/.cc-rules/memory/handoffs/2026-05-25-phase-2-kickoff.md` in cc-rules `d9da966`); standing autopilot grant (`~/.cc-rules/memory/auto/standing_autopilot_phase_2.md` in cc-rules `bf0ed9a`).
+
 ### D44 — `lib/keys.mjs` core landed (multi-key auth, no server wire-up yet)
 
 First Phase 2 implementation D-day. Lands the `lib/keys.mjs` module per ADR 0007 §§ 5/6.1/6.3/6.3.5/6.4/9.4. Identity / lifecycle layer for OLP API keys is now in-tree; `server.mjs` integration scheduled D45 (until then, requests still use the hardcoded `'__anonymous__'` cache namespace — no behavioural change at v0.1.1 / D44).

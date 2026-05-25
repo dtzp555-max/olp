@@ -48,6 +48,14 @@ import {
   buildDefaultChain,
   loadFallbackConfigSync,
 } from './lib/fallback/engine.mjs';
+// Phase 2 / D45 — multi-key auth integration per ADR 0007.
+import {
+  validateKey,
+  touchLastUsed,
+  loadAuthConfigSync,
+  ANONYMOUS_KEY_ID,
+} from './lib/keys.mjs';
+import { appendAuditEvent } from './lib/audit.mjs';
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -91,6 +99,25 @@ if (_softTriggersConfigured) {
     message: 'routing.soft_triggers configured but soft triggers are deferred to v1.x; ' +
       'thresholds will not fire at v0.1 — see ADR 0004 Amendment 2',
   });
+}
+
+// ── Auth config (Phase 2 / D45, ADR 0007 § 7.2) ───────────────────────────
+// auth.allow_anonymous default false (production-off). Test seam below.
+let _authConfig = loadAuthConfigSync();
+if (_authConfig.allow_anonymous === true) {
+  logEvent('warn', 'auth_allow_anonymous_enabled', {
+    message: 'config.json auth.allow_anonymous is true — all routes accept requests without an OLP API key; production deployments should set this to false (ADR 0007 § 7).',
+  });
+}
+
+/** @internal — test seam: inject a synthetic auth config (no file I/O). */
+export function __setAuthConfig(config) {
+  _authConfig = config ?? { allow_anonymous: false, owner_only_endpoints: ['/health'], fallback_detail_header_policy: 'owner_only' };
+}
+
+/** @internal — reset auth config to file-loaded state. */
+export function __resetAuthConfig() {
+  _authConfig = loadAuthConfigSync();
 }
 
 // ── Provider registry ─────────────────────────────────────────────────────
@@ -383,11 +410,88 @@ function withFallbackDetailHeader(baseHeaders, fallbackDetail) {
 
 // ── Route handlers ────────────────────────────────────────────────────────
 
+// ── Auth middleware (Phase 2 / D45, ADR 0007 § 5 + § 7) ───────────────────
+
+/**
+ * Extract the plaintext OLP token from request headers.
+ * Tries `Authorization: Bearer <token>` first, then `x-api-key: <token>`.
+ * Returns the token string or null.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {string|null}
+ */
+function extractToken(req) {
+  const auth = req.headers['authorization'];
+  if (typeof auth === 'string') {
+    const match = /^Bearer\s+(\S+)$/i.exec(auth);
+    if (match) return match[1];
+  }
+  const xKey = req.headers['x-api-key'];
+  if (typeof xKey === 'string' && xKey.length > 0) return xKey;
+  return null;
+}
+
+/**
+ * Authenticate the request per ADR 0007 §§ 5 / 7 / 9.4.
+ *   - Try env-owner override first (OLP_OWNER_TOKEN).
+ *   - Then filesystem manifest lookup by SHA-256 hash.
+ *   - Else, if auth.allow_anonymous is true → anonymous identity.
+ *   - Else → 401 auth_required.
+ *
+ * Returns { ok: true, authContext } on success or
+ * { ok: false, status, code, message } on failure (401).
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {{ ok: true, authContext: { keyId: string, owner_tier: 'owner'|'guest'|'anonymous', providers_enabled: string[]|'*', source: 'env'|'filesystem'|'anonymous' } } | { ok: false, status: number, code: string, message: string }}
+ */
+function authenticate(req) {
+  const token = extractToken(req);
+  const identity = validateKey(token, { allowAnonymous: _authConfig.allow_anonymous });
+  if (identity === null) {
+    // Distinguish "no token presented" from "token presented but invalid/revoked".
+    // Both surface as 401 to the client (don't leak which case it was), but the
+    // server-side audit + log captures the source for operator diagnosis.
+    return {
+      ok: false,
+      status: 401,
+      code: token ? 'invalid_or_revoked_key' : 'auth_required',
+      message: token
+        ? 'OLP API key is invalid or has been revoked.'
+        : 'OLP API key required. Pass via "Authorization: Bearer <token>" or "x-api-key: <token>".',
+    };
+  }
+  return {
+    ok: true,
+    authContext: {
+      keyId: identity.id,
+      owner_tier: identity.owner_tier,
+      providers_enabled: identity.providers_enabled,
+      source: identity.source,
+    },
+  };
+}
+
+/**
+ * Check whether the given provider key is permitted for this identity.
+ * `providers_enabled: '*'` grants all; an array is a whitelist.
+ *
+ * @param {{ providers_enabled: string[]|'*' }} authContext
+ * @param {string} providerKey
+ * @returns {boolean}
+ */
+function isProviderEnabled(authContext, providerKey) {
+  if (authContext.providers_enabled === '*') return true;
+  return Array.isArray(authContext.providers_enabled) && authContext.providers_enabled.includes(providerKey);
+}
+
 /**
  * GET /health
  * Returns server health including count of loaded providers and per-provider
  * healthCheck() snapshots (ADR 0002 § Provider contract: healthCheck is used
  * by startup and /health endpoint per ADR 0002 § Provider contract description).
+ *
+ * Phase 2 / D45: no auth gate at this endpoint yet. Owner-vs-guest /health
+ * payload trimming per ADR 0007 § 7.1 lands at D46.
  */
 async function handleHealth(req, res) {
   const enabled = loadedProviders.size;
@@ -423,6 +527,45 @@ async function handleHealth(req, res) {
  * Empty case: if no providers are enabled, data: [] is returned naturally.
  */
 function handleModels(req, res) {
+  const startMs = Date.now();
+
+  // Audit + auth for /v1/models per Phase 2 / D45 (ADR 0007 § 7).
+  const auditCtx = {
+    ts: new Date().toISOString(),
+    key_id: ANONYMOUS_KEY_ID,
+    owner_tier: 'anonymous',
+    method: 'GET',
+    path: '/v1/models',
+    provider: null,
+    model: null,
+    status_code: 0,
+    latency_ms: 0,
+    cache_status: null,
+    fallback_hops: 0,
+    tried_providers: [],
+    error_code: null,
+    ir_request_hash: null,
+    chain_id: null,
+  };
+  let _authedKeyId = null;
+  res.on('finish', () => {
+    auditCtx.status_code = res.statusCode;
+    auditCtx.latency_ms = Date.now() - startMs;
+    try { appendAuditEvent(auditCtx); } catch { /* best-effort */ }
+    if (_authedKeyId && _authedKeyId !== ANONYMOUS_KEY_ID) {
+      touchLastUsed(_authedKeyId).catch(() => {});
+    }
+  });
+
+  const authResult = authenticate(req);
+  if (!authResult.ok) {
+    auditCtx.error_code = authResult.code;
+    return sendError(res, authResult.status, authResult.message, authResult.code);
+  }
+  auditCtx.key_id = authResult.authContext.keyId;
+  auditCtx.owner_tier = authResult.authContext.owner_tier;
+  _authedKeyId = authResult.authContext.keyId;
+
   const data = [];
 
   // Canonical entries first
@@ -472,9 +615,64 @@ function handleModels(req, res) {
 async function handleChatCompletions(req, res) {
   const startMs = Date.now();
 
+  // Audit context — fields populated as the request proceeds; § 8 schema.
+  // Fired on res.on('finish') below regardless of success / error path.
+  const auditCtx = {
+    ts: new Date().toISOString(),
+    key_id: ANONYMOUS_KEY_ID,        // updated post-auth
+    owner_tier: 'anonymous',         // updated post-auth
+    method: 'POST',
+    path: '/v1/chat/completions',
+    provider: null,
+    model: null,
+    status_code: 0,                  // updated on finish
+    latency_ms: 0,                   // updated on finish
+    cache_status: null,
+    fallback_hops: 0,
+    tried_providers: [],
+    error_code: null,
+    ir_request_hash: null,
+    chain_id: null,
+  };
+  // Wire post-response audit + lazy last_used_at update once, at the top, so
+  // every code path below (401, 400, 500, 200, streaming) emits an audit row.
+  // touchLastUsed is best-effort and never throws (§ 6.3).
+  let _authedKeyId = null;
+  res.on('finish', () => {
+    auditCtx.status_code = res.statusCode;
+    auditCtx.latency_ms = Date.now() - startMs;
+    try { appendAuditEvent(auditCtx); } catch { /* audit is best-effort */ }
+    if (_authedKeyId && _authedKeyId !== ANONYMOUS_KEY_ID) {
+      // Anonymous + __env_owner__ have no on-disk manifest to touch; touchLastUsed
+      // itself early-returns for those identities (§ 6.3 wrapper). For
+      // filesystem-stored keys, fire-and-forget.
+      touchLastUsed(_authedKeyId).catch(() => { /* warned internally */ });
+    }
+  });
+
+  // ── Authentication (Phase 2 / D45, ADR 0007 § 5 + § 7) ───────────────────
+  // olpIdentity carries the OLP-side identity (keyId / owner_tier /
+  // providers_enabled). It is SEPARATE from `authContext` which is the
+  // per-provider OAuth/credential artifact passed to provider.spawn().
+  // Provider plugins treat `authContext === null` as "fall back to your
+  // own credential discovery (env / keychain / file)" — that contract is
+  // preserved at D45. Per-provider per-key credential mapping is a Phase
+  // 3+ concern (ADR 0007 § 12 Out of scope; v0.1 spec § 4.5 anticipated).
+  const authResult = authenticate(req);
+  if (!authResult.ok) {
+    auditCtx.error_code = authResult.code;
+    return sendError(res, authResult.status, authResult.message, authResult.code,
+      olpErrorHeaders({ startMs }));
+  }
+  const olpIdentity = authResult.authContext;
+  auditCtx.key_id = olpIdentity.keyId;
+  auditCtx.owner_tier = olpIdentity.owner_tier;
+  _authedKeyId = olpIdentity.keyId;
+
   // Require JSON content-type
   const ct = req.headers['content-type'] ?? '';
   if (!ct.includes('application/json')) {
+    auditCtx.error_code = 'invalid_content_type';
     return sendError(res, 415, 'Content-Type must be application/json', 'invalid_request_error',
       olpErrorHeaders({ startMs }));
   }
@@ -483,6 +681,7 @@ async function handleChatCompletions(req, res) {
   try {
     body = await readJSON(req);
   } catch (e) {
+    auditCtx.error_code = 'invalid_request_body';
     return sendError(res, e.statusCode ?? 400, e.message, 'invalid_request_error',
       olpErrorHeaders({ startMs }));
   }
@@ -493,22 +692,22 @@ async function handleChatCompletions(req, res) {
     ir = openAIToIR(body);
   } catch (e) {
     if (e instanceof BadRequestError) {
+      auditCtx.error_code = 'invalid_ir';
       return sendError(res, 400, e.message, 'invalid_request_error',
         olpErrorHeaders({ startMs }));
     }
     throw e;
   }
-
-  // Auth context is null at D5/D9 — providers fall back to their own credential
-  // discovery (env var, keychain, credentials file). Phase 2 multi-key
-  // infrastructure will pass a real authContext carrying the per-key OLP token.
-  const authContext = null;
+  auditCtx.model = ir.model;
 
   // ── Fallback engine: build chain (ADR 0004) ─────────────────────────────
   // buildDefaultChain returns null if no enabled provider serves this model.
   // Per ADR 0004 § D9: at v0.1, chain is single-hop (no fallback) unless the
   // user has populated ~/.olp/config.json routing.chains.
-  const chain = buildDefaultChain(
+  //
+  // `let` (not `const`) because the chain may be filtered below per the
+  // authenticated key's providers_enabled allowlist (ADR 0007 § 10 #11).
+  let chain = buildDefaultChain(
     ir.model,
     loadedProviders,
     _fallbackConfig.chains,
@@ -517,6 +716,7 @@ async function handleChatCompletions(req, res) {
 
   if (!chain) {
     // ALIGNMENT.md: 0 Enabled Providers at v0.1 → 503 per spec
+    auditCtx.error_code = 'no_enabled_provider';
     return sendError(
       res, 503,
       `No enabled providers for model ${ir.model}. See README § Supported Providers.`,
@@ -525,12 +725,39 @@ async function handleChatCompletions(req, res) {
     );
   }
 
+  // ── providers_enabled scope enforcement (Phase 2 / D45, ADR 0007 § 10 #11) ─
+  // Filter the chain to providers this key is authorized for. If the resulting
+  // chain is empty, return 403 — the model exists in the registry but no hop
+  // is reachable from this identity's allowlist.
+  const _originalChainProviders = chain.map(hop => hop.provider);
+  chain = chain.filter(hop => isProviderEnabled(olpIdentity, hop.provider));
+  if (chain.length === 0) {
+    auditCtx.error_code = 'key_no_provider_access';
+    auditCtx.tried_providers = _originalChainProviders;
+    const allowed = olpIdentity.providers_enabled === '*' ? '*' : (olpIdentity.providers_enabled ?? []).join(', ') || '(none)';
+    return sendError(
+      res, 403,
+      `This OLP key does not have access to any provider serving model "${ir.model}". Key's providers_enabled: [${allowed}]. Chain providers: [${_originalChainProviders.join(', ')}].`,
+      'key_no_provider_access',
+      olpErrorHeaders({ startMs, model: ir.model }),
+    );
+  }
+
+  // Auth context is null at D45 — providers fall back to their own credential
+  // discovery (env var, keychain, credentials file). The OLP-side identity
+  // (olpIdentity above) is consumed for cache namespacing + providers_enabled
+  // gating + audit attribution. Per-provider per-key credential mapping is a
+  // Phase 3+ deferral (ADR 0007 § 12).
+  const authContext = null;
+
   const requestId = generateRequestId();
 
-  // ── Cache layer (ADR 0005) ──────────────────────────────────────────────
-  // keyId: '__anonymous__' at D5/D9. Phase 2 multi-key infrastructure wires the
-  // real OLP API key ID here for D1 per-key isolation.
-  const keyId = '__anonymous__';
+  // ── Cache layer (ADR 0005, namespaced per OLP key per ADR 0007 § 7) ─────
+  // keyId is the authenticated identity's namespace token. For anonymous
+  // (when auth.allow_anonymous=true) this is the legacy '__anonymous__'
+  // shared namespace; for filesystem keys it is the per-key id; for the
+  // OLP_OWNER_TOKEN env override it is the synthetic '__env_owner__'.
+  const keyId = olpIdentity.keyId;
 
   // D2 bypass (per-hop, per ADR 0005 § D2):
   // cache_control markers bypass OLP's response cache ONLY when the active hop
@@ -1059,6 +1286,18 @@ async function handleChatCompletions(req, res) {
       fallbackHops: fallbackHops ?? 0,
     });
 
+    // Audit ctx capture for chain-exhausted / provider-error path (audit fires
+    // on res.on('finish'); fields populated here so the row reflects what we
+    // know at exhaustion time — provider is the chain[0] primary per ADR 0004
+    // step 4, tried_providers is the failed-hop trail from fallbackDetail).
+    auditCtx.provider = providerUsed ?? 'none';
+    auditCtx.fallback_hops = fallbackHops ?? 0;
+    auditCtx.tried_providers = Array.isArray(fallbackDetail)
+      ? fallbackDetail.map(t => t?.provider).filter(Boolean)
+      : [];
+    auditCtx.cache_status = 'miss';
+    auditCtx.error_code = originalError?.code ?? 'provider_error';
+
     // Send error with standard OLP headers + optional exhausted header +
     // D40 X-OLP-Fallback-Detail (when any hop attempted to spawn failed).
     // D40 (issue #7) — ungated v0.1 per maintainer decision; owner-vs-non-owner
@@ -1102,6 +1341,13 @@ async function handleChatCompletions(req, res) {
     olpHeaders({ providerUsed, modelUsed, startMs, cacheStatus, fallbackHops }),
     fallbackDetail,
   );
+
+  // Audit ctx capture for success path (audit fires on res.on('finish');
+  // status_code + latency_ms populated then).
+  auditCtx.provider = providerUsed;
+  auditCtx.fallback_hops = fallbackHops;
+  auditCtx.tried_providers = (Array.isArray(fallbackDetail) ? fallbackDetail.map(t => t?.provider).filter(Boolean) : []).concat([providerUsed]);
+  auditCtx.cache_status = cacheStatus;
 
   if (ir.stream) {
     // Streaming response path: burst replay from buffered chunks.

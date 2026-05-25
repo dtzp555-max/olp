@@ -18,6 +18,19 @@
     "olp-audit-rotate": "node bin/olp-audit-rotate.mjs",
     "olp-connect": "bash bin/olp-connect"
   },
+  "files": [
+    "server.mjs",
+    "bin/",
+    "lib/",
+    "olp-plugin/",
+    "models-registry.json",
+    "dashboard.html",
+    "README.md",
+    "ALIGNMENT.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "docs/"
+  ],
   "engines": {
     "node": ">=18"
   },

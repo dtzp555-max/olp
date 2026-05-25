@@ -1,0 +1,22 @@
+{
+  "id": "olp",
+  "name": "OLP Commands",
+  "description": "Slash commands for OLP — /olp status, /olp usage, /olp health, etc. (read-only by design; mutations require SSH).",
+  "version": "0.4.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "proxyUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:4567",
+        "description": "Full URL of the OLP proxy. Default matches D60 OLP_PORT=4567. Overridable via OLP_PROXY_URL or OLP_PORT env."
+      },
+      "apiKey": {
+        "type": "string",
+        "description": "Owner-tier OLP API key (olp_xxx). Required for owner-only subcommands (status / usage / cache). Use a dedicated bot key — DO NOT share the maintainer's personal owner key."
+      }
+    },
+    "required": ["apiKey"]
+  }
+}

@@ -11344,3 +11344,260 @@ describe('Suite 23 — D49 lib/audit-query.mjs (Phase 3 audit aggregate query la
     });
   });
 });
+
+// ── Suite 24: D50 management endpoints (Phase 3, ADR 0008 §§ 7-8) ─────────
+//
+// HTTP-level tests for the 4 owner_only_block endpoints:
+//   /dashboard, /v0/management/dashboard-data, /v0/management/quota, /cache/stats
+// Each must 401 non-owner identities (including anonymous-when-allow_anonymous=true
+// per ADR 0008 § 8) + serve owner identities with proper Content-Type and shape.
+
+describe('Suite 24 — D50 management endpoints (Phase 3, ADR 0008 §§ 7-8)', () => {
+  const GLOBAL_OLP_HOME = process.env.OLP_HOME;
+
+  let _suite24SavedOAuth;
+  function ensureSuite24FakeOAuth() {
+    _suite24SavedOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'suite24-fake-oauth-token';
+  }
+  function restoreSuite24OAuth() {
+    if (_suite24SavedOAuth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = _suite24SavedOAuth;
+    else delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  }
+
+  function makeSuite24Server() {
+    __setProvidersEnabled({ anthropic: true });
+    __setSpawnImpl(makeMockSpawn(['suite24-response']));
+    ensureSuite24FakeOAuth();
+    const server = createOlpServer();
+    return new Promise(resolve => {
+      server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+    });
+  }
+  function teardownSuite24(server) {
+    return new Promise(resolve => {
+      __resetSpawnImpl();
+      __setProvidersEnabled({});
+      __clearCache();
+      restoreSuite24OAuth();
+      if (server) server.close(() => resolve());
+      else resolve();
+    });
+  }
+
+  describe('24a-d — /dashboard owner_only_block', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-24ad-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      ({ server, port } = await makeSuite24Server());
+    });
+    after(async () => {
+      await teardownSuite24(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('24a: owner → 200 text/html with "OLP Dashboard"', async () => {
+      const { plaintext_token } = createKey({ name: '24a-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/dashboard',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      assert.ok(r.headers['content-type'].startsWith('text/html'));
+      assert.match(r.body, /OLP Dashboard/i);
+    });
+
+    it('24b: guest → 401 owner_required', async () => {
+      const { plaintext_token } = createKey({ name: '24b-guest', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/dashboard',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 401);
+      const err = JSON.parse(r.body);
+      assert.equal(err.error.type, 'owner_required');
+    });
+
+    it('24c: anonymous (allow_anonymous: true) → 401 owner_required (owner_only_block per ADR 0008 § 8)', async () => {
+      // allow_anonymous: true → no header → anonymous identity → STILL 401
+      // because management endpoints are owner_only_block (not trim).
+      const r = await fetch({ port, method: 'GET', path: '/dashboard' });
+      assert.equal(r.status, 401);
+      const err = JSON.parse(r.body);
+      assert.equal(err.error.type, 'owner_required');
+    });
+
+    it('24d: allow_anonymous: false + no header → 401 auth_required (middleware path)', async () => {
+      __setAuthConfig({ allow_anonymous: false, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      try {
+        const r = await fetch({ port, method: 'GET', path: '/dashboard' });
+        assert.equal(r.status, 401);
+        const err = JSON.parse(r.body);
+        assert.equal(err.error.type, 'auth_required');
+      } finally {
+        __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      }
+    });
+  });
+
+  describe('24e-g — /v0/management/dashboard-data + /v0/management/quota', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-24eg-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      ({ server, port } = await makeSuite24Server());
+    });
+    after(async () => {
+      await teardownSuite24(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('24e: owner GET /v0/management/dashboard-data → 200 JSON with required ADR 0008 § 7.2 fields', async () => {
+      const { plaintext_token } = createKey({ name: '24e-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/v0/management/dashboard-data',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.ok(typeof body.generated_at === 'string');
+      assert.ok(typeof body.window_24h === 'object');
+      assert.ok(typeof body.window_24h.request_count === 'number');
+      assert.ok(typeof body.cache_hit_24h === 'object');
+      assert.ok(Array.isArray(body.quota));
+      assert.ok(Array.isArray(body.spend_trend_30d));
+      assert.equal(body.spend_trend_30d.length, 30, 'spend_trend_30d must have 30 entries');
+      assert.ok(Array.isArray(body.top_fallback_chains_24h));
+      assert.ok(typeof body.cache_stats === 'object');
+    });
+
+    it('24f: guest GET /v0/management/dashboard-data → 401 owner_required', async () => {
+      const { plaintext_token } = createKey({ name: '24f-guest', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/v0/management/dashboard-data',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 401);
+      assert.equal(JSON.parse(r.body).error.type, 'owner_required');
+    });
+
+    it('24g: owner GET /v0/management/quota → 200 JSON with quota array', async () => {
+      const { plaintext_token } = createKey({ name: '24g-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/v0/management/quota',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.ok(typeof body.generated_at === 'string');
+      assert.ok(Array.isArray(body.quota));
+      // Each quota entry has at least a provider key (and possibly more fields).
+      for (const q of body.quota) {
+        assert.ok(typeof q.provider === 'string');
+      }
+    });
+  });
+
+  describe('24h — /cache/stats', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-24h-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      ({ server, port } = await makeSuite24Server());
+    });
+    after(async () => {
+      await teardownSuite24(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('24h: owner GET /cache/stats → 200 JSON with hits/misses/size/inflightCount', async () => {
+      const { plaintext_token } = createKey({ name: '24h-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/cache/stats',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.ok(typeof body.generated_at === 'string');
+      assert.ok(typeof body.hits === 'number');
+      assert.ok(typeof body.misses === 'number');
+      assert.ok(typeof body.size === 'number');
+      assert.ok(typeof body.inflightCount === 'number');
+    });
+
+    it('24h-401: guest GET /cache/stats → 401', async () => {
+      const { plaintext_token } = createKey({ name: '24h-guest', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/cache/stats',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 401);
+    });
+  });
+
+  describe('24i-j — audit rows on management endpoints', () => {
+    let TMP, server, port;
+    before(async () => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-24ij-'));
+      process.env.OLP_HOME = TMP;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      ({ server, port } = await makeSuite24Server());
+    });
+    after(async () => {
+      await teardownSuite24(server);
+      process.env.OLP_HOME = GLOBAL_OLP_HOME;
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+      rmSync(TMP, { recursive: true, force: true });
+    });
+
+    it('24i: successful /v0/management/dashboard-data appends audit row with path + status_code 200', async () => {
+      const { id, plaintext_token } = createKey({ name: '24i-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/v0/management/dashboard-data',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      await new Promise(resolve => setTimeout(resolve, 25));
+
+      const auditPath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      assert.ok(fsExistsSync(auditPath));
+      const lines = fsReadFileSync(auditPath, 'utf-8').trim().split('\n').filter(Boolean);
+      const mgmtRow = lines.map(l => JSON.parse(l)).find(row =>
+        row.path === '/v0/management/dashboard-data' && row.status_code === 200,
+      );
+      assert.ok(mgmtRow, 'management dashboard-data audit row must be present');
+      assert.equal(mgmtRow.key_id, id);
+      assert.equal(mgmtRow.owner_tier, 'owner');
+      assert.equal(mgmtRow.method, 'GET');
+    });
+
+    it('24j: 401 (guest blocked) /v0/management/dashboard-data appends audit row with error_code', async () => {
+      const { id, plaintext_token } = createKey({ name: '24j-guest', owner_tier: 'guest', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/v0/management/dashboard-data',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 401);
+      await new Promise(resolve => setTimeout(resolve, 25));
+
+      const auditPath = _pathJoinForSetup(TMP, 'logs', 'audit.ndjson');
+      const lines = fsReadFileSync(auditPath, 'utf-8').trim().split('\n').filter(Boolean);
+      const blockedRow = lines.map(l => JSON.parse(l)).find(row =>
+        row.path === '/v0/management/dashboard-data' && row.status_code === 401 && row.key_id === id,
+      );
+      assert.ok(blockedRow, 'management 401 audit row must be present');
+      assert.equal(blockedRow.error_code, 'owner_required');
+      assert.equal(blockedRow.owner_tier, 'guest');
+    });
+  });
+});

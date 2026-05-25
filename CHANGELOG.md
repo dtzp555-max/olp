@@ -4,6 +4,34 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D50 — `server.mjs` management endpoints (Phase 3 dashboard wire-up)
+
+Third Phase 3 D-day. Wires the D49 `lib/audit-query.mjs` aggregate query layer into 4 owner_only_block HTTP endpoints per ADR 0008 §§ 7-8. Ships a placeholder `dashboard.html` at repo root (D51 lands the full multi-panel UI). All endpoints follow the Phase 2 / D45 auth + audit + touchLastUsed pattern.
+
+- **4 new endpoints** (all owner_only_block per ADR 0008 § 8 — anonymous + guest + missing-key all → 401):
+  - `GET /dashboard` — serves `dashboard.html` (Content-Type text/html; charset=utf-8). D50 stub explains the state + lists backing endpoints; D51 replaces with full UI.
+  - `GET /v0/management/dashboard-data` — full aggregate per ADR 0008 § 7.2: `{ generated_at, window_24h (auditAggregateRequests), cache_hit_24h (auditCacheHitRateWindow), quota (per-provider provider.quotaStatus + error capture), spend_trend_30d (auditSpendTrendDaily — exactly 30 entries), top_fallback_chains_24h (auditTopFallbackChains limit 10), cache_stats (live cacheStore.stats()) }`.
+  - `GET /v0/management/quota` — quota subset only (subset of dashboard-data; useful for scripted monitoring).
+  - `GET /cache/stats` — live in-memory `cacheStore.stats()` shape (`{ hits, misses, size, inflightCount }` + `generated_at` wrapper).
+- **`_runOwnerOnlyManagementEndpoint(req, res, method, path, inner)` helper** factors the common auth + audit ctx + owner-block + res.on('finish') wire. inner is async (req, res, olpIdentity, auditCtx) → returns void. Eliminates 4× boilerplate.
+- **`owner_only_block` mode** (ADR 0008 § 8): authenticate → if not owner → 401 `owner_required`. Distinct from `owner_only_trim` (Phase 2 /health pattern). Anonymous identity (when `allow_anonymous: true`) reaches the handler and is 401'd by the owner check — verified by Suite 24c.
+- **Provider quotaStatus error capture**: dashboard-data + quota endpoints catch per-provider throws and surface `{ provider, error, available: null }` so one bad provider doesn't fail the whole panel (ADR 0008 § 9 graceful degradation).
+- **`dashboard.html` placeholder** (~50 lines at repo root): explains the D50 state, lists backing endpoints with curl example. Cached in memory at first /dashboard request (`_loadDashboardHtml` with module-scope `_dashboardHtmlCache`); falls back to an in-memory stub if the file is missing (e.g., test imports from non-repo cwd).
+- **Audit on management endpoints** (ADR 0008 § 7.5): every management request appends an audit row including 401 paths (verified by Suite 24j). Touch wire skips anonymous + env-owner identities (matches Phase 2 pattern).
+- **Router**: 4 new GET branches added between /v1/chat/completions and the 404 fallback.
+- **Test surface (Suite 24, +11 tests — 571 → 582):**
+  - 24a-d: /dashboard owner_only_block (owner 200 / guest 401 / anonymous-with-allow_anonymous=true 401 / no-auth-with-allow_anonymous=false 401)
+  - 24e: dashboard-data owner → 200 JSON with all required ADR § 7.2 fields (asserts `spend_trend_30d.length === 30`)
+  - 24f: dashboard-data guest → 401 owner_required
+  - 24g: quota owner → 200 JSON with quota array
+  - 24h: cache/stats owner → 200 JSON with `{ hits, misses, size, inflightCount, generated_at }`
+  - 24h-401: cache/stats guest → 401
+  - 24i: successful dashboard-data appends audit row with `status_code: 200` + `key_id` + `path: '/v0/management/dashboard-data'`
+  - 24j: 401 (guest blocked) dashboard-data appends audit row with `error_code: 'owner_required'` + `owner_tier: 'guest'`
+- **Documentation:** AGENTS.md `lib/audit-query.mjs` D49 marker note added + new `dashboard.html` entry (D50 placeholder).
+- **Test count:** 571 → 582 (+11 D50 tests in Suite 24).
+- **Authority:** ADR 0008 § 7 (endpoints) + § 8 (owner_only_block mode) + § 9 (graceful degradation) + § 7.5 (audit on management endpoints); ADR 0007 § 7 (auth model reused); ADR 0002 § Provider contract (quotaStatus); ADR 0005 (cacheStore.stats); CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; standing autopilot grant.
+
 ### D49 — `lib/audit-query.mjs` audit aggregate query layer (Phase 3)
 
 Second Phase 3 D-day. Implements ADR 0008 § 4 query API. Pure in-memory ndjson scan; cross-file walk over `audit.ndjson` (live) + `audit-YYYY-MM-DD.ndjson` (rotated). No server.mjs integration in this D-day (D50 wires the consuming endpoints).

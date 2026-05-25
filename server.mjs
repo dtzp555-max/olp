@@ -57,6 +57,13 @@ import {
   ENV_OWNER_KEY_ID,
 } from './lib/keys.mjs';
 import { appendAuditEvent } from './lib/audit.mjs';
+// Phase 3 / D50 — management endpoints consume the audit aggregate query layer.
+import {
+  aggregateRequests as auditAggregateRequests,
+  topFallbackChains as auditTopFallbackChains,
+  spendTrendDaily as auditSpendTrendDaily,
+  cacheHitRateWindow as auditCacheHitRateWindow,
+} from './lib/audit-query.mjs';
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -1462,6 +1469,174 @@ async function handleChatCompletions(req, res) {
   }
 }
 
+// ── Phase 3 / D50 — Management endpoints (owner_only_block per ADR 0008 §8) ──
+
+// Read dashboard.html once at startup; cached in memory thereafter. If the
+// file is absent (e.g. test that imports server.mjs from a non-repo cwd), we
+// still serve a minimal in-memory fallback. The file lives at the repo root.
+let _dashboardHtmlCache = null;
+function _loadDashboardHtml() {
+  if (_dashboardHtmlCache !== null) return _dashboardHtmlCache;
+  try {
+    const path = join(__dirname, 'dashboard.html');
+    _dashboardHtmlCache = readFileSync(path, 'utf-8');
+  } catch {
+    _dashboardHtmlCache = '<!DOCTYPE html><title>OLP Dashboard</title><p>dashboard.html not on disk; server has fallen back to this in-memory stub. Check the OLP installation.</p>';
+  }
+  return _dashboardHtmlCache;
+}
+
+/**
+ * Gated owner-only_block handler factory per ADR 0008 §8 + §7.5. Builds the
+ * audit ctx, runs auth, blocks non-owner with 401, wires res.on('finish') for
+ * audit + touchLastUsed, then calls inner(req, res, olpIdentity, auditCtx).
+ *
+ * inner should be async (or sync); errors propagate to the router's catch.
+ */
+async function _runOwnerOnlyManagementEndpoint(req, res, method, path, inner) {
+  const startMs = Date.now();
+  const auditCtx = {
+    ts: new Date().toISOString(),
+    key_id: ANONYMOUS_KEY_ID,
+    owner_tier: 'anonymous',
+    method,
+    path,
+    provider: null,
+    model: null,
+    status_code: 0,
+    latency_ms: 0,
+    cache_status: null,
+    fallback_hops: 0,
+    tried_providers: [],
+    error_code: null,
+    ir_request_hash: null,
+    chain_id: null,
+  };
+  let _authedKeyId = null;
+  res.on('finish', () => {
+    auditCtx.status_code = res.statusCode;
+    auditCtx.latency_ms = Date.now() - startMs;
+    try { appendAuditEvent(auditCtx); } catch { /* best-effort */ }
+    if (_authedKeyId && _authedKeyId !== ANONYMOUS_KEY_ID && _authedKeyId !== ENV_OWNER_KEY_ID) {
+      touchLastUsed(_authedKeyId).catch(() => {});
+    }
+  });
+
+  // Step 1: authenticate.
+  const authResult = authenticate(req);
+  if (!authResult.ok) {
+    auditCtx.error_code = authResult.code;
+    return sendError(res, authResult.status, authResult.message, authResult.code,
+      olpErrorHeaders({ startMs }));
+  }
+  const olpIdentity = authResult.authContext;
+  auditCtx.key_id = olpIdentity.keyId;
+  auditCtx.owner_tier = olpIdentity.owner_tier;
+  _authedKeyId = olpIdentity.keyId;
+
+  // Step 2: owner-only_block. ADR 0008 §8 says management endpoints REJECT
+  // non-owner identities outright (vs /health's trim model). Anonymous +
+  // guest both produce 401 here.
+  if (olpIdentity.owner_tier !== 'owner') {
+    auditCtx.error_code = 'owner_required';
+    return sendError(res, 401,
+      'OLP owner-tier identity required for this management endpoint.',
+      'owner_required',
+      olpErrorHeaders({ startMs }));
+  }
+
+  // Step 3: delegate.
+  return await inner(req, res, olpIdentity, auditCtx);
+}
+
+/**
+ * GET /dashboard
+ * Serves dashboard.html to owner identities. Owner-only_block (per ADR 0008 §8).
+ * Cached in memory at startup; D51 ships the real multi-panel UI; D50 ships a
+ * placeholder.
+ */
+async function handleDashboard(req, res) {
+  return _runOwnerOnlyManagementEndpoint(req, res, 'GET', '/dashboard',
+    async (_req, res2, _identity, _auditCtx) => {
+      const html = _loadDashboardHtml();
+      res2.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(html, 'utf-8'),
+        'Cache-Control': 'no-cache',
+      });
+      res2.end(html);
+    });
+}
+
+/**
+ * GET /v0/management/dashboard-data
+ * Full JSON aggregate per ADR 0008 § 7.2. The dashboard 30s poll consumes
+ * this. Owner-only_block.
+ */
+async function handleManagementDashboardData(req, res) {
+  return _runOwnerOnlyManagementEndpoint(req, res, 'GET', '/v0/management/dashboard-data',
+    async (_req, res2, _identity, _auditCtx) => {
+      // Quota panel: collect quotaStatus from each loaded provider; null on
+      // throw or null return → "unavailable" indicator.
+      const quota = [];
+      for (const [name, provider] of loadedProviders) {
+        try {
+          const q = await provider.quotaStatus(null);
+          quota.push({ provider: name, ...(q ?? {}), available: q?.available ?? null });
+        } catch (err) {
+          quota.push({ provider: name, error: err?.message ?? String(err), available: null });
+        }
+      }
+
+      const WINDOW_24H = 24 * 60 * 60 * 1000;
+      const payload = {
+        generated_at: new Date().toISOString(),
+        window_24h: auditAggregateRequests({ windowMs: WINDOW_24H, logEvent }),
+        cache_hit_24h: auditCacheHitRateWindow({ windowMs: WINDOW_24H, logEvent }),
+        quota,
+        spend_trend_30d: auditSpendTrendDaily({ days: 30, logEvent }),
+        top_fallback_chains_24h: auditTopFallbackChains({ windowMs: WINDOW_24H, limit: 10, logEvent }),
+        cache_stats: cacheStore.stats(),
+      };
+      sendJSON(res2, 200, payload);
+    });
+}
+
+/**
+ * GET /v0/management/quota
+ * Per-provider quota snapshot only (subset of dashboard-data). Useful for
+ * scripted monitoring. Owner-only_block.
+ */
+async function handleManagementQuota(req, res) {
+  return _runOwnerOnlyManagementEndpoint(req, res, 'GET', '/v0/management/quota',
+    async (_req, res2, _identity, _auditCtx) => {
+      const quota = [];
+      for (const [name, provider] of loadedProviders) {
+        try {
+          const q = await provider.quotaStatus(null);
+          quota.push({ provider: name, ...(q ?? {}), available: q?.available ?? null });
+        } catch (err) {
+          quota.push({ provider: name, error: err?.message ?? String(err), available: null });
+        }
+      }
+      sendJSON(res2, 200, { generated_at: new Date().toISOString(), quota });
+    });
+}
+
+/**
+ * GET /cache/stats
+ * Live in-memory CacheStore stats. Owner-only_block.
+ * Per ADR 0008 § 7.4: returns the current cacheStore.stats() shape
+ * ({ hits, misses, size, inflightCount }). Per-(provider, model) breakdown
+ * is a Phase 4+ amendment trigger.
+ */
+async function handleCacheStats(req, res) {
+  return _runOwnerOnlyManagementEndpoint(req, res, 'GET', '/cache/stats',
+    async (_req, res2, _identity, _auditCtx) => {
+      sendJSON(res2, 200, { generated_at: new Date().toISOString(), ...cacheStore.stats() });
+    });
+}
+
 // ── Request router ────────────────────────────────────────────────────────
 
 /**
@@ -1485,6 +1660,20 @@ async function router(req, res) {
 
     if (method === 'POST' && path === '/v1/chat/completions') {
       return await handleChatCompletions(req, res);
+    }
+
+    // Phase 3 / D50 — management endpoints (owner-only_block per ADR 0008 § 8)
+    if (method === 'GET' && path === '/dashboard') {
+      return await handleDashboard(req, res);
+    }
+    if (method === 'GET' && path === '/v0/management/dashboard-data') {
+      return await handleManagementDashboardData(req, res);
+    }
+    if (method === 'GET' && path === '/v0/management/quota') {
+      return await handleManagementQuota(req, res);
+    }
+    if (method === 'GET' && path === '/cache/stats') {
+      return await handleCacheStats(req, res);
     }
 
     // 404 for any unrecognised route

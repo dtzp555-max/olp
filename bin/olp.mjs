@@ -512,6 +512,16 @@ async function cmdRestart(flags, io) {
   // macOS: launchctl kickstart -k gui/$(id -u)/dev.olp.proxy
   // Linux: systemctl --user restart olp-proxy
   // Neither installed → fall through to a helpful error.
+  //
+  // CAVEAT (D64-D67 reviewer P2-2; known OCP institutional lesson per
+  // ~/.cc-rules/memory/auto/MEMORY.md PIT INDEX): `launchctl kickstart -k`
+  // does NOT re-read the plist's EnvironmentVariables block — launchd
+  // sticks to its cached env from the most recent bootstrap. If you edited
+  // ~/Library/LaunchAgents/dev.olp.proxy.plist's env, this subcommand will
+  // silently use stale values. Use `launchctl bootout gui/<uid>/dev.olp.proxy`
+  // followed by `launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/dev.olp.proxy.plist`
+  // to force a clean env reload. The Phase 4 installer (planned post-D73)
+  // will expose `olp restart --full` for the bootout/bootstrap dance.
   const platform = process.platform;
   const uid = process.getuid?.() ?? null;
   let cmd, args;

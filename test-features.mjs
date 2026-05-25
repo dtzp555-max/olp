@@ -9,7 +9,7 @@
  *   D5 adds: Suite 9 (cache layer unit + HTTP integration), Suite 10 (Anthropic E2E gated)
  */
 
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
 import { EventEmitter } from 'node:events';
@@ -12456,5 +12456,475 @@ describe('Suite 27 — D57 streaming singleflight (cache layer)', () => {
     // Stats: each keyId has its own miss counter.
     assert.equal(store.stats('key-A').misses, 1);
     assert.equal(store.stats('key-B').misses, 1);
+  });
+});
+
+// ── Suite 28: D58 streaming singleflight (server.mjs HTTP wiring) ──────────
+//
+// Authority: ADR 0005 Amendment 8 §§ 7, 8, 9, 11, 12 (issue #16, D58).
+//
+// HTTP-layer integration tests for the server.mjs streaming branch wired to
+// cacheStore.getOrComputeStreaming(). D57 (cache layer) tested singleflight
+// in unit form; D58 verifies the server actually plumbs it through and emits
+// the new X-OLP-Streaming-Inflight header. Provider spawn is mocked at the
+// plugin level via lp.set('anthropic', { ...real, spawn: fake }) — the
+// pattern used by Suites 15d/15e — so no real CLI is invoked.
+//
+// Test count: 8 (28a single, 28b 2-concurrent join, 28c TOCTOU pre-cache,
+// 28d mid-stream join behaviour-validated via parallel HTTP, 28e omitted in
+// favour of Suite 27g unit coverage per D58 prompt, 28f one-of-N disconnect,
+// 28g all-disconnect, 28h CONCURRENCY_LIMIT fallthrough).
+
+describe('Suite 28 — D58 streaming singleflight (server.mjs HTTP wiring, ADR 0005 Amendment 8)', () => {
+  let server28;
+  let port28;
+  let savedToken28;
+  let lp28;
+  let savedAnthropic28;
+
+  before(async () => {
+    savedToken28 = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'fake-token-suite-28';
+    __setProvidersEnabled({ anthropic: true });
+
+    const mod = await import('./server.mjs');
+    lp28 = mod.loadedProviders;
+    savedAnthropic28 = lp28.get('anthropic');
+    mod.__clearCache();
+
+    server28 = mod.createOlpServer();
+    await new Promise((resolve, reject) => {
+      server28.listen(0, '127.0.0.1', resolve);
+      server28.once('error', reject);
+    });
+    port28 = server28.address().port;
+  });
+
+  after(async () => {
+    // Restore original anthropic provider so other suites are unaffected.
+    if (savedAnthropic28 !== undefined) {
+      lp28.set('anthropic', savedAnthropic28);
+    } else {
+      lp28.delete('anthropic');
+    }
+    __resetProvidersEnabled();
+    __resetSpawnImpl();
+    if (savedToken28 !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = savedToken28;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
+    if (!server28) return;
+    return new Promise(r => server28.close(r));
+  });
+
+  /**
+   * Install a custom spawn async generator on the anthropic plugin for one
+   * test. `factory` is a function returning the async generator each spawn.
+   * Tracks invocation count via spawnCount.
+   */
+  function installFakeStreamProvider(spawnImpl) {
+    const counter = { count: 0 };
+    const fake = {
+      ...savedAnthropic28,
+      spawn: async function* (ir, authContext) {
+        counter.count++;
+        yield* spawnImpl(ir, authContext);
+      },
+    };
+    lp28.set('anthropic', fake);
+    return counter;
+  }
+
+  /**
+   * Fire an SSE request and collect the full body + headers. The promise
+   * resolves when the server ends the response (res 'end' event).
+   */
+  function makeStreamRequest(extra = {}) {
+    return new Promise((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: port28,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        let data = '';
+        res.on('data', d => { data += d.toString(); });
+        res.on('end', () => resolve({
+          status: res.statusCode,
+          body: data,
+          headers: res.headers,
+        }));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.write(JSON.stringify({
+        model: extra.model ?? 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: extra.prompt ?? 'd58-default' }],
+        stream: true,
+      }));
+      req.end();
+    });
+  }
+
+  /**
+   * Fire an SSE request and abort it after `abortAfterMs` ms. Returns the
+   * partial body collected up to abort. Resolves on the abort event.
+   */
+  function makeAbortableStreamRequest({ prompt, abortAfterMs }) {
+    return new Promise((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port: port28,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        let data = '';
+        res.on('data', d => { data += d.toString(); });
+        res.on('end', () => resolve({
+          status: res.statusCode,
+          body: data,
+          headers: res.headers,
+          aborted: false,
+        }));
+        res.on('error', () => resolve({
+          status: res.statusCode,
+          body: data,
+          headers: res.headers,
+          aborted: true,
+        }));
+      });
+      req.on('error', () => resolve({ aborted: true }));
+      req.write(JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: prompt }],
+        stream: true,
+      }));
+      req.end();
+      setTimeout(() => {
+        try { req.destroy(); } catch { /* ignore */ }
+      }, abortAfterMs);
+    });
+  }
+
+  beforeEach(async () => {
+    const mod = await import('./server.mjs');
+    mod.__clearCache();
+  });
+
+  it('28a — single SSE request: X-OLP-Streaming-Inflight: source; cache populated; identical re-request → cache hit', async () => {
+    // D58 — ADR 0005 Amendment 8 §11: single client gets `source` role,
+    // X-OLP-Cache: miss. Subsequent identical request hits the cache.
+    const counter = installFakeStreamProvider(async function* (_ir) {
+      yield { type: 'delta', content: 'chunk-A' };
+      yield { type: 'delta', content: 'chunk-B' };
+      yield { type: 'stop', finish_reason: 'stop' };
+    });
+
+    const r1 = await makeStreamRequest({ prompt: 'd58-28a' });
+    assert.equal(r1.status, 200, `r1 status ${r1.status}: ${r1.body.slice(0, 200)}`);
+    assert.equal(r1.headers['x-olp-streaming-inflight'], 'source',
+      'r1 must emit X-OLP-Streaming-Inflight: source');
+    assert.equal(r1.headers['x-olp-cache'], 'miss',
+      'r1 must be X-OLP-Cache: miss');
+    assert.ok(r1.body.includes('chunk-A'), 'r1 body must include chunk-A');
+    assert.ok(r1.body.includes('chunk-B'), 'r1 body must include chunk-B');
+    assert.ok(r1.body.includes('[DONE]'), 'r1 body must end with [DONE]');
+    assert.equal(counter.count, 1, 'exactly one spawn for r1');
+
+    // Second identical request — cache hit, no spawn.
+    const r2 = await makeStreamRequest({ prompt: 'd58-28a' });
+    assert.equal(r2.status, 200);
+    assert.equal(r2.headers['x-olp-cache'], 'hit', 'r2 must be cache hit');
+    // X-OLP-Streaming-Inflight is omitted on cache_hit (X-OLP-Cache: hit
+    // already signals that path per D58 design).
+    assert.equal(r2.headers['x-olp-streaming-inflight'], undefined,
+      'cache_hit path must omit X-OLP-Streaming-Inflight header');
+    assert.equal(counter.count, 1, 'no additional spawn for r2');
+  });
+
+  it('28b — 2 concurrent identical SSE: one spawn; first=source second=attached; identical chunks', async () => {
+    // D58 — ADR 0005 Amendment 8 §1, §11: two concurrent identical streams
+    // share one underlying spawn. First gets X-OLP-Streaming-Inflight:
+    // source; second gets attached. Both bodies contain the same chunks.
+    //
+    // Pacing: source yields chunks with a setTimeout gap so the second
+    // request has time to fire and attach mid-stream.
+    const counter = installFakeStreamProvider(async function* (_ir) {
+      // Slow pacing so the second request can attach before completion.
+      for (const t of ['c0', 'c1', 'c2', 'c3']) {
+        yield { type: 'delta', content: t };
+        await new Promise(r => setTimeout(r, 20));
+      }
+      yield { type: 'stop', finish_reason: 'stop' };
+    });
+
+    // Fire request 1, then a few ms later fire request 2; both run to
+    // completion in parallel.
+    const p1 = makeStreamRequest({ prompt: 'd58-28b' });
+    // Give p1 a head start to register the inflight entry.
+    await new Promise(r => setTimeout(r, 10));
+    const p2 = makeStreamRequest({ prompt: 'd58-28b' });
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.equal(counter.count, 1, 'only one underlying spawn for both requests');
+
+    // First caller (registered the inflight entry) gets source; the other
+    // gets attached. The order is set by who hit getOrComputeStreaming
+    // first — we asserted that with the 10ms head start above.
+    assert.equal(r1.headers['x-olp-streaming-inflight'], 'source',
+      'r1 must be source role');
+    assert.equal(r2.headers['x-olp-streaming-inflight'], 'attached',
+      'r2 must be attached role');
+
+    // Both responses must contain all 4 delta chunks + [DONE].
+    for (const tag of ['c0', 'c1', 'c2', 'c3', '[DONE]']) {
+      assert.ok(r1.body.includes(tag), `r1 missing ${tag}`);
+      assert.ok(r2.body.includes(tag), `r2 missing ${tag}`);
+    }
+
+    // Cache_status header: source=miss, attached=hit (cache_hit role)?
+    // No — attached client did NOT hit the cache (cache was empty). The
+    // server distinguishes by setting cache_status header to 'miss' for
+    // attached and 'miss' for source. Verify both are 'miss' on the wire
+    // (X-OLP-Cache header). cache_status='streaming_attached' is the AUDIT
+    // value, not the wire header value.
+    assert.equal(r1.headers['x-olp-cache'], 'miss');
+    assert.equal(r2.headers['x-olp-cache'], 'miss');
+  });
+
+  it('28c — TOCTOU regression: pre-populated cache + 2 concurrent identical streams → both cache_hit, no spawn', async () => {
+    // D58 — ADR 0005 Amendment 8 §6 / §11: when the cache is already
+    // populated, preCheckHit gates entry to the streaming-singleflight
+    // branch. The streaming-singleflight branch should not run at all.
+    // 2 concurrent identical requests both replay from cache; spawn count
+    // stays at 0.
+    const counter = installFakeStreamProvider(async function* (_ir) {
+      yield { type: 'delta', content: 'should-not-fire' };
+      yield { type: 'stop', finish_reason: 'stop' };
+    });
+
+    // Populate the cache via a first request.
+    const r0 = await makeStreamRequest({ prompt: 'd58-28c' });
+    assert.equal(r0.status, 200);
+    assert.equal(counter.count, 1, 'r0 spawned once to populate cache');
+
+    // Now fire 2 concurrent identical requests — both should be cache hits.
+    const [r1, r2] = await Promise.all([
+      makeStreamRequest({ prompt: 'd58-28c' }),
+      makeStreamRequest({ prompt: 'd58-28c' }),
+    ]);
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.equal(r1.headers['x-olp-cache'], 'hit', 'r1 must be cache hit');
+    assert.equal(r2.headers['x-olp-cache'], 'hit', 'r2 must be cache hit');
+    // Neither should have entered the streaming-singleflight branch.
+    assert.equal(r1.headers['x-olp-streaming-inflight'], undefined,
+      'r1 must not emit X-OLP-Streaming-Inflight (served from buffered cache replay)');
+    assert.equal(r2.headers['x-olp-streaming-inflight'], undefined,
+      'r2 must not emit X-OLP-Streaming-Inflight (served from buffered cache replay)');
+    assert.equal(counter.count, 1, 'no additional spawns');
+  });
+
+  it('28d — mid-stream join (HTTP-level): 2 concurrent SSE requests share one spawn; both bodies identical', async () => {
+    // D58 — ADR 0005 Amendment 8 §5: late joiner gets accumulated burst +
+    // live tail. At the HTTP level we can't observe the burst-vs-live split
+    // precisely (it's internal to the cache layer), but we can verify the
+    // end-to-end invariant: both clients receive the same chunk sequence
+    // even when one joins mid-source. Suite 27c covers the burst-vs-live
+    // split at the cache-layer unit level.
+    const counter = installFakeStreamProvider(async function* (_ir) {
+      // Slower pacing so the second client clearly joins mid-stream.
+      for (const t of ['m0', 'm1', 'm2', 'm3', 'm4']) {
+        yield { type: 'delta', content: t };
+        await new Promise(r => setTimeout(r, 25));
+      }
+      yield { type: 'stop', finish_reason: 'stop' };
+    });
+
+    const p1 = makeStreamRequest({ prompt: 'd58-28d' });
+    // p2 joins ~40ms in — at least 2 chunks have been accumulated by then.
+    await new Promise(r => setTimeout(r, 40));
+    const p2 = makeStreamRequest({ prompt: 'd58-28d' });
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.equal(counter.count, 1, 'exactly one underlying spawn');
+    assert.equal(r1.headers['x-olp-streaming-inflight'], 'source');
+    assert.equal(r2.headers['x-olp-streaming-inflight'], 'attached');
+    for (const tag of ['m0', 'm1', 'm2', 'm3', 'm4']) {
+      assert.ok(r1.body.includes(tag), `r1 missing ${tag}`);
+      assert.ok(r2.body.includes(tag), `r2 missing ${tag} (late-joiner replay must include burst)`);
+    }
+  });
+
+  it('28f — one of N clients disconnects mid-stream: source NOT aborted; other client completes; cache populated', async () => {
+    // D58 — ADR 0005 Amendment 8 §9: when one of N attached clients drops,
+    // the source continues for the remaining clients. The cache write
+    // happens because the source completed normally for the surviving
+    // client.
+    const counter = installFakeStreamProvider(async function* (_ir) {
+      for (const t of ['s0', 's1', 's2', 's3', 's4', 's5']) {
+        yield { type: 'delta', content: t };
+        await new Promise(r => setTimeout(r, 25));
+      }
+      yield { type: 'stop', finish_reason: 'stop' };
+    });
+
+    // r1 starts and registers the inflight entry.
+    const p1 = makeStreamRequest({ prompt: 'd58-28f' });
+    await new Promise(r => setTimeout(r, 15));
+    // r2 attaches but aborts after ~40ms.
+    const p2 = makeAbortableStreamRequest({ prompt: 'd58-28f', abortAfterMs: 40 });
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    // r1 (the source) completes normally with the full stream.
+    assert.equal(r1.status, 200);
+    assert.equal(r1.headers['x-olp-streaming-inflight'], 'source');
+    for (const tag of ['s0', 's1', 's2', 's3', 's4', 's5', '[DONE]']) {
+      assert.ok(r1.body.includes(tag), `r1 missing ${tag}`);
+    }
+    assert.equal(counter.count, 1, 'source spawn was NOT re-fired by the disconnect');
+
+    // r2 was aborted — partial body is okay; what matters is the source
+    // wasn't killed (verified above by r1 completing).
+    // Subsequent identical request must be a cache hit (cache was populated
+    // by the source on normal completion).
+    const r3 = await makeStreamRequest({ prompt: 'd58-28f' });
+    assert.equal(r3.status, 200);
+    assert.equal(r3.headers['x-olp-cache'], 'hit', 'cache populated after source completion');
+    assert.equal(counter.count, 1, 'no additional spawn for r3');
+  });
+
+  it('28g — ALL clients disconnect mid-stream: source aborted; no cache write; subsequent request respawns', async () => {
+    // D58 — ADR 0005 Amendment 8 §9 + §4: when all attached clients
+    // disconnect, the cache layer fires sourceAbortController.abort() and
+    // does NOT write the cache. A subsequent identical request must spawn
+    // afresh (no inflight entry left dangling).
+    //
+    // Implementation detail: the fake spawn's async generator must respect
+    // the abort signal (or simply have its iterator.return() called when
+    // the spawn is iterated by the tee task — see Suite 27 unit tests).
+    // For an async generator with `await new Promise(setTimeout)` between
+    // yields, calling .return() naturally propagates because the for-await
+    // exits cleanly via the try/finally.
+    let sourceFinished = false;
+    const counter = installFakeStreamProvider(async function* (_ir) {
+      try {
+        for (let i = 0; i < 30; i++) {
+          yield { type: 'delta', content: `g${i}` };
+          await new Promise(r => setTimeout(r, 20));
+        }
+        yield { type: 'stop', finish_reason: 'stop' };
+        sourceFinished = true;
+      } finally {
+        // intentionally no-op; the "finished without abort" signal lives in
+        // sourceFinished above.
+      }
+    });
+
+    // Only one client; abort it after ~40ms (well before completion).
+    const r1 = await makeAbortableStreamRequest({ prompt: 'd58-28g', abortAfterMs: 40 });
+    assert.equal(counter.count, 1, 'spawn fired once');
+    // Wait for the cache layer to observe attachedClients.size === 0 and abort.
+    await new Promise(r => setTimeout(r, 100));
+    assert.equal(sourceFinished, false, 'source was aborted, not completed');
+
+    // Subsequent identical request must respawn (no cache, no inflight).
+    const r2 = await makeStreamRequest({ prompt: 'd58-28g' });
+    assert.equal(r2.status, 200);
+    assert.equal(r2.headers['x-olp-cache'], 'miss', 'no cache write after abort');
+    assert.equal(r2.headers['x-olp-streaming-inflight'], 'source', 'fresh source role');
+    assert.equal(counter.count, 2, 'r2 triggered a fresh spawn');
+  });
+
+  it('28h — CONCURRENCY_LIMIT fallthrough: different cacheKeys at maxConcurrent=1 → first succeeds; second falls through to buffered path', async () => {
+    // D58 — ADR 0005 Amendment 8 §7: CONCURRENCY_LIMIT thrown by
+    // sourceFactory falls through to the buffered path. Different
+    // cacheKeys do NOT share an inflight entry (they're not singleflight
+    // candidates), so request 2's sourceFactory throws and the streaming
+    // branch is bypassed for that request. The buffered path then
+    // re-attempts acquire; since maxConcurrent=1 and request 1 still has
+    // the slot, it surfaces a chain-exhausted 502 (single-hop saturation).
+    //
+    // We install a custom provider with maxConcurrent=1 + slow stream to
+    // hold the slot while request 2 fires.
+    let releaseSig;
+    const releaseGate = new Promise(r => { releaseSig = r; });
+    const counter = { count: 0 };
+    const fake = {
+      ...savedAnthropic28,
+      hints: { ...savedAnthropic28.hints, maxConcurrent: 1 },
+      spawn: async function* (_ir, _ctx) {
+        counter.count++;
+        // First spawn holds the slot until releaseGate is signalled.
+        yield { type: 'delta', content: `h${counter.count}-0` };
+        await releaseGate;
+        yield { type: 'stop', finish_reason: 'stop' };
+      },
+    };
+    lp28.set('anthropic', fake);
+
+    try {
+      // Fire request 1 with prompt-A; it acquires the slot and stalls.
+      const p1 = makeStreamRequest({ prompt: 'd58-28h-A' });
+      await new Promise(r => setTimeout(r, 30));
+      // Fire request 2 with prompt-B (different cache key) — should
+      // CONCURRENCY_LIMIT in factory, fall through to buffered path,
+      // which will also fail acquire → chain-exhausted 502.
+      const r2 = await makeStreamRequest({ prompt: 'd58-28h-B' });
+      // The buffered fallback engine surfaces a chain-exhausted error as
+      // 502 for single-hop saturation per pre-D58 behaviour.
+      assert.ok(r2.status === 502 || r2.status === 503,
+        `expected 502/503 chain-exhausted, got ${r2.status}: ${r2.body.slice(0, 200)}`);
+
+      // Release request 1's stall.
+      releaseSig();
+      const r1 = await p1;
+      assert.equal(r1.status, 200, 'r1 must complete normally');
+      // Exactly one spawn — request 2 never spawned (CONCURRENCY_LIMIT).
+      assert.equal(counter.count, 1, 'only one underlying spawn');
+    } finally {
+      // In case of an early failure, release the gate so promises settle.
+      try { releaseSig(); } catch { /* already released */ }
+    }
+  });
+
+  it('28i — stop-less exhaustion: source generator returns without {type:"stop"} → cache NOT populated (D58 follow-up to D58 reviewer P2-2)', async () => {
+    // ADR 0005 § "Cache write conditions" item 1 (D16 truncated-not-cached
+    // invariant): if the source generator exhausts without emitting a stop
+    // chunk, the response is treated as truncated and MUST NOT persist in
+    // cache. D57's cache layer is IR-agnostic and writes accumulatedChunks
+    // on any source exhaustion; D58's server.mjs handles the IR semantics by
+    // calling cacheStore.delete(...) immediately after on the no-stop path.
+    // This test pins the end-to-end behaviour from the HTTP layer.
+    const counter = { count: 0 };
+    const fake = {
+      ...savedAnthropic28,
+      spawn: async function* (_ir, _ctx) {
+        counter.count++;
+        yield { type: 'delta', content: 'no-stop-1' };
+        yield { type: 'delta', content: 'no-stop-2' };
+        // Generator returns WITHOUT a stop chunk — truncation path.
+      },
+    };
+    lp28.set('anthropic', fake);
+    const r1 = await makeStreamRequest({ prompt: 'd58-28i' });
+    assert.equal(r1.status, 200, '28i r1: SSE response 200');
+    assert.equal(counter.count, 1, '28i r1: spawned once');
+    // The synthetic truncation marker {type:"stop", finish_reason:"length"}
+    // should appear (D26 F19 in-band signal); [DONE] terminator follows.
+    assert.ok(r1.body.includes('"finish_reason":"length"'),
+      `28i r1: truncation marker expected; body=${r1.body.slice(0, 300)}`);
+    assert.ok(r1.body.includes('[DONE]'), '28i r1: [DONE] terminator');
+    // Subsequent identical request must respawn (cache was NOT populated).
+    const r2 = await makeStreamRequest({ prompt: 'd58-28i' });
+    assert.equal(r2.status, 200, '28i r2: SSE response 200');
+    assert.equal(counter.count, 2, '28i r2: second request triggered a fresh spawn (no cache reuse for truncated entry)');
   });
 });

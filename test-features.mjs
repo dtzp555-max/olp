@@ -6247,6 +6247,30 @@ describe('D40 — X-OLP-Fallback-Detail header (issue #7)', () => {
     assert.equal(result.fallbackDetail[0].code, 'SPAWN_FAILED');
   });
 
+  it('engine: AUTH_MISSING terminates chain, fallbackDetail tuple records trigger_type:"auth_missing" (D56, v1.x roadmap #7)', async () => {
+    // v1.x roadmap #7 (D40 follow-up): explicit pin that the AUTH_MISSING
+    // path produces a fallbackDetail tuple with trigger_type:"auth_missing"
+    // BEFORE the engine's early-return at engine.mjs:486. Was implicit via
+    // other engine-path tests; D56 makes it explicit so any future refactor
+    // that moves the tuple-push past the auth_missing branch fails this.
+    const err = new ProviderError('No OAuth token found', 'AUTH_MISSING');
+    const chain = [
+      { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      { provider: 'openai', model: 'gpt-5.5' }, // present to verify AUTH_MISSING does NOT advance
+    ];
+    const hopFn = async () => { throw err; };
+    const result = await executeWithFallback(chain, makeIR({ model: 'claude-sonnet-4-6' }), hopFn);
+    // AUTH_MISSING is HARD_TRIGGER_CODES[AUTH_MISSING]=false (engine.mjs L52);
+    // chain stops at hop 0 instead of advancing to openai.
+    assert.equal(result.chunks, null, 'AUTH_MISSING terminates chain');
+    assert.equal(result.fallbackHops, 0, 'AUTH_MISSING does NOT advance — stays at hop 0');
+    assert.equal(result.fallbackDetail.length, 1, 'fallbackDetail has exactly 1 tuple (the AUTH_MISSING hop)');
+    assert.equal(result.fallbackDetail[0].code, 'AUTH_MISSING');
+    assert.equal(result.fallbackDetail[0].trigger_type, 'auth_missing');
+    assert.equal(result.fallbackDetail[0].provider, 'anthropic');
+    assert.equal(result.fallbackDetail[0].hop, 0);
+  });
+
   it('engine: non-ProviderError exception → tuple code is "UNKNOWN"', async () => {
     const err = new Error('Something unexpected'); // no .code field
     const chain = [{ provider: 'anthropic', model: 'claude-sonnet-4-6' }];
@@ -10520,6 +10544,29 @@ describe('Suite 21 — D46 owner-vs-guest gating (ADR 0007 §§ 7.1, 7.2)', () =
       assert.equal(typeof body.providers, 'object');
       assert.equal(typeof body.providers.enabled, 'number');
       assert.ok('status' in body.providers, 'owner /health providers.status must be present');
+    });
+
+    it('21c-extra: owner /health each provider status carries activeSpawns field (D56, v1.x #4 / ADR 0002 Amendment 6)', async () => {
+      // ADR 0002 Amendment 6 forward note: when surfaced on /health, the
+      // per-provider concurrency counter lives at providers.status.<name>.
+      // activeSpawns. D56 wires it. With no requests in flight, the value
+      // is 0; under saturation it equals hints.maxConcurrent.
+      const { plaintext_token } = createKey({ name: '21c-extra', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+      const r = await fetch({
+        port, method: 'GET', path: '/health',
+        headers: { Authorization: `Bearer ${plaintext_token}` },
+      });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      // At least one provider must be enabled in the fixture
+      const statusEntries = Object.entries(body.providers.status);
+      assert.ok(statusEntries.length >= 1, 'fixture has at least one enabled provider');
+      for (const [name, status] of statusEntries) {
+        assert.ok('activeSpawns' in status,
+          `providers.status.${name}.activeSpawns MUST be present (ADR 0002 Amendment 6)`);
+        assert.equal(typeof status.activeSpawns, 'number');
+        assert.ok(status.activeSpawns >= 0, 'activeSpawns >= 0');
+      }
     });
 
     it('21d: owner_only_endpoints config opt-out — empty list → guest gets full payload', async () => {

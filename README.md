@@ -2,7 +2,7 @@
 
 A personal- and family-scale multi-provider LLM proxy. One HTTP endpoint, many subscriptions behind it, automatic routing, automatic fallback, content-addressed caching — so your IDEs and family clients keep working as long as *any* of your subscriptions has quota left.
 
-> **Status:** v0.2.0 shipped (2026-05-25) — Phase 1 multi-provider proxy core (v0.1.0 + v0.1.1) + Phase 2 multi-key auth + audit + owner gating + keygen CLI. Phase 3 (Dashboard + audit query layer) is the next milestone. Sections marked _placeholder_ land alongside the relevant phase of work (see [phase plan](#phase-plan)).
+> **Status:** v0.2.0 shipped (2026-05-25); v0.3.0 in progress — Phase 1 multi-provider proxy core (v0.1.0 + v0.1.1) + Phase 2 multi-key auth + audit + owner gating + keygen CLI (v0.2.0) + Phase 3 Dashboard + audit query layer + daily audit rotation (D48-D54 shipped to main; v0.3.0 release pending maintainer-triggered close). Sections marked _placeholder_ land alongside the relevant phase of work (see [phase plan](#phase-plan)).
 
 ---
 
@@ -94,16 +94,15 @@ Trigger types, fallback safety, idempotency rules, and the full example config l
 
 ## API Endpoints
 
-_placeholder — full table lands as each endpoint lands._
-
 | Endpoint | Method | Phase | Status | Description |
 |---|---|---|---|---|
 | `/v1/chat/completions` | POST | 1 | ✅ Shipped | OpenAI-compatible Chat Completions entry. Internally normalized to IR, dispatched to a provider plugin, response shape converted back. |
 | `/v1/models` | GET | 1 | ✅ Shipped | Lists models from `models-registry.json`. |
-| `/health` | GET | 1 | ✅ Shipped | Per-provider health snapshot (owner-only). |
-| `/cache/stats` | GET | 5 | 📋 Planned | Cache hit rate, by-provider breakdown. |
-| `/v0/management/quota` | GET | 6 | 📋 Planned | Per-provider quota / credit pool status (best-effort). |
-| `/dashboard` | GET | 6 | 📋 Planned | Owner-only dashboard (localhost-bound by default). |
+| `/health` | GET | 1 | ✅ Shipped | Per-provider health snapshot. Phase 2 owner-only-trim: full per-provider details to owner identity; trimmed `{ ok, version }` to guest / anonymous. Gate via `auth.owner_only_endpoints` config. |
+| `/dashboard` | GET | 3 | ✅ Shipped (D50 + D51) | Owner-only multi-provider dashboard HTML (4 panels: quota / 24h request stats / 30d spend trend / top fallback chains; 30s poll with visibilitychange pause). Owner-only_block; non-owner identities receive 401. Localhost-bound by default. |
+| `/v0/management/dashboard-data` | GET | 3 | ✅ Shipped (D50) | JSON aggregate consumed by the dashboard 30s poll: `{ generated_at, window_24h, cache_hit_24h, quota, spend_trend_30d, top_fallback_chains_24h, cache_stats }`. Owner-only_block. |
+| `/v0/management/quota` | GET | 3 | ✅ Shipped (D50) | Per-provider quota snapshot via `provider.quotaStatus()` (subset of dashboard-data; useful for scripted monitoring). Owner-only_block. |
+| `/cache/stats` | GET | 3 | ✅ Shipped (D50) | Live in-memory `cacheStore.stats()` (`{ hits, misses, size, inflightCount }` + `generated_at`). Owner-only_block. |
 
 ---
 
@@ -167,7 +166,7 @@ If a fallback chain is exhausted, `X-OLP-Fallback-Exhausted` lists the tried pro
 
 ## Implementation status (as of 2026-05-25, post-v0.2.0)
 
-Phase 1 closed at v0.1.1 (multi-provider proxy core + pre-Phase-2 cleanup). Phase 2 closed at v0.2.0 (multi-key auth + audit + owner gating + keygen CLI; ADR 0007 § 10 all 11 acceptance criteria shipped). Phase 3 (Dashboard + audit query layer) is the next milestone. This table reflects what is currently shipped vs. what is designed for later phases.
+Phase 1 closed at v0.1.1 (multi-provider proxy core + pre-Phase-2 cleanup). Phase 2 closed at v0.2.0 (multi-key auth + audit + owner gating + keygen CLI; ADR 0007 § 10 all 11 acceptance criteria shipped). Phase 3 (Dashboard + audit query layer + daily audit rotation) shipped to main through D54; v0.3.0 release is pending maintainer-triggered close (D55). This table reflects what is currently shipped vs. what is designed for later phases.
 
 | File / artifact | Status | Notes |
 |---|---|---|
@@ -184,8 +183,10 @@ Phase 1 closed at v0.1.1 (multi-provider proxy core + pre-Phase-2 cleanup). Phas
 | `test-features.mjs` | ✅ Shipped | Comprehensive test suite covering IR, cache, fallback, and integration paths (CI: `test.yml`) |
 | `lib/keys.mjs` | ✅ Phase 2 shipped (D44 + D45 + D46) | Multi-key auth core (`createKey` / `validateKey` / `listKeys` / `revokeKey` / `touchLastUsed`) per ADR 0007 §§ 5/6.1/6.3/6.3.5/6.4/9.4 + `loadAuthConfigSync` for `auth.allow_anonymous` / `owner_only_endpoints` / `fallback_detail_header_policy`. Server wires `validateKey` per request, filters chain by `providers_enabled`, fires `touchLastUsed` post-response, trims `/health` payload for non-owner, gates `X-OLP-Fallback-Detail` emission by policy. |
 | `bin/olp-keys.mjs` | ✅ Phase 2 shipped (D47) | Keygen CLI per ADR 0007 § 9.1. `npx olp-keys keygen --owner` generates an owner key + prints plaintext token once; `npx olp-keys list` enumerates keys (token_hash redacted); `npx olp-keys revoke --id=X` marks a key revoked. `--olp-home=<path>` overrides `~/.olp/`. |
-| `lib/audit.mjs` | 🟡 Phase 2 — shipped at D45 | Append-only ndjson audit at `~/.olp/logs/audit.ndjson` per ADR 0007 § 6.2 + § 8. `appendAuditEvent` fires for every `/v1/*` request (success, 401, 403, 5xx). Warn + 1 retry on append failure; no memory buffer at Phase 2 (forward path). PII excluded (no message / response content). `OLP_HOME` env override supported for test/operator isolation. |
-| `dashboard.html` | 📋 Planned (Phase 6) | Owner-only multi-provider dashboard |
+| `lib/audit.mjs` | ✅ Phase 2 + 3 (D45 append + D52 rotation) | Append-only ndjson audit at `~/.olp/logs/audit.ndjson` per ADR 0007 § 6.2 + § 8. `appendAuditEvent` fires for every `/v1/*` + `/v0/management/*` request (success, 401, 403, 5xx). Warn + 1 retry on append failure; no memory buffer at Phase 2 (forward path). PII excluded. D52 adds synchronous daily rotation per ADR 0008 § 5 — first append after UTC midnight renames live → `audit-YYYY-MM-DD.ndjson`. |
+| `lib/audit-query.mjs` | ✅ Phase 3 shipped (D49) | Audit ndjson aggregate query layer per ADR 0008 § 4. 5 functions: `discoverAuditFiles`, `readAuditWindow`, `aggregateRequests`, `topFallbackChains`, `spendTrendDaily`, `cacheHitRateWindow`. In-memory cross-file scan; PII guard at output. Consumed by `/v0/management/dashboard-data`. |
+| `dashboard.html` | ✅ Phase 3 shipped (D50 stub + D51 full UI) | Owner-only multi-provider dashboard per ADR 0008 § 6. 4 panels (quota / 24h request stats / 30d SVG sparkline / top fallback chains). Vanilla HTML+JS+fetch (no build step). 30s page poll with `document.visibilityState` pause. Served by `/dashboard` route owner-only_block. |
+| `bin/olp-audit-rotate.mjs` | ✅ Phase 3 shipped (D52) | External audit rotation cron tool per ADR 0008 § 5.2. `npx olp-audit-rotate [--olp-home=<path>]`. Idempotent + safe alongside the in-server first-append trigger. |
 | `docs/provider-caveats.md` | 📋 Planned (Phase 3+) | Lossy-translation reference; for now documented inline in each plugin header |
 | `docs/openai-spec-pin.md` | ✅ Shipped (D30) | OpenAI spec snapshot for annual audit; v0.1 baseline pinned 2026-05-24 |
 | `docs/alignment-audits/` | 📋 Planned | Output directory for annual alignment audits (first audit: 2027-05-14) |
@@ -198,7 +199,9 @@ Behaviors that work correctly at personal/family scale but have ratified follow-
 
 - **Streaming-path singleflight not implemented.** The cache layer's D4 singleflight (one spawn per identical concurrent request) is fully wired on the buffered path but NOT on the streaming path. N concurrent identical streaming requests at v0.1 will each spawn their own CLI process. Design ratified in [ADR 0005 Amendment 8](./docs/adr/0005-cache-cross-provider.md); implementation tracked via [issue #16](https://github.com/dtzp555-max/olp/issues/16) and [v1.x roadmap #1](./docs/v1x-roadmap.md). At family scale this is observably fine — every caller still receives the correct response; the cost is N CLI processes instead of one.
 - **Soft triggers configured but inert.** `routing.soft_triggers` in `~/.olp/config.json` is honored by the engine's evaluation logic but `quotaStatus()` polling is not wired (ADR 0004 Amendment 2). A startup warning fires if the field is non-empty so the inert state is visible.
-- **Multi-key auth + owner gating + keygen CLI all shipped (D44 + D45 + D46 + D47); Phase 2 close pending.** `lib/keys.mjs` core shipped at D44; `server.mjs` invokes `validateKey` per request, filters the chain by `providers_enabled`, fires `touchLastUsed` post-response, and appends an audit row to `~/.olp/logs/audit.ndjson` for each `/v1/*` request (D45). At D46: `/health` payload trimmed for non-owner (returns `{ ok, version }` when `owner_only_endpoints` includes `/health`); `X-OLP-Fallback-Detail` emission gated by `fallback_detail_header_policy` (`owner_only` default suppresses for non-owner; `'all'` opts back into v0.1.1 behaviour; `'none'` suppresses entirely). At D47: keygen CLI shipped at `bin/olp-keys.mjs` — `npx olp-keys keygen --owner` produces an owner key (plaintext printed once); `npx olp-keys list` / `revoke` for lifecycle management. Phase 2 functional scope is complete; close to v0.2.0 is maintainer-triggered per CLAUDE.md `release_kit.phase_close_trigger`. Tracked in [v1.x roadmap #2](./docs/v1x-roadmap.md).
+- **Multi-key auth + owner gating + keygen CLI shipped at v0.2.0 (D44 + D45 + D46 + D47).** `lib/keys.mjs` (core), `lib/audit.mjs` (audit), owner-vs-guest `/health` payload trimming + `X-OLP-Fallback-Detail` policy gating, `bin/olp-keys.mjs` (keygen CLI). All 11 ADR 0007 § 10 acceptance criteria covered. v0.2.0 maintainer-merged 2026-05-25.
+
+- **Phase 3 (Dashboard + audit query layer + rotation) shipped to main (D48-D54); v0.3.0 release pending.** `docs/adr/0008-dashboard-and-audit-query.md` ratified at D48. `lib/audit-query.mjs` (D49) implements the 5-function aggregate query API (in-memory ndjson scan, PII-guarded). 4 new owner-only_block endpoints at D50 (`/dashboard`, `/v0/management/dashboard-data`, `/v0/management/quota`, `/cache/stats`). `dashboard.html` full multi-panel UI at D51 (vanilla HTML+JS+fetch, 30s poll with visibilitychange pause). Daily audit rotation at D52 (synchronous on first append after UTC midnight; `audit-YYYY-MM-DD.ndjson` naming) + optional `bin/olp-audit-rotate.mjs` cron tool. `tried_providers` schema semantic fix at D53 (D45 P2 deferral). Phase 3 close to v0.3.0 is maintainer-triggered per CLAUDE.md `release_kit.phase_close_trigger`.
 
   **Bootstrap workflow (D47):** for first-run / production setup:
 
@@ -249,8 +252,9 @@ The original v0.1 spec (in `~/.cc-rules/memory/projects/olp_v0_1_spec.md` on the
 - **Phase 0** — Repo bootstrap, `ALIGNMENT.md`, founding ADRs, CI workflows, PR template. ✅ Shipped (2026-05-23).
 - **Phase 1** — Multi-provider proxy core: `server.mjs`, IR, three Tier-D provider plugins (Anthropic / OpenAI Codex / Mistral Vibe), cache (D1+D4) + cleanup (D2 bypass / D3 chunked replay / D23 size cap), fallback engine with first-chunk safety + hard triggers + per-hop log observability, IR↔OpenAI translation under Rule 2(b). ✅ Shipped — v0.1.0 (2026-05-24) + v0.1.1 cleanup (2026-05-25, D35–D42).
 - **Phase 2** — Multi-key auth (`lib/keys.mjs`) per ADR 0007: opaque OLP API keys, per-key cache namespacing, owner-vs-guest tier for header gating, audit ndjson (`lib/audit.mjs`), `/health` payload trimming + `X-OLP-Fallback-Detail` emission gating, `OLP_OWNER_TOKEN` env override, keygen CLI (`bin/olp-keys.mjs`). ✅ Shipped — v0.2.0 (2026-05-25, D43-A → D47). All 11 ADR 0007 § 10 acceptance criteria covered.
-- **Phase 3** — Dashboard (`dashboard.html`) + audit query layer (deferred from Phase 2). Owner-only multi-provider quota panels, fallback rate, cache hit rate; localhost-bound by default. **(next)**.
-- **Phase 4+** — v1.x roadmap items as triggered. Full deferred-work tracker: [`docs/v1x-roadmap.md`](./docs/v1x-roadmap.md). Includes streaming-path singleflight ([issue #16](https://github.com/dtzp555-max/olp/issues/16) + ADR 0005 Amendment 8 design ratified), soft-trigger reactivation (ADR 0004 Amendment 2), `/health` activeSpawns integration, provider-level `cacheKeyFields` mask, streaming-path SPAWN_FAILED salvage.
+- **Phase 3** — Dashboard + audit query layer + daily audit rotation per ADR 0008: in-memory ndjson aggregate query layer (`lib/audit-query.mjs`), 4 owner-only_block management endpoints (`/dashboard` + `/v0/management/dashboard-data` + `/v0/management/quota` + `/cache/stats`), multi-panel `dashboard.html` with 30s poll, synchronous daily audit rotation + `bin/olp-audit-rotate.mjs` cron tool, `tried_providers` schema fix (D45 P2 deferral). 🟡 In progress — D48 (ADR) + D49–D54 shipped to main 2026-05-25; v0.3.0 close awaits maintainer trigger.
+- **Phase 4 (planned)** — Per-key per-provider auth artifact mapping (ADR 0007 § 12 deferral), audit query rotation/retention policies, SQLite hybrid migration (ADR 0007 § 13 trigger), provider-cost weights for spend trend.
+- **Phase 4+ (v1.x roadmap, triggered as needed)** — Full deferred-work tracker: [`docs/v1x-roadmap.md`](./docs/v1x-roadmap.md). Includes streaming-path singleflight ([issue #16](https://github.com/dtzp555-max/olp/issues/16) + ADR 0005 Amendment 8 design ratified), soft-trigger reactivation (ADR 0004 Amendment 2), `/health` activeSpawns integration, provider-level `cacheKeyFields` mask, streaming-path SPAWN_FAILED salvage.
 - **Phase N (opt-in)** — Tier-2 / Tier-C provider plugins (Grok / Kimi / MiniMax / GLM / Qwen) per [ADR 0006](./docs/adr/0006-provider-inclusion.md); provider-native protocol endpoints; deterministic triggers. Triggered by tier-2 demand, not on the bootstrap path.
 
 Full spec (decision rationale, open questions, risks): `~/.cc-rules/memory/projects/olp_v0_1_spec.md` on the maintainer's workstations. Phase 2 kickoff handoff: `~/.cc-rules/memory/handoffs/2026-05-25-phase-2-kickoff.md`.

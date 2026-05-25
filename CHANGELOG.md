@@ -4,6 +4,23 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D54 — README Phase 3 polish (docs-only, no code change)
+
+Seventh Phase 3 D-day. Documentation polish ahead of Phase 3 close (D55, maintainer-triggered). Brings README status header / Implementation Status / API Endpoints / Known limitations / Phase plan up to date with Phase 3 work shipped to main through D48-D53.
+
+- **Status header**: `v0.2.0 shipped` → `v0.2.0 shipped; v0.3.0 in progress` + lists D48-D54 highlights.
+- **Implementation status note**: Phase 3 description updated from "next milestone" to "shipped to main through D54; v0.3.0 release pending maintainer-triggered close (D55)".
+- **Implementation Status table** — 4 row updates:
+  - `lib/audit.mjs`: 🟡 D45-only → ✅ D45 append + D52 rotation; describes both responsibilities.
+  - `lib/audit-query.mjs`: NEW row (D49 shipped, 5-function aggregate query API).
+  - `dashboard.html`: 📋 Planned (Phase 6) → ✅ Phase 3 shipped (D50 stub + D51 full UI); describes the 4 panels.
+  - `bin/olp-audit-rotate.mjs`: NEW row (D52 shipped, external cron tool).
+- **API Endpoints table** — `/cache/stats`, `/v0/management/quota`, `/dashboard` (Phase 6 📋 Planned → Phase 3 ✅ Shipped); new `/v0/management/dashboard-data` row; `/health` row clarified to spell out owner-only-trim semantic. Removed the "placeholder — full table lands" stub since the table is now substantively complete.
+- **Known limitations** — Phase 2 paragraph kept (now reads as historical Phase 2 completion note); new Phase 3 paragraph summarizing D48-D54 shipped + D55 close pending.
+- **Phase plan** — Phase 3 description (was "next") → "🟡 In progress — D48 (ADR) + D49–D54 shipped to main 2026-05-25; v0.3.0 close awaits maintainer trigger." Added Phase 4+ entry covering the deferred items (per-key per-provider auth, SQLite hybrid, audit rotation/retention policies, provider-cost weights).
+- **Test count:** 601 → 601 (docs-only).
+- **Authority:** CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; ADR 0008 § 13 sprint shape (D54 = "E2E + AGENTS / README polish"); standing autopilot grant.
+
 ### D53 — `tried_providers` schema semantic fix (D45 P2 deferral closed)
 
 Sixth Phase 3 D-day. Small focused fix for the D45 fresh-context opus reviewer P2 finding that was deferred: `auditCtx.tried_providers` on the `key_no_provider_access` 403 path was being stamped with the ORIGINAL chain (which was filtered out, never dispatched), distorting downstream audit queries like "which providers did key X actually call".

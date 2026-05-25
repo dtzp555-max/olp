@@ -100,7 +100,7 @@ Trigger types, fallback safety, idempotency rules, and the full example config l
 |---|---|---|---|---|
 | `/v1/chat/completions` | POST | 1 | ✅ Shipped | OpenAI-compatible Chat Completions entry. Internally normalized to IR, dispatched to a provider plugin, response shape converted back. |
 | `/v1/models` | GET | 1 | ✅ Shipped | Lists models from `models-registry.json`. |
-| `/health` | GET | 1 | ✅ Shipped | Per-provider health snapshot. Phase 2 owner-only-trim: full per-provider details to owner identity; trimmed `{ ok, version }` to guest / anonymous. Gate via `auth.owner_only_endpoints` config. |
+| `/health` | GET | 1 | ✅ Shipped | Per-provider health snapshot. Phase 2 owner-only-trim: full per-provider details to owner identity; trimmed `{ ok, version }` to guest / anonymous. Gate via `auth.owner_only_endpoints` config. **Optional `anonymousKey` field (D69 / Phase 4, v0.4.0)** appears in both trimmed and full payloads when `auth.advertise_anonymous_key: true` AND `auth.allow_anonymous: true` AND at least one non-revoked guest-tier key has `plaintext_advertise: true` (see [ADR 0011](./docs/adr/0011-anonymous-key-deployment-context.md) for the trusted-LAN-only invariant). Default off — field absent when prereqs unmet. |
 | `/dashboard` | GET | 3 | ✅ Shipped (D50 + D51) | Owner-only multi-provider dashboard HTML (4 panels: quota / 24h request stats / 30d spend trend / top fallback chains; 30s poll with visibilitychange pause). Owner-only_block; non-owner identities receive 401. Localhost-bound by default. |
 | `/v0/management/dashboard-data` | GET | 3 | ✅ Shipped (D50) | JSON aggregate consumed by the dashboard 30s poll: `{ generated_at, window_24h, cache_hit_24h, quota, spend_trend_30d, top_fallback_chains_24h, cache_stats }`. Owner-only_block. |
 | `/v0/management/quota` | GET | 3 | ✅ Shipped (D50) | Per-provider quota snapshot via `provider.quotaStatus()` (subset of dashboard-data; useful for scripted monitoring). Owner-only_block. |
@@ -118,6 +118,21 @@ _placeholder — full table lands per-phase as variables are introduced._
 | `OLP_CLAUDE_BIN` | `claude` (from PATH) | Override path to the `claude` binary (Anthropic provider). Useful when multiple `claude` installs are present. |
 | `OLP_CODEX_BIN` | `codex` (from PATH) | Override path to the `codex` binary (OpenAI provider). |
 | `OLP_VIBE_BIN` | `vibe` (from PATH) | Override path to the `vibe` binary (Mistral provider). |
+
+### `config.json` keys introduced at Phase 4
+
+These live in `~/.olp/config.json` (not env vars) — they're documented here alongside the env-var table for discoverability.
+
+| Config key | Default | Description |
+|---|---|---|
+| `streaming.heartbeat_interval_ms` | `0` (disabled) | D61 / Phase 4. SSE keepalive comment frames during stream-silent windows. Set `>0` (e.g. `15000` for 15s) when OLP runs behind nginx / Cloudflare / Tailscale Funnel with idle-abort timeouts. |
+| `auth.advertise_anonymous_key` | `false` | D69 / Phase 4. When `true`, surfaces an existing guest-tier key's plaintext via `/health.anonymousKey` so `olp-connect <ip>` can self-bootstrap clients on the LAN with zero out-of-band coordination. **Requires `auth.allow_anonymous: true` AND at least one key created via `olp-keys keygen --anonymous --advertise`.** Trusted-LAN-only — see [ADR 0011](./docs/adr/0011-anonymous-key-deployment-context.md). |
+
+### Operator CLI surfaces (Phase 4)
+
+- `olp` (Node CLI at `bin/olp.mjs`): `status / health / usage / models / cache / providers / chain show / logs / restart / keys / doctor`. Run `npx olp --help` for full subcommand reference. `olp doctor --json` emits a machine-readable `next_action.ai_executable[]` payload designed for AI agents to self-repair OLP. See [ADR 0010](./docs/adr/0010-phase-4-charter-operator-and-client-ux.md) § Phase 4 D-day plan and [ADR 0002 Amendment 7](./docs/adr/0002-plugin-architecture.md) (per-plugin `doctorChecks()` contract).
+- `olp-connect` (bash at `bin/olp-connect`): zero-config LAN client setup — detects Cline / Continue.dev / Cursor / Aider / Claude Code / OpenClaw and configures each. Run `bash bin/olp-connect --help`. Requires `python3` for JSON parsing.
+- `olp-keys keygen --anonymous --advertise`: creates a guest-tier key with the plaintext stored alongside its hash so `/health.anonymousKey` can publish it. Prints an explicit ADR-0011 warning at keygen time.
 
 ### Per-provider auth env vars
 

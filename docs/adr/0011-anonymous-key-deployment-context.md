@@ -95,6 +95,21 @@ Every other key (every existing key, and every newly-created key without
 `--advertise`) retains the ADR 0007 § 5 hash-only contract — `manifest.json`
 contains `token_hash` and NEVER `plaintext_advertise`.
 
+**Schema-version note (D69 reviewer P2-2).** This adds a new optional field
+to the manifest. Per ADR 0007 § 4 ("Increment `schema_version` on any
+non-additive change"), additive optional fields do NOT require a
+`schema_version` bump — older parsers ignore unknown fields per the same
+section's forward-compat rule. The manifest stays at `schema_version: 1`.
+Documented here so a future archaeologist asking "why didn't D69 bump
+`schema_version`?" has a one-line answer.
+
+**`listKeys()` redaction (D69 reviewer P2-1).** `lib/keys.mjs listKeys()`
+strips BOTH `token_hash` AND `plaintext_advertise` from its return value.
+Callers wanting the advertised plaintext for the `/health` publication
+path MUST go through `findAdvertisedKey()` — the only sanctioned read
+site. This protects against a future caller of `listKeys()` accidentally
+emitting the plaintext into logs / HTTP responses / dashboards.
+
 ### Tier restriction (guest only)
 
 `createKey()` rejects `plaintext_advertise: true` for `owner_tier: 'owner'`

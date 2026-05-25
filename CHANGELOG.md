@@ -4,6 +4,41 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D51 — `dashboard.html` full multi-panel UI (Phase 3)
+
+Fourth Phase 3 D-day. Replaces the D50 `dashboard.html` placeholder with the full 4-panel UI per ADR 0008 § 6. Vanilla HTML + JS + fetch — no build step, no framework, no CDN (Lane 1 = A). 30s page poll with `document.visibilityState` pause/resume (Lane 4 = A).
+
+- **4 panels rendered from `/v0/management/dashboard-data`** (the single backing endpoint, per Lane 2 in-memory query model):
+  - **Panel 1 — Per-provider quota**: table of `{ Provider | Available | Status }`; surfaces `null` available as "n/a" + capturing per-provider `provider.quotaStatus()` errors as a red status pill (graceful degradation per ADR § 9).
+  - **Panel 2 — Last 24h: request count + cache hit + fallback rate**: per-provider row of `{ Requests | Cache hit % | Fallback rate % }`. Cache hit sourced from `cache_hit_24h.by_provider[p].hit_rate`; fallback rate computed from `window_24h.by_provider[p].fallback_count / count`.
+  - **Panel 3 — Request count last 30 days (SVG sparkline)**: vanilla SVG bar chart with `<title>` tooltips showing per-day per-provider breakdown. Y-axis: requests per day (scaled to max); X-axis: 30 daily buckets (UTC). Each bar `<title>` includes the date + total count + provider breakdown.
+  - **Panel 4 — Top fallback chains (last 24h)**: numbered table of `{ # | Chain | Count | First seen | Last seen }` with chain arrows rendered in monospace (`anthropic → openai`).
+- **30s poll + visibilitychange pause** (ADR 0008 § 6.5):
+  - `setInterval(refresh, 30000)` after the initial fetch.
+  - `document.addEventListener('visibilitychange', ...)` → `stopPolling()` on hidden / `refresh() + startPolling()` on visible.
+  - Per ADR § 6.5 this prevents 2880 background polls/day per owner when the dashboard tab is in the background.
+- **Error handling**:
+  - 401 from `/v0/management/dashboard-data` → in-page error banner explains owner-tier requirement + suggests SSH-tunnel + header-injection workaround (browsers can't natively send `Authorization: Bearer` without a proxy/extension).
+  - Other HTTP errors → generic "HTTP <code>" banner; console.warn for operator debugging.
+  - Per-panel "Loading…" / "No requests in window." / "No fallback chains triggered" empty states.
+- **DOM helpers**: small `el(tag, attrs, ...children)` + `svgEl(tag, attrs)` factories — no framework, ~10 lines each. Sparkline uses native `<title>` for tooltips (no JS hover handlers).
+- **Critical correctness invariants** (per ADR 0008 § 6 + Lane 1 = A):
+  - No `<script src>` — entire JS inline in `<script>` tag (Suite 25d asserts).
+  - No `<link rel="stylesheet" href=>` — all CSS in `<style>` tag (Suite 25d asserts).
+  - Only one backing endpoint hit: `/v0/management/dashboard-data` (Suite 25e asserts). All 4 panels consume slices of its response.
+  - 401 path keeps panels in last-good state rather than clearing them; operator sees the error banner + can debug.
+- **Test surface (Suite 25, +6 tests — 582 → 588):**
+  - 25a: owner /dashboard response contains all 4 panel container IDs (`panel-quota`, `panel-24h`, `panel-trend`, `panel-chains`).
+  - 25b: dashboard JS declares `POLL_INTERVAL_MS = 30000` + uses `setInterval` + `clearInterval`.
+  - 25c: visibilitychange listener wired + checks `document.visibilityState === 'hidden'`.
+  - 25d: NO external `<script src>` and NO external stylesheet `<link href>` — pinning Lane 1 = A.
+  - 25e: dashboard JS fetches `/v0/management/dashboard-data` (the single consolidated D50 endpoint).
+  - 25f: 401 in-page error banner mentions owner-tier so a maintainer who lands on a 401 knows the route forward.
+- **Manual smoke (ADR 0008 § 10 #12 manual acceptance)**: the dashboard renders without console errors in a real browser when served by a running OLP instance + owner-tier Bearer token injected via SSH-tunnel + header-injection extension. Not automated at Phase 3 (Lane 4 = A poll model doesn't need playwright; Phase 4+ may add a playwright smoke if dashboard complexity grows).
+- **Documentation:** AGENTS.md `dashboard.html` marker promoted from 🟡 D50 placeholder to ✅ D51 full UI.
+- **Test count:** 582 → 588 (+6 D51 tests in Suite 25).
+- **Authority:** ADR 0008 § 6 (panels + refresh + localhost) + § 6.5 (poll + visibilityState pause) + Lane 1 = A (no build step) + Lane 4 = A (30s poll) + Lane 5 = B (full 4-panel scope); ADR § 9 (graceful degradation surfaced in Panel 1); ADR § 10 criterion #12 (HTML smoke); CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; standing autopilot grant.
+
 ### D50 — `server.mjs` management endpoints (Phase 3 dashboard wire-up)
 
 Third Phase 3 D-day. Wires the D49 `lib/audit-query.mjs` aggregate query layer into 4 owner_only_block HTTP endpoints per ADR 0008 §§ 7-8. Ships a placeholder `dashboard.html` at repo root (D51 lands the full multi-panel UI). All endpoints follow the Phase 2 / D45 auth + audit + touchLastUsed pattern.

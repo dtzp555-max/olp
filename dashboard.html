@@ -1,17 +1,20 @@
 <!DOCTYPE html>
 <!--
-  OLP Dashboard — Phase 3 / D50 PLACEHOLDER
-  -------------------------------------------
-  This file is a stub shipped at D50 to wire the /dashboard route. D51 lands
-  the real multi-panel dashboard per ADR 0008 §6 (quota / per-provider 24h
-  counts / 30d spend trend / top fallback chains).
+  OLP Dashboard — Phase 3 / D51
+  ------------------------------
+  Multi-panel owner-only dashboard per ADR 0008 § 6. Polls
+  /v0/management/dashboard-data every 30 seconds (paused when the
+  page is hidden via document.visibilityState).
 
-  At D50, /dashboard returns this placeholder for owner-tier identities;
-  non-owner / unauth identities receive 401 (owner_only_block per ADR 0008
-  §8). The 3 backing endpoints (/v0/management/dashboard-data,
-  /v0/management/quota, /cache/stats) are live + return real data; you can
-  curl them directly with an owner-tier Bearer token to see the JSON
-  shapes that D51 will render.
+  Panels (per spec v0.1 § 4.6 + ADR 0008 Lane 5 = B full):
+    1. Per-provider quota / credit pool
+    2. Per-provider 24h request count + cache hit rate + fallback rate
+    3. 30-day spend trend (SVG sparkline; per-provider in tooltip)
+    4. Top 10 fallback chains by trigger count
+
+  No build step, no framework, no external dependencies. Vanilla JS +
+  fetch + DOM render. Owner-only_block: anonymous / guest / no-auth all
+  receive 401 — non-owner identities will see an error banner.
 -->
 <html lang="en">
 <head>
@@ -19,36 +22,287 @@
 <title>OLP Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; max-width: 720px; color: #222; }
-  h1 { margin-top: 0; }
-  code, pre { background: #f4f4f4; padding: 0.15em 0.4em; border-radius: 3px; font-size: 0.95em; }
-  pre { padding: 0.6em 0.8em; overflow-x: auto; }
-  .stub { background: #fff8e1; border-left: 4px solid #ffb300; padding: 1em 1.2em; margin: 1em 0; }
-  ul { padding-left: 1.2em; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 1.5rem; background: #f9fafb; color: #1f2937; }
+  h1 { margin: 0 0 0.5rem; font-size: 1.5rem; }
+  .meta { color: #6b7280; font-size: 0.875rem; margin-bottom: 1.5rem; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; max-width: 1200px; }
+  .panel { background: #fff; border: 1px solid #e5e7eb; border-radius: 6px; padding: 1rem 1.25rem; }
+  .panel h2 { margin: 0 0 0.75rem; font-size: 1rem; color: #374151; font-weight: 600; }
+  .panel-error { color: #b91c1c; font-style: italic; padding: 0.5rem 0; }
+  .panel-loading { color: #6b7280; font-style: italic; padding: 0.5rem 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #f3f4f6; }
+  th { font-weight: 600; color: #4b5563; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .banner { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 0.75rem 1rem; border-radius: 4px; margin-bottom: 1rem; }
+  .banner.error { background: #fee2e2; border-color: #ef4444; color: #991b1b; }
+  .sparkline { width: 100%; height: 120px; }
+  .sparkline rect { fill: #3b82f6; }
+  .sparkline rect:hover { fill: #1d4ed8; }
+  .chain { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.85rem; color: #374151; }
+  .pill { display: inline-block; background: #e5e7eb; color: #374151; padding: 0.05rem 0.4rem; border-radius: 3px; font-size: 0.75rem; }
+  footer { margin-top: 2rem; color: #9ca3af; font-size: 0.75rem; text-align: center; }
 </style>
 </head>
 <body>
 <h1>OLP Dashboard</h1>
-<p class="stub">
-  <strong>D50 placeholder.</strong> The full dashboard UI lands at D51 per
-  <a href="https://github.com/dtzp555-max/olp/blob/main/docs/adr/0008-dashboard-and-audit-query.md">ADR 0008</a> § 6.
-  The three management endpoints are already live and serving real data — you can
-  curl them with an owner-tier Bearer token to preview the JSON shapes D51 will render.
-</p>
-<h2>Backing endpoints (live at D50)</h2>
-<ul>
-  <li><code>GET /v0/management/dashboard-data</code> — full aggregate (quota + 24h request stats + 30d spend trend + top fallback chains).</li>
-  <li><code>GET /v0/management/quota</code> — per-provider quota snapshot only.</li>
-  <li><code>GET /cache/stats</code> — live in-memory CacheStore stats.</li>
-</ul>
-<h2>Auth</h2>
-<p>
-  All <code>/dashboard</code> and <code>/v0/management/*</code> + <code>/cache/stats</code> endpoints are
-  <code>owner_only_block</code> per ADR 0007 § 7 + ADR 0008 § 8. Non-owner identities
-  (including anonymous when <code>allow_anonymous: true</code>) receive <code>401</code>.
-</p>
-<h2>Example request</h2>
-<pre>curl -H "Authorization: Bearer olp_..." http://localhost:3456/v0/management/dashboard-data</pre>
-<p style="color: #666; font-size: 0.9em;">— shipped at D50 (Phase 3); replaced at D51.</p>
+<div id="meta" class="meta">Loading…</div>
+<div id="banner-slot"></div>
+<div class="grid">
+  <section class="panel">
+    <h2>Quota (per provider)</h2>
+    <div id="panel-quota"><div class="panel-loading">Loading…</div></div>
+  </section>
+  <section class="panel">
+    <h2>Last 24h — request count · cache hit · fallback rate</h2>
+    <div id="panel-24h"><div class="panel-loading">Loading…</div></div>
+  </section>
+  <section class="panel" style="grid-column: span 2;">
+    <h2>Request count — last 30 days (UTC)</h2>
+    <div id="panel-trend"><div class="panel-loading">Loading…</div></div>
+  </section>
+  <section class="panel" style="grid-column: span 2;">
+    <h2>Top fallback chains (last 24h)</h2>
+    <div id="panel-chains"><div class="panel-loading">Loading…</div></div>
+  </section>
+</div>
+<footer>OLP Dashboard · poll every 30s · paused when tab hidden · v0.3.0-phase3</footer>
+<script>
+(function () {
+  'use strict';
+  const POLL_INTERVAL_MS = 30000;
+  let pollHandle = null;
+
+  function fmtNum(n) { return (n ?? 0).toLocaleString(); }
+  function fmtPct(rate) { return (rate * 100).toFixed(1) + '%'; }
+  function el(tag, attrs, ...children) {
+    const node = document.createElement(tag);
+    if (attrs) for (const [k, v] of Object.entries(attrs)) {
+      if (k === 'class') node.className = v;
+      else if (k === 'style') node.style.cssText = v;
+      else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
+      else node.setAttribute(k, v);
+    }
+    for (const c of children) {
+      if (c == null) continue;
+      node.appendChild(typeof c === 'string' || typeof c === 'number' ? document.createTextNode(String(c)) : c);
+    }
+    return node;
+  }
+
+  function svgEl(tag, attrs) {
+    const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    if (attrs) for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+    return node;
+  }
+
+  function renderQuota(data) {
+    const target = document.getElementById('panel-quota');
+    target.innerHTML = '';
+    if (!Array.isArray(data) || data.length === 0) {
+      target.appendChild(el('div', { class: 'panel-loading' }, 'No providers enabled.'));
+      return;
+    }
+    const table = el('table', null,
+      el('thead', null, el('tr', null,
+        el('th', null, 'Provider'),
+        el('th', null, 'Available'),
+        el('th', null, 'Status'),
+      )),
+    );
+    const tbody = el('tbody');
+    for (const row of data) {
+      const available = row.error ? el('span', { class: 'pill' }, 'unavailable')
+        : row.available === null || row.available === undefined ? el('span', { class: 'pill' }, 'n/a')
+        : el('span', null, fmtNum(row.available));
+      const status = row.error ? el('span', { style: 'color: #b91c1c;' }, row.error)
+        : row.available === null || row.available === undefined ? 'no quota API'
+        : 'ok';
+      tbody.appendChild(el('tr', null,
+        el('td', null, row.provider),
+        el('td', { class: 'num' }, available),
+        el('td', null, status),
+      ));
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
+  }
+
+  function render24h(window24h, cacheHit24h) {
+    const target = document.getElementById('panel-24h');
+    target.innerHTML = '';
+    const byProvider = (window24h && window24h.by_provider) || {};
+    const providers = Object.keys(byProvider);
+    if (providers.length === 0) {
+      target.appendChild(el('div', { class: 'panel-loading' }, 'No requests in window.'));
+      return;
+    }
+    const table = el('table', null,
+      el('thead', null, el('tr', null,
+        el('th', null, 'Provider'),
+        el('th', null, 'Requests'),
+        el('th', null, 'Cache hit'),
+        el('th', null, 'Fallback rate'),
+      )),
+    );
+    const tbody = el('tbody');
+    for (const p of providers) {
+      const pData = byProvider[p];
+      const hitData = (cacheHit24h && cacheHit24h.by_provider && cacheHit24h.by_provider[p]) || null;
+      const fallbackRate = pData.count > 0 ? pData.fallback_count / pData.count : 0;
+      tbody.appendChild(el('tr', null,
+        el('td', null, p),
+        el('td', { class: 'num' }, fmtNum(pData.count)),
+        el('td', { class: 'num' }, hitData ? fmtPct(hitData.hit_rate) : 'n/a'),
+        el('td', { class: 'num' }, fmtPct(fallbackRate)),
+      ));
+    }
+    table.appendChild(tbody);
+    target.appendChild(table);
+  }
+
+  function renderTrend(spendTrend30d) {
+    const target = document.getElementById('panel-trend');
+    target.innerHTML = '';
+    if (!Array.isArray(spendTrend30d) || spendTrend30d.length === 0) {
+      target.appendChild(el('div', { class: 'panel-loading' }, 'No trend data.'));
+      return;
+    }
+    const counts = spendTrend30d.map(d => d.request_count);
+    const maxCount = Math.max(1, ...counts);
+    const width = 800, height = 120, padding = { top: 8, right: 8, bottom: 20, left: 32 };
+    const innerW = width - padding.left - padding.right;
+    const innerH = height - padding.top - padding.bottom;
+    const barGap = 2;
+    const barW = (innerW - barGap * (spendTrend30d.length - 1)) / spendTrend30d.length;
+    const svg = svgEl('svg', { class: 'sparkline', viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: 'xMidYMid meet' });
+    for (let i = 0; i < spendTrend30d.length; i++) {
+      const d = spendTrend30d[i];
+      const h = (d.request_count / maxCount) * innerH;
+      const x = padding.left + i * (barW + barGap);
+      const y = padding.top + innerH - h;
+      const rect = svgEl('rect', { x, y, width: barW, height: Math.max(1, h) });
+      const providerBreakdown = Object.entries(d.by_provider || {}).map(([p, n]) => `${p}: ${n}`).join(', ');
+      const title = svgEl('title');
+      title.textContent = `${d.date} — ${fmtNum(d.request_count)} requests${providerBreakdown ? ' (' + providerBreakdown + ')' : ''}`;
+      rect.appendChild(title);
+      svg.appendChild(rect);
+    }
+    // Y-axis labels (max + min)
+    const maxLabel = svgEl('text', { x: 4, y: padding.top + 10, 'font-size': 10, fill: '#6b7280' });
+    maxLabel.textContent = fmtNum(maxCount);
+    svg.appendChild(maxLabel);
+    const minLabel = svgEl('text', { x: 4, y: height - 4, 'font-size': 10, fill: '#6b7280' });
+    minLabel.textContent = '0';
+    svg.appendChild(minLabel);
+    // Date labels (first + last only at v0.3.0; mid labels deferred — added if needed by Phase 4 UX feedback)
+    if (spendTrend30d.length > 0) {
+      const firstDate = svgEl('text', { x: padding.left, y: height - 4, 'font-size': 10, fill: '#6b7280' });
+      firstDate.textContent = spendTrend30d[0].date.slice(5);
+      svg.appendChild(firstDate);
+      const lastDate = svgEl('text', { x: width - padding.right - 28, y: height - 4, 'font-size': 10, fill: '#6b7280' });
+      lastDate.textContent = spendTrend30d[spendTrend30d.length - 1].date.slice(5);
+      svg.appendChild(lastDate);
+    }
+    target.appendChild(svg);
+    target.appendChild(el('div', { class: 'meta', style: 'margin-top: 0.5rem; font-size: 0.8rem;' },
+      'Hover bars for per-day provider breakdown · y-axis: requests per day (max ' + fmtNum(maxCount) + ')'));
+  }
+
+  function renderChains(chains) {
+    const target = document.getElementById('panel-chains');
+    target.innerHTML = '';
+    if (!Array.isArray(chains) || chains.length === 0) {
+      target.appendChild(el('div', { class: 'panel-loading' }, 'No fallback chains triggered in window.'));
+      return;
+    }
+    const table = el('table', null,
+      el('thead', null, el('tr', null,
+        el('th', null, '#'),
+        el('th', null, 'Chain'),
+        el('th', null, 'Count'),
+        el('th', null, 'First seen'),
+        el('th', null, 'Last seen'),
+      )),
+    );
+    const tbody = el('tbody');
+    chains.forEach((c, i) => {
+      tbody.appendChild(el('tr', null,
+        el('td', { class: 'num' }, String(i + 1)),
+        el('td', null, el('span', { class: 'chain' }, c.chain.join(' → '))),
+        el('td', { class: 'num' }, fmtNum(c.count)),
+        el('td', null, c.first_seen || ''),
+        el('td', null, c.last_seen || ''),
+      ));
+    });
+    table.appendChild(tbody);
+    target.appendChild(table);
+  }
+
+  function showError(message) {
+    const slot = document.getElementById('banner-slot');
+    slot.innerHTML = '';
+    slot.appendChild(el('div', { class: 'banner error' }, message));
+  }
+
+  function clearError() {
+    document.getElementById('banner-slot').innerHTML = '';
+  }
+
+  async function fetchDashboardData() {
+    const res = await fetch('/v0/management/dashboard-data', {
+      headers: { 'Accept': 'application/json' },
+      credentials: 'same-origin',
+    });
+    if (res.status === 401) {
+      showError('401 — owner-tier OLP key required. The dashboard is owner-only_block (ADR 0008 §8). Pass `Authorization: Bearer <owner-token>` via a proxy/extension; OLP itself doesn\'t accept browser cookies. Common path: SSH-tunnel + curl + tee the dashboard-data JSON, OR use a browser extension that adds the header.');
+      throw new Error('owner_required');
+    }
+    if (!res.ok) {
+      showError('Dashboard data fetch failed: HTTP ' + res.status);
+      throw new Error('http_' + res.status);
+    }
+    return await res.json();
+  }
+
+  async function refresh() {
+    try {
+      const data = await fetchDashboardData();
+      clearError();
+      const generated = data.generated_at ? new Date(data.generated_at) : new Date();
+      document.getElementById('meta').textContent =
+        'Last refresh: ' + generated.toLocaleString() + ' · next in ~30s';
+      renderQuota(data.quota);
+      render24h(data.window_24h, data.cache_hit_24h);
+      renderTrend(data.spend_trend_30d);
+      renderChains(data.top_fallback_chains_24h);
+    } catch (err) {
+      // Error banner already shown by fetchDashboardData; keep panels in
+      // their last-good state. Console for operator debugging.
+      console.warn('OLP dashboard refresh failed:', err.message);
+    }
+  }
+
+  function startPolling() {
+    if (pollHandle !== null) return;
+    pollHandle = setInterval(refresh, POLL_INTERVAL_MS);
+  }
+  function stopPolling() {
+    if (pollHandle === null) return;
+    clearInterval(pollHandle);
+    pollHandle = null;
+  }
+
+  // Pause when tab hidden, resume on visible (ADR 0008 § 6.5).
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') stopPolling();
+    else { refresh(); startPolling(); }
+  });
+
+  // Initial fetch + start poll.
+  refresh().finally(startPolling);
+})();
+</script>
 </body>
 </html>

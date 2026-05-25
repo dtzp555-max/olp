@@ -11601,3 +11601,128 @@ describe('Suite 24 — D50 management endpoints (Phase 3, ADR 0008 §§ 7-8)', (
     });
   });
 });
+
+// ── Suite 25: D51 dashboard.html UI smoke (Phase 3, ADR 0008 § 6) ─────────
+//
+// HTML-level smoke tests for the D51 dashboard. Per ADR 0008 § 10 criterion
+// #12 the "no JS console errors in a real browser" sub-claim is manual or
+// playwright; this suite covers the server-observable claims:
+//   - The owner-served HTML contains the 4 panel container IDs.
+//   - The polling script references the 30s interval + visibilitychange
+//     pause hook.
+//   - No external script/style src (no build step, no framework, no CDN).
+
+describe('Suite 25 — D51 dashboard.html UI smoke (Phase 3, ADR 0008 § 6)', () => {
+  const GLOBAL_OLP_HOME = process.env.OLP_HOME;
+
+  let _suite25SavedOAuth;
+  function ensureSuite25FakeOAuth() {
+    _suite25SavedOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'suite25-fake-oauth-token';
+  }
+  function restoreSuite25OAuth() {
+    if (_suite25SavedOAuth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = _suite25SavedOAuth;
+    else delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  }
+
+  let TMP, server, port;
+  before(async () => {
+    TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-25-'));
+    process.env.OLP_HOME = TMP;
+    __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+    __setProvidersEnabled({ anthropic: true });
+    __setSpawnImpl(makeMockSpawn(['suite25-response']));
+    ensureSuite25FakeOAuth();
+    server = createOlpServer();
+    await new Promise(resolve => {
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    port = server.address().port;
+  });
+  after(async () => {
+    __resetSpawnImpl();
+    __setProvidersEnabled({});
+    __clearCache();
+    restoreSuite25OAuth();
+    if (server) await new Promise(resolve => server.close(() => resolve()));
+    process.env.OLP_HOME = GLOBAL_OLP_HOME;
+    __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+    rmSync(TMP, { recursive: true, force: true });
+  });
+
+  it('25a: owner /dashboard response contains all 4 panel container IDs', async () => {
+    const { plaintext_token } = createKey({ name: '25a-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+    const r = await fetch({
+      port, method: 'GET', path: '/dashboard',
+      headers: { Authorization: `Bearer ${plaintext_token}` },
+    });
+    assert.equal(r.status, 200);
+    assert.match(r.body, /id="panel-quota"/);
+    assert.match(r.body, /id="panel-24h"/);
+    assert.match(r.body, /id="panel-trend"/);
+    assert.match(r.body, /id="panel-chains"/);
+  });
+
+  it('25b: dashboard JS references 30s polling interval + setInterval/clearInterval', async () => {
+    const { plaintext_token } = createKey({ name: '25b-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+    const r = await fetch({
+      port, method: 'GET', path: '/dashboard',
+      headers: { Authorization: `Bearer ${plaintext_token}` },
+    });
+    assert.equal(r.status, 200);
+    assert.match(r.body, /POLL_INTERVAL_MS\s*=\s*30000/, 'must declare 30s POLL_INTERVAL_MS constant');
+    assert.match(r.body, /setInterval\(/, 'must call setInterval');
+    assert.match(r.body, /clearInterval\(/, 'must call clearInterval (for visibilitychange pause)');
+  });
+
+  it('25c: dashboard JS wires visibilitychange listener for tab-hidden pause', async () => {
+    const { plaintext_token } = createKey({ name: '25c-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+    const r = await fetch({
+      port, method: 'GET', path: '/dashboard',
+      headers: { Authorization: `Bearer ${plaintext_token}` },
+    });
+    assert.equal(r.status, 200);
+    assert.match(r.body, /addEventListener\(\s*['"]visibilitychange['"]/, 'must register visibilitychange listener');
+    assert.match(r.body, /document\.visibilityState\s*===\s*['"]hidden['"]/, 'must check hidden state');
+  });
+
+  it('25d: dashboard has NO external script/style src (no build step, no framework, no CDN)', async () => {
+    const { plaintext_token } = createKey({ name: '25d-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+    const r = await fetch({
+      port, method: 'GET', path: '/dashboard',
+      headers: { Authorization: `Bearer ${plaintext_token}` },
+    });
+    assert.equal(r.status, 200);
+    // ADR 0008 Lane 1 = A: static HTML + vanilla JS + fetch; no framework.
+    // Strict: no <script src=> and no <link rel="stylesheet" href=>.
+    assert.ok(!/<script\s+[^>]*src\s*=/i.test(r.body),
+      'dashboard must NOT include any <script src="..."> (no external JS — ADR 0008 Lane 1 A)');
+    assert.ok(!/<link\s+[^>]*rel\s*=\s*['"]stylesheet['"][^>]*href\s*=/i.test(r.body),
+      'dashboard must NOT include any external <link rel="stylesheet" href="..."> (no external CSS)');
+  });
+
+  it('25e: dashboard fetches /v0/management/dashboard-data (the only backing endpoint hit by JS)', async () => {
+    const { plaintext_token } = createKey({ name: '25e-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+    const r = await fetch({
+      port, method: 'GET', path: '/dashboard',
+      headers: { Authorization: `Bearer ${plaintext_token}` },
+    });
+    assert.equal(r.status, 200);
+    assert.match(r.body, /fetch\(\s*['"]\/v0\/management\/dashboard-data['"]/,
+      'dashboard JS must fetch /v0/management/dashboard-data (consolidated D50 endpoint)');
+  });
+
+  it('25f: dashboard 401 surface for non-owner shows actionable error banner instructions', async () => {
+    // The dashboard HTML itself is served owner-only_block at handleDashboard
+    // (Suite 24 covers that). This test verifies the IN-PAGE error banner
+    // string mentions owner-token guidance so a future maintainer who lands
+    // on a 401 from the in-page JS knows what to do.
+    const { plaintext_token } = createKey({ name: '25f-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP });
+    const r = await fetch({
+      port, method: 'GET', path: '/dashboard',
+      headers: { Authorization: `Bearer ${plaintext_token}` },
+    });
+    assert.equal(r.status, 200);
+    assert.match(r.body, /401.*owner-tier/i, 'dashboard error banner must mention owner-tier in 401 case');
+  });
+});

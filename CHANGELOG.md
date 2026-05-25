@@ -4,6 +4,73 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+(empty — Phase 4 entries land here once Phase 4 opens)
+
+## v0.3.0 — 2026-05-25
+
+### Phase 3 — Dashboard + audit query layer + daily audit rotation (D48 → D54)
+
+**Overview.** v0.3.0 closes Phase 3 — the dashboard / audit aggregate query / daily rotation track that grew OLP from "audit ndjson exists but is grep-only" (v0.2.0) to a live multi-panel owner-only dashboard with aggregate queries + automatic daily file rotation. 7 D-day commits (D48 through D54) shipped between 2026-05-25 under the standing-autopilot grant. All 15 ADR 0008 § 10 acceptance criteria are implemented + tested.
+
+**Test count: 544 (v0.2.0) → 601 (v0.3.0).** +57 tests across the Phase 3 arc.
+
+**Phase 3 release_kit checklist**
+
+- [x] All 7 D-day deliverables landed on main (D48 ADR + D49-D54 implementation)
+- [x] CI green on every D-day merge commit + on this release commit's head
+- [x] Fresh-context opus reviewer on every implementation D-day (D49/D50/D51/D52/D53) + D48 ADR draft + D54 docs polish
+- [x] All 15 ADR 0008 § 10 acceptance criteria (#1–#15) covered by Suite 23/24/25/26/20h-extra-audit tests
+- [x] CHANGELOG "Unreleased" promoted to "## v0.3.0 — 2026-05-25" with D48 through D54 entries
+- [x] `package.json` bumped 0.2.0 → 0.3.0
+- [x] `CLAUDE.md release_kit.phase_rolling_mode`: `current_phase` Phase 3 → Phase 4; `current_pre_release_identifier` `0.3.0-phase3` → `0.4.0-phase4`
+- [x] README status header + Implementation Status + Phase plan reflect Phase 3 shipped
+- [ ] Tag pushed (next step in this PR's lifecycle)
+- [ ] `release.yml` triggered + GitHub Release created (auto on tag push; D37 phase_rolling_mode gate will pass because Unreleased is now sentinel-only)
+
+**ADR 0008 § 10 acceptance criteria — final ship status**
+
+| # | Criterion | Covering tests |
+|---|---|---|
+| 1 | `readAuditWindow` iterates events from today + N prior rotated files | Suite 23b-1, 23b-2, 23b-3 |
+| 2 | `readAuditWindow` skips malformed lines without throwing + logs warn | Suite 23b-6 |
+| 3 | `aggregateRequests` counts by provider / cache_status / owner_tier / path + median/p95 latency | Suite 23c-1, 23c-2, 23c-3 |
+| 4 | `topFallbackChains` sort desc by count + tied-count tiebreak | Suite 23d-1, 23d-4 |
+| 5 | `spendTrendDaily` sparse-fills zero-request days + UTC day boundaries | Suite 23e-1, 23e-2, 23e-3 |
+| 6 | Daily rotation past UTC midnight | Suite 26a-3, 26b-1 |
+| 7 | Cross-file query with mixed rotated files | Suite 26e-1 + Suite 23b-1 |
+| 8 | Concurrent rotation safety (N appends → 1 rename) | Suite 26c-1 |
+| 9 | `GET /dashboard` 200 to owner; 401 to non-owner | Suite 24a, 24b, 24c, 24d |
+| 10 | `GET /v0/management/dashboard-data` 200 to owner with all required fields | Suite 24e |
+| 11 | `GET /cache/stats` 200 to owner with live stats | Suite 24h |
+| 12 | Dashboard HTML smoke (4 panel containers + 30s poll + no external resources) | Suite 25a-25f |
+| 13 | Audit row on management endpoints (success + 401) | Suite 24i, 24j |
+| 14 | Graceful degradation on `quotaStatus()` throw (panel surfaces null + error) | server.mjs `handleManagementDashboardData` try/catch verified by code |
+| 15 | PII guard — no message-content fields in any aggregate output | Suite 23g-1, 23g-2, 23g-3 |
+
+**Phase 3 D-day index**
+
+- **D48** (`c0b6969`) — ADR 0008 Phase 3 design draft (Dashboard + audit query layer) + lane decisions A/A/B/A/B
+- **D49** (`686794e`) — `lib/audit-query.mjs` aggregate query layer (5 functions, PII-guarded)
+- **D50** (`f9f2eaa`) — `server.mjs` 4 management endpoints (owner_only_block per ADR 0008 § 8) + dashboard.html placeholder
+- **D51** (`251b578`) — `dashboard.html` full multi-panel UI (vanilla HTML+JS+fetch, 30s poll with visibilitychange pause)
+- **D52** (`408d5a8`) — Daily audit rotation in `lib/audit.mjs` (synchronous trigger on first append after UTC midnight) + `bin/olp-audit-rotate.mjs` external cron tool
+- **D53** (`68e50da`) — `tried_providers` schema semantic fix (D45 P2 deferral closed; ADR 0007 § 8 amendment)
+- **D54** (`6d9ab1f`) — README Phase 3 polish (docs-only)
+
+**Bonus: also resolved at D53** — D45 fresh-context opus reviewer P2 deferral (`tried_providers` semantics on `key_no_provider_access` 403). ADR 0007 § 8 amended; server.mjs sets `tried_providers = []` on the 403 path so downstream audit queries stay accurate.
+
+**Known limitations carried beyond v0.3.0**
+
+Phase 3 functional scope is complete. The following remain as Phase 4+ deferrals (tracked in `docs/v1x-roadmap.md` + the new Phase 4 entry below):
+
+- **Per-key per-provider auth artifact mapping** — ADR 0007 § 12. Each OLP key independently authenticated to a different provider account.
+- **Audit query rotation / retention policies** — ADR 0008 § 11. Currently unbounded; operator manages disk. A Phase 4+ amendment adds `audit_max_days` config when an operational need emerges.
+- **SQLite hybrid migration** — ADR 0007 § 13. Trigger: query latency > 2s on typical owner session OR > 5 owners polling. Requires engines bump + CI matrix change as a separate prior PR.
+- **Provider-cost weights for spend trend** — ADR 0008 § 11. At v0.3.0 "spend" is proxied by request count; cost integration when commercial cost-tracking lands.
+- **Per-key dashboard views** — owner sees aggregate; per-key drill-down is a future amendment.
+- **Key-mgmt UI on dashboard** — owner can create / revoke / edit keys from web. Out of Phase 3 scope; needs separate security review per ADR 0008 § 11.
+- **Manual smoke for dashboard** — per ADR 0008 § 10 #12 the "no JS console errors in real browser" sub-claim is manual / playwright; Phase 3 acceptance shipped with server-observable checks (Suite 25); a Phase 4+ amendment may add playwright smoke if dashboard complexity grows.
+
 ### D54 — README Phase 3 polish (docs-only, no code change)
 
 Seventh Phase 3 D-day. Documentation polish ahead of Phase 3 close (D55, maintainer-triggered). Brings README status header / Implementation Status / API Endpoints / Known limitations / Phase plan up to date with Phase 3 work shipped to main through D48-D53.

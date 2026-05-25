@@ -4,6 +4,33 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### D49 — `lib/audit-query.mjs` audit aggregate query layer (Phase 3)
+
+Second Phase 3 D-day. Implements ADR 0008 § 4 query API. Pure in-memory ndjson scan; cross-file walk over `audit.ndjson` (live) + `audit-YYYY-MM-DD.ndjson` (rotated). No server.mjs integration in this D-day (D50 wires the consuming endpoints).
+
+- **New file `lib/audit-query.mjs`** (~370 lines): 5 public API functions per ADR 0008 § 4.1:
+  - `discoverAuditFiles({ olpHome })` — filesystem scan; returns `Map<date|'live', path>`.
+  - `readAuditWindow({ startMs, endMs, olpHome, logEvent })` — generator over events in half-open window [startMs, endMs). Walks rotated date files + live file. Skips malformed lines + logs warn.
+  - `aggregateRequests({ windowMs, olpHome })` — counts + status buckets + by_provider + by_owner_tier + by_path + median/p95 latency over rolling window.
+  - `topFallbackChains({ windowMs, limit, olpHome })` — top-N chains by trigger count from events with `fallback_hops > 0`. Tied-count tiebreak: ascending first_seen.
+  - `spendTrendDaily({ days, olpHome })` — daily series ending today with sparse-fill for zero-request days. Per-day request_count + median latency + by_provider breakdown.
+  - `cacheHitRateWindow({ windowMs, olpHome })` — audit-derived cache hit rate (bypass excluded from denominator); per-provider + overall.
+- **PII discipline** (ADR 0008 § 4.3): every aggregate function relays only schema fields; never message content. Suite 23g actively asserts the absence of `content`/`message`/`messages`/`prompt`/`response`/`body` keys in every aggregate output.
+- **Cross-file walk semantics** (ADR 0008 § 4.2): half-open window [startMs, endMs); date-range computed once from window bounds; each rotated date file checked; live `audit.ndjson` always checked (it covers today regardless of whether the window endpoint is past midnight).
+- **`spendTrendDaily` calendar-date semantics**: `days: N` returns "last N calendar UTC dates ending today" — NOT "events within a rolling N×86400-ms window" (which would span N+1 distinct UTC dates and produce off-by-one buckets at non-midnight call times). Computed via `for (let i = days-1; i >= 0; i--) dates.push(_utcDateFromMs(now - i*86400*1000));`.
+- **`cacheHitRateWindow` denominator**: hit_rate = hit / (hit + miss). Bypass is intentional non-cacheable (Anthropic cache_control marker), NOT a cache miss; excluding it from the denominator gives a clean cache-effectiveness signal.
+- **Test surface (Suite 23, +27 tests — 544 → 571):**
+  - 23a-1..4: `discoverAuditFiles` (empty dir / live only / live+rotated / non-audit files ignored)
+  - 23b-1..6: `readAuditWindow` (all-coverage / single-day / half-open exclusivity / empty window / missing files / malformed-skip with warn)
+  - 23c-1..4: `aggregateRequests` (counts + status buckets + by_provider; by_owner_tier; median+p95 latency over realistic distribution; invalid windowMs rejection)
+  - 23d-1..4: `topFallbackChains` (sort desc by count; limit truncation; fallback_hops=0 excluded; first_seen/last_seen carried)
+  - 23e-1..3: `spendTrendDaily` (N-day range correctness; populated day breakdown; empty day sparse-fill)
+  - 23f-1..3: `cacheHitRateWindow` (overall + per-provider hit_rate; bypass not in denominator; cache_status=null events excluded)
+  - 23g-1..3: PII guard for `aggregateRequests` / `spendTrendDaily` / `topFallbackChains` + `cacheHitRateWindow` — every output JSON-stringified + scanned for forbidden PII keys
+- **Documentation:** AGENTS.md `lib/audit-query.mjs` new entry; `lib/audit.mjs` note added that D52 extends with daily rotation.
+- **Test count:** 544 → 571 (+27 D49 tests).
+- **Authority:** ADR 0008 § 4 (query API surface) + § 5 (rotation file naming pattern) + § 3 (storage layout); ADR 0007 § 8 (audit ndjson event schema — input data); CLAUDE.md `release_kit overlay phase_rolling_mode` — under Unreleased; standing autopilot grant.
+
 ### D48 — ADR 0008 Phase 3 design draft (Dashboard + audit query layer)
 
 First Phase 3 D-day. Design-only. Ratifies the storage / query model / rotation / dashboard / refresh / scope decisions ahead of D49+ implementation D-days. Opens ADR 0007 § 12 deferral for Dashboard + audit query layer + rotation.

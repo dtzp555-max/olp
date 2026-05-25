@@ -10897,3 +10897,450 @@ describe('Suite 22 — D47 keygen CLI (bin/olp-keys.mjs, ADR 0007 § 9.1)', () =
     });
   });
 });
+
+// ── Suite 23: D49 lib/audit-query.mjs (Phase 3 audit aggregate query layer) ──
+//
+// Unit tests for the in-memory audit query layer per ADR 0008 § 4.
+//   - discoverAuditFiles: filesystem scan + date-suffix recognition
+//   - readAuditWindow: window filtering + cross-file walk + malformed skip
+//   - aggregateRequests: count + median/p95 latency + by_provider + by_owner_tier + by_path
+//   - topFallbackChains: sort + tied-count tiebreak + tried_providers shape
+//   - spendTrendDaily: sparse-fill + UTC day buckets
+//   - cacheHitRateWindow: per-provider + bypass-not-in-denominator
+//   - PII guard: aggregate shapes never include message content
+
+import {
+  discoverAuditFiles,
+  readAuditWindow,
+  aggregateRequests,
+  topFallbackChains,
+  spendTrendDaily,
+  cacheHitRateWindow,
+} from './lib/audit-query.mjs';
+import { mkdirSync, writeFileSync as fsWriteFileSyncForS23 } from 'node:fs';
+
+describe('Suite 23 — D49 lib/audit-query.mjs (Phase 3 audit aggregate query layer, ADR 0008 § 4)', () => {
+
+  // Helper: write synthetic audit ndjson files to a tmpdir's logs/ subdir.
+  // entries is { 'live': [...events] | 'YYYY-MM-DD': [...events] }
+  function setupAuditFiles(tmp, entries) {
+    const logsDir = _pathJoinForSetup(tmp, 'logs');
+    mkdirSync(logsDir, { recursive: true, mode: 0o700 });
+    for (const [date, events] of Object.entries(entries)) {
+      const filename = date === 'live' ? 'audit.ndjson' : `audit-${date}.ndjson`;
+      const path = _pathJoinForSetup(logsDir, filename);
+      const lines = events.map(ev => JSON.stringify(ev)).join('\n') + '\n';
+      fsWriteFileSyncForS23(path, lines, { mode: 0o600 });
+    }
+  }
+
+  function makeEvent(overrides = {}) {
+    return {
+      ts: new Date().toISOString(),
+      key_id: 'k1',
+      owner_tier: 'owner',
+      method: 'POST',
+      path: '/v1/chat/completions',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+      status_code: 200,
+      latency_ms: 100,
+      cache_status: 'miss',
+      fallback_hops: 0,
+      tried_providers: ['anthropic'],
+      error_code: null,
+      ir_request_hash: 'abc123',
+      chain_id: 'c1',
+      ...overrides,
+    };
+  }
+
+  describe('23a — discoverAuditFiles', () => {
+    let TMP;
+    before(() => { TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-23a-')); });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); });
+
+    it('23a-1: empty logs dir → empty Map', () => {
+      const r = discoverAuditFiles({ olpHome: TMP });
+      assert.equal(r.size, 0);
+    });
+
+    it('23a-2: only audit.ndjson → Map with "live" key', () => {
+      setupAuditFiles(TMP, { 'live': [makeEvent()] });
+      const r = discoverAuditFiles({ olpHome: TMP });
+      assert.equal(r.size, 1);
+      assert.ok(r.has('live'));
+    });
+
+    it('23a-3: rotated files + live → all recognized', () => {
+      setupAuditFiles(TMP, {
+        'live': [makeEvent()],
+        '2026-05-24': [makeEvent({ ts: '2026-05-24T12:00:00Z' })],
+        '2026-05-23': [makeEvent({ ts: '2026-05-23T12:00:00Z' })],
+      });
+      const r = discoverAuditFiles({ olpHome: TMP });
+      assert.equal(r.size, 3);
+      assert.ok(r.has('live'));
+      assert.ok(r.has('2026-05-24'));
+      assert.ok(r.has('2026-05-23'));
+    });
+
+    it('23a-4: non-audit files ignored', () => {
+      setupAuditFiles(TMP, { 'live': [makeEvent()] });
+      fsWriteFileSyncForS23(_pathJoinForSetup(TMP, 'logs', 'some-random.log'), 'noise\n', { mode: 0o600 });
+      fsWriteFileSyncForS23(_pathJoinForSetup(TMP, 'logs', 'audit-invalid-date.ndjson'), 'noise\n', { mode: 0o600 });
+      const r = discoverAuditFiles({ olpHome: TMP });
+      // live + 3 prior rotated from 23a-3 (state carries within describe block); ignore random files
+      assert.ok(r.size >= 1);
+      for (const key of r.keys()) {
+        assert.ok(key === 'live' || /^\d{4}-\d{2}-\d{2}$/.test(key));
+      }
+    });
+  });
+
+  describe('23b — readAuditWindow', () => {
+    let TMP;
+    before(() => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-23b-'));
+      setupAuditFiles(TMP, {
+        '2026-05-23': [
+          makeEvent({ ts: '2026-05-23T10:00:00Z', provider: 'anthropic' }),
+          makeEvent({ ts: '2026-05-23T20:00:00Z', provider: 'openai' }),
+        ],
+        '2026-05-24': [
+          makeEvent({ ts: '2026-05-24T10:00:00Z', provider: 'mistral' }),
+        ],
+        'live': [
+          makeEvent({ ts: '2026-05-25T10:00:00Z', provider: 'anthropic' }),
+        ],
+      });
+    });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); });
+
+    it('23b-1: window covering all → all 4 events', () => {
+      const start = Date.parse('2026-05-23T00:00:00Z');
+      const end = Date.parse('2026-05-26T00:00:00Z');
+      const events = [...readAuditWindow({ startMs: start, endMs: end, olpHome: TMP })];
+      assert.equal(events.length, 4);
+    });
+
+    it('23b-2: window covering only 2026-05-24 → 1 event (mistral)', () => {
+      const start = Date.parse('2026-05-24T00:00:00Z');
+      const end = Date.parse('2026-05-25T00:00:00Z');
+      const events = [...readAuditWindow({ startMs: start, endMs: end, olpHome: TMP })];
+      assert.equal(events.length, 1);
+      assert.equal(events[0].provider, 'mistral');
+    });
+
+    it('23b-3: half-open semantics — endMs exclusive', () => {
+      // Event at 2026-05-23T20:00:00Z. Window endMs = exactly that ts → exclude.
+      const start = Date.parse('2026-05-23T00:00:00Z');
+      const end = Date.parse('2026-05-23T20:00:00Z');
+      const events = [...readAuditWindow({ startMs: start, endMs: end, olpHome: TMP })];
+      assert.equal(events.length, 1); // only the 10:00 event
+      assert.equal(events[0].ts, '2026-05-23T10:00:00Z');
+    });
+
+    it('23b-4: empty window (end <= start) → empty', () => {
+      const events = [...readAuditWindow({ startMs: 1000, endMs: 1000, olpHome: TMP })];
+      assert.equal(events.length, 0);
+      const events2 = [...readAuditWindow({ startMs: 2000, endMs: 1000, olpHome: TMP })];
+      assert.equal(events2.length, 0);
+    });
+
+    it('23b-5: missing files → empty iteration (not an error)', () => {
+      const TMP2 = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-23b5-'));
+      try {
+        const events = [...readAuditWindow({
+          startMs: Date.parse('2026-05-01T00:00:00Z'),
+          endMs: Date.parse('2026-05-02T00:00:00Z'),
+          olpHome: TMP2,
+        })];
+        assert.equal(events.length, 0);
+      } finally {
+        rmSync(TMP2, { recursive: true, force: true });
+      }
+    });
+
+    it('23b-6: malformed lines skipped + warn fired', () => {
+      const TMP3 = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-23b6-'));
+      try {
+        mkdirSync(_pathJoinForSetup(TMP3, 'logs'), { recursive: true, mode: 0o700 });
+        const path = _pathJoinForSetup(TMP3, 'logs', 'audit.ndjson');
+        const lines = [
+          JSON.stringify(makeEvent({ ts: '2026-05-25T10:00:00Z' })),
+          '{ this is not valid json',
+          JSON.stringify(makeEvent({ ts: '2026-05-25T11:00:00Z' })),
+          '',
+          'definitely not json',
+          JSON.stringify(makeEvent({ ts: '2026-05-25T12:00:00Z' })),
+        ].join('\n');
+        fsWriteFileSyncForS23(path, lines, { mode: 0o600 });
+
+        let warnFired = false;
+        const events = [...readAuditWindow({
+          startMs: Date.parse('2026-05-25T00:00:00Z'),
+          endMs: Date.parse('2026-05-26T00:00:00Z'),
+          olpHome: TMP3,
+          logEvent: (level, ev) => { if (level === 'warn' && ev === 'audit_query_skip_malformed') warnFired = true; },
+        })];
+        assert.equal(events.length, 3, 'malformed lines skipped, 3 valid events kept');
+        assert.ok(warnFired, 'warn must fire for malformed lines');
+      } finally {
+        rmSync(TMP3, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('23c — aggregateRequests', () => {
+    let TMP;
+    before(() => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-23c-'));
+      const now = Date.now();
+      const t = (offsetMs) => new Date(now - offsetMs).toISOString();
+      setupAuditFiles(TMP, {
+        'live': [
+          makeEvent({ ts: t(60000), provider: 'anthropic', cache_status: 'hit', owner_tier: 'owner', status_code: 200, latency_ms: 50 }),
+          makeEvent({ ts: t(50000), provider: 'anthropic', cache_status: 'miss', owner_tier: 'owner', status_code: 200, latency_ms: 150 }),
+          makeEvent({ ts: t(40000), provider: 'openai', cache_status: 'miss', owner_tier: 'guest', status_code: 200, latency_ms: 200 }),
+          makeEvent({ ts: t(30000), provider: 'mistral', cache_status: 'bypass', owner_tier: 'owner', status_code: 401, latency_ms: 10 }),
+          makeEvent({ ts: t(20000), provider: 'anthropic', cache_status: 'miss', owner_tier: 'owner', status_code: 503, latency_ms: 5000, fallback_hops: 1, tried_providers: ['anthropic', 'openai'] }),
+        ],
+      });
+    });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); });
+
+    it('23c-1: aggregateRequests counts requests + status buckets + by_provider', () => {
+      const r = aggregateRequests({ windowMs: 86400 * 1000, olpHome: TMP });
+      assert.equal(r.request_count, 5);
+      assert.equal(r.status_2xx, 3); // 200x3
+      assert.equal(r.status_4xx, 1); // 401
+      assert.equal(r.status_5xx, 1); // 503
+      assert.equal(r.by_provider.anthropic.count, 3);
+      assert.equal(r.by_provider.anthropic.cache_hit, 1);
+      assert.equal(r.by_provider.anthropic.cache_miss, 2);
+      assert.equal(r.by_provider.anthropic.fallback_count, 1);
+      assert.equal(r.by_provider.openai.count, 1);
+      assert.equal(r.by_provider.mistral.cache_bypass, 1);
+    });
+
+    it('23c-2: by_owner_tier breakdown', () => {
+      const r = aggregateRequests({ windowMs: 86400 * 1000, olpHome: TMP });
+      assert.equal(r.by_owner_tier.owner, 4);
+      assert.equal(r.by_owner_tier.guest, 1);
+      assert.equal(r.by_owner_tier.anonymous, 0);
+    });
+
+    it('23c-3: median + p95 latency over [5, 50, 150, 200, 5000]', () => {
+      const r = aggregateRequests({ windowMs: 86400 * 1000, olpHome: TMP });
+      // sorted: 5, 10, 50, 150, 200; we have 5 events with latencies [50, 150, 200, 10, 5000]
+      // sorted: [10, 50, 150, 200, 5000]; median (index 2) = 150
+      assert.equal(r.median_latency_ms, 150);
+      // p95 index = floor(5 * 0.95) = 4 → 5000
+      assert.equal(r.p95_latency_ms, 5000);
+    });
+
+    it('23c-4: throws on invalid windowMs', () => {
+      assert.throws(() => aggregateRequests({ olpHome: TMP }), /windowMs.*required/);
+      assert.throws(() => aggregateRequests({ windowMs: 0, olpHome: TMP }), /windowMs.*required/);
+      assert.throws(() => aggregateRequests({ windowMs: -1, olpHome: TMP }), /windowMs.*required/);
+    });
+  });
+
+  describe('23d — topFallbackChains', () => {
+    let TMP;
+    before(() => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-23d-'));
+      const now = Date.now();
+      const t = (offsetMs) => new Date(now - offsetMs).toISOString();
+      setupAuditFiles(TMP, {
+        'live': [
+          // 3x anthropic→openai
+          makeEvent({ ts: t(5000), fallback_hops: 1, tried_providers: ['anthropic', 'openai'] }),
+          makeEvent({ ts: t(4000), fallback_hops: 1, tried_providers: ['anthropic', 'openai'] }),
+          makeEvent({ ts: t(3000), fallback_hops: 1, tried_providers: ['anthropic', 'openai'] }),
+          // 2x anthropic→mistral
+          makeEvent({ ts: t(2500), fallback_hops: 1, tried_providers: ['anthropic', 'mistral'] }),
+          makeEvent({ ts: t(2000), fallback_hops: 1, tried_providers: ['anthropic', 'mistral'] }),
+          // 1x openai→mistral (single chain)
+          makeEvent({ ts: t(1000), fallback_hops: 1, tried_providers: ['openai', 'mistral'] }),
+          // events with fallback_hops:0 are excluded
+          makeEvent({ ts: t(500), fallback_hops: 0, tried_providers: ['anthropic'] }),
+        ],
+      });
+    });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); });
+
+    it('23d-1: sorted desc by count', () => {
+      const r = topFallbackChains({ windowMs: 86400 * 1000, olpHome: TMP });
+      assert.equal(r.length, 3);
+      assert.equal(r[0].count, 3);
+      assert.deepEqual(r[0].chain, ['anthropic', 'openai']);
+      assert.equal(r[1].count, 2);
+      assert.deepEqual(r[1].chain, ['anthropic', 'mistral']);
+      assert.equal(r[2].count, 1);
+      assert.deepEqual(r[2].chain, ['openai', 'mistral']);
+    });
+
+    it('23d-2: limit argument truncates result', () => {
+      const r = topFallbackChains({ windowMs: 86400 * 1000, limit: 2, olpHome: TMP });
+      assert.equal(r.length, 2);
+    });
+
+    it('23d-3: events with fallback_hops=0 excluded from chains', () => {
+      const r = topFallbackChains({ windowMs: 86400 * 1000, olpHome: TMP });
+      const allCounts = r.reduce((s, c) => s + c.count, 0);
+      assert.equal(allCounts, 6); // 3+2+1 — fallback_hops:0 event not counted
+    });
+
+    it('23d-4: chain entries carry first_seen + last_seen', () => {
+      const r = topFallbackChains({ windowMs: 86400 * 1000, olpHome: TMP });
+      for (const c of r) {
+        assert.ok(typeof c.first_seen === 'string');
+        assert.ok(typeof c.last_seen === 'string');
+        assert.ok(c.first_seen <= c.last_seen);
+      }
+    });
+  });
+
+  describe('23e — spendTrendDaily', () => {
+    let TMP;
+    before(() => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-23e-'));
+      // 3 events on day-2, 1 event on day-0; day-1 has none (sparse fill test)
+      const today = new Date().toISOString().slice(0, 10);
+      const day1 = new Date(Date.now() - 86400 * 1000).toISOString().slice(0, 10);
+      const day2 = new Date(Date.now() - 2 * 86400 * 1000).toISOString().slice(0, 10);
+      setupAuditFiles(TMP, {
+        [day2]: [
+          makeEvent({ ts: `${day2}T10:00:00Z`, provider: 'anthropic', latency_ms: 100 }),
+          makeEvent({ ts: `${day2}T11:00:00Z`, provider: 'openai', latency_ms: 200 }),
+          makeEvent({ ts: `${day2}T12:00:00Z`, provider: 'anthropic', latency_ms: 50 }),
+        ],
+        'live': [
+          makeEvent({ ts: new Date().toISOString(), provider: 'mistral', latency_ms: 75 }),
+        ],
+      });
+    });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); });
+
+    it('23e-1: 3-day window returns 3 entries (sparse-fills empty days)', () => {
+      const r = spendTrendDaily({ days: 3, olpHome: TMP });
+      assert.equal(r.length, 3);
+      // Each entry has a date + request_count (>=0)
+      for (const e of r) {
+        assert.ok(typeof e.date === 'string');
+        assert.equal(e.date.length, 10);
+        assert.ok(typeof e.request_count === 'number');
+        assert.ok(typeof e.median_latency_ms === 'number');
+        assert.ok(typeof e.by_provider === 'object');
+      }
+    });
+
+    it('23e-2: day with data has correct breakdown', () => {
+      const r = spendTrendDaily({ days: 5, olpHome: TMP });
+      const day2Date = new Date(Date.now() - 2 * 86400 * 1000).toISOString().slice(0, 10);
+      const day2 = r.find(e => e.date === day2Date);
+      assert.ok(day2);
+      assert.equal(day2.request_count, 3);
+      assert.equal(day2.by_provider.anthropic, 2);
+      assert.equal(day2.by_provider.openai, 1);
+      // median of [50, 100, 200] = 100
+      assert.equal(day2.median_latency_ms, 100);
+    });
+
+    it('23e-3: empty day has request_count=0 and empty by_provider', () => {
+      const r = spendTrendDaily({ days: 3, olpHome: TMP });
+      const day1Date = new Date(Date.now() - 86400 * 1000).toISOString().slice(0, 10);
+      const day1 = r.find(e => e.date === day1Date);
+      assert.ok(day1);
+      assert.equal(day1.request_count, 0);
+      assert.deepEqual(day1.by_provider, {});
+      assert.equal(day1.median_latency_ms, 0);
+    });
+  });
+
+  describe('23f — cacheHitRateWindow', () => {
+    let TMP;
+    before(() => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-23f-'));
+      const now = Date.now();
+      const t = (offsetMs) => new Date(now - offsetMs).toISOString();
+      setupAuditFiles(TMP, {
+        'live': [
+          makeEvent({ ts: t(5000), provider: 'anthropic', cache_status: 'hit' }),
+          makeEvent({ ts: t(4000), provider: 'anthropic', cache_status: 'hit' }),
+          makeEvent({ ts: t(3000), provider: 'anthropic', cache_status: 'miss' }),
+          makeEvent({ ts: t(2000), provider: 'openai', cache_status: 'miss' }),
+          makeEvent({ ts: t(1500), provider: 'openai', cache_status: 'bypass' }),
+          // events with cache_status null (e.g., 401 paths) excluded
+          makeEvent({ ts: t(1000), provider: null, cache_status: null }),
+        ],
+      });
+    });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); });
+
+    it('23f-1: hit_rate excludes bypass from denominator', () => {
+      const r = cacheHitRateWindow({ windowMs: 86400 * 1000, olpHome: TMP });
+      // overall: hit=2, miss=2, bypass=1 → hit_rate = 2/(2+2) = 0.5
+      assert.equal(r.hit, 2);
+      assert.equal(r.miss, 2);
+      assert.equal(r.bypass, 1);
+      assert.equal(r.hit_rate, 0.5);
+    });
+
+    it('23f-2: per-provider hit_rate', () => {
+      const r = cacheHitRateWindow({ windowMs: 86400 * 1000, olpHome: TMP });
+      // anthropic: 2 hit + 1 miss → rate 2/3
+      assert.equal(r.by_provider.anthropic.hit, 2);
+      assert.equal(r.by_provider.anthropic.miss, 1);
+      assert.equal(r.by_provider.anthropic.hit_rate, 2 / 3);
+      // openai: 1 miss + 1 bypass → rate 0/1 = 0
+      assert.equal(r.by_provider.openai.miss, 1);
+      assert.equal(r.by_provider.openai.bypass, 1);
+      assert.equal(r.by_provider.openai.hit_rate, 0);
+    });
+
+    it('23f-3: events with cache_status null excluded from total', () => {
+      const r = cacheHitRateWindow({ windowMs: 86400 * 1000, olpHome: TMP });
+      assert.equal(r.total, 5); // 6 events but 1 has cache_status:null
+    });
+  });
+
+  describe('23g — PII guard (ADR 0008 § 4.3)', () => {
+    let TMP;
+    before(() => {
+      TMP = _mkdtempSyncForSetup(_pathJoinForSetup(_tmpdirForSetup(), 'olp-test-23g-'));
+      setupAuditFiles(TMP, {
+        'live': [makeEvent({ provider: 'anthropic', latency_ms: 100 })],
+      });
+    });
+    after(() => { rmSync(TMP, { recursive: true, force: true }); });
+
+    it('23g-1: aggregateRequests returns NO message-content fields', () => {
+      const r = aggregateRequests({ windowMs: 86400 * 1000, olpHome: TMP });
+      const json = JSON.stringify(r);
+      for (const piiKey of ['content', 'message', 'messages', 'prompt', 'response', 'body']) {
+        assert.ok(!json.includes(`"${piiKey}"`),
+          `aggregateRequests result MUST NOT contain field "${piiKey}" (PII guard)`);
+      }
+    });
+
+    it('23g-2: spendTrendDaily returns NO message-content fields', () => {
+      const r = spendTrendDaily({ days: 1, olpHome: TMP });
+      const json = JSON.stringify(r);
+      for (const piiKey of ['content', 'message', 'messages', 'prompt', 'response', 'body']) {
+        assert.ok(!json.includes(`"${piiKey}"`));
+      }
+    });
+
+    it('23g-3: topFallbackChains + cacheHitRateWindow contain no message fields', () => {
+      const j1 = JSON.stringify(topFallbackChains({ windowMs: 86400 * 1000, olpHome: TMP }));
+      const j2 = JSON.stringify(cacheHitRateWindow({ windowMs: 86400 * 1000, olpHome: TMP }));
+      for (const piiKey of ['content', 'message', 'messages', 'prompt', 'response', 'body']) {
+        assert.ok(!j1.includes(`"${piiKey}"`));
+        assert.ok(!j2.includes(`"${piiKey}"`));
+      }
+    });
+  });
+});

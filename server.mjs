@@ -138,9 +138,15 @@ const recentErrors = [];
  * @param {number|null} [opts.statusCode]
  */
 function _pushError({ error, provider = null, path = null, statusCode = null }) {
-  // Filter: 401/403 are client-tier failures; do not record. Any other status
-  // is recorded when (a) statusCode >= 500 OR (b) the error is a ProviderError
-  // (provider-shape failure, always interesting for operators).
+  // D61-D63 reviewer P2-1 (defense-in-depth): explicitly reject 401/403 at the
+  // function level even if a caller mistakenly passes one. The current call
+  // sites all use the "no auth" path → never invoke _pushError, but a future
+  // contributor passing a ProviderError tagged statusCode=401 would otherwise
+  // slip past the isProviderError branch and flood the ring under brute force.
+  if (statusCode === 401 || statusCode === 403) return;
+  // Filter: any other status is recorded when (a) statusCode >= 500 OR (b) the
+  // error is a ProviderError (provider-shape failure, always interesting for
+  // operators).
   const isProviderError = error?.code === 'PROVIDER_ERROR'
     || error?.code === 'SPAWN_FAILED'
     || error?.code === 'CONCURRENCY_LIMIT'
@@ -1537,7 +1543,7 @@ async function handleChatCompletions(req, res) {
                 error: { message: irChunk.error ?? 'streaming_error_after_first_chunk', code: 'SPAWN_FAILED' },
                 provider: streamProvider,
                 path: '/v1/chat/completions',
-                statusCode: 200, // already sent 200 headers; record by code
+                statusCode: null, // headers already sent; status_code intentionally null — record by error code only (D61-D63 reviewer P2-2: explicit intent over numeric-but-meaningless 200)
               });
               res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
               res.write(SSE_DONE);
@@ -1620,7 +1626,7 @@ async function handleChatCompletions(req, res) {
             error: e,
             provider: streamProvider,
             path: '/v1/chat/completions',
-            statusCode: 200, // already sent 200 headers; record by code
+            statusCode: null, // headers already sent; status_code intentionally null — record by error code only (D61-D63 reviewer P2-2)
           });
           res.write(irChunkToOpenAISSE({ type: 'stop', finish_reason: 'length' }, requestId, ir.model));
           res.write(SSE_DONE);

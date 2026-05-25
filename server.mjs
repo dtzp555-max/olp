@@ -577,10 +577,17 @@ async function handleHealth(req, res) {
   const available = listAllProviderNames().length;
   const providerStatuses = {};
   for (const [name, provider] of loadedProviders) {
+    // D56 / v1.x roadmap #4 (ADR 0002 Amendment 6 forward note): surface
+    // per-provider active spawn count for capacity-planning observability.
+    // D38 shipped getActiveSpawnCount; this is the /health integration.
+    // The field is set BEFORE healthCheck() in case healthCheck throws —
+    // activeSpawns is cheap (in-memory counter read) and useful even
+    // when healthCheck fails.
+    const activeSpawns = getActiveSpawnCount(name);
     try {
-      providerStatuses[name] = await provider.healthCheck();
+      providerStatuses[name] = { ...(await provider.healthCheck()), activeSpawns };
     } catch (e) {
-      providerStatuses[name] = { ok: false, error: e.message };
+      providerStatuses[name] = { ok: false, error: e.message, activeSpawns };
     }
   }
   sendJSON(res, 200, {

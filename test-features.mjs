@@ -13591,3 +13591,467 @@ describe('Suite 31 — D63 /v0/management/status (ADR 0010 § Phase 4 D61-D63)',
       `total_requests expected >= 1, got ${body.stats.total_requests}`);
   });
 });
+
+// ── Suite 32: D64 bin/olp.mjs CLI scaffold (ADR 0010 § Phase 4 D64-D67) ───
+//
+// Smoke tests for the operator CLI. The CLI is invoked in-process via its
+// exported runCli() so we get exit codes without spawning a subprocess. The
+// process.env is mutated per-test (saved + restored in before/after) so the
+// runtime resolution paths (OLP_PROXY_URL / OLP_PORT / OLP_API_KEY / OLP_HOME)
+// behave deterministically.
+//
+// The CLI sources are:
+//   bin/olp.mjs              — runCli(argv, { out, err, useColor }) → exit code
+//   lib/doctor.mjs           — runDoctor() consumed by `olp doctor`
+//
+// These tests do NOT spawn a real OLP server for the HTTP subcommands; instead
+// each HTTP test starts an ephemeral createOlpServer() listening on port 0 and
+// points the CLI at that port via --proxy-url. The owner_token used is created
+// per-test via createKey({ owner_tier: 'owner' }).
+
+import { runCli as runOlpCli, parseArgv as parseOlpArgv, resolveBearerToken as olpResolveBearerToken } from './bin/olp.mjs';
+
+describe('Suite 32 — D64 bin/olp.mjs CLI scaffold (ADR 0010 § Phase 4 D64-D67)', () => {
+  const SAVED_ENV_32 = {
+    OLP_HOME: process.env.OLP_HOME,
+    OLP_PROXY_URL: process.env.OLP_PROXY_URL,
+    OLP_PORT: process.env.OLP_PORT,
+    OLP_API_KEY: process.env.OLP_API_KEY,
+    OLP_OWNER_TOKEN: process.env.OLP_OWNER_TOKEN,
+  };
+  let TMP32;
+
+  before(() => {
+    TMP32 = mkdtempSync(pathJoin(tmpdir(), 'olp-test-32-'));
+    process.env.OLP_HOME = TMP32;
+    // Clear conflicting env vars for deterministic resolution
+    delete process.env.OLP_PROXY_URL;
+    delete process.env.OLP_PORT;
+    delete process.env.OLP_API_KEY;
+    delete process.env.OLP_OWNER_TOKEN;
+  });
+
+  after(() => {
+    for (const [k, v] of Object.entries(SAVED_ENV_32)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    rmSync(TMP32, { recursive: true, force: true });
+  });
+
+  // Helper: capture stdout / stderr buffers via IO writers
+  function makeCapture() {
+    let out = '', err = '';
+    return {
+      out: s => { out += s; },
+      err: s => { err += s; },
+      get stdout() { return out; },
+      get stderr() { return err; },
+    };
+  }
+
+  it('32a — parseArgv: --flag=value + --flag value + bare --flag', () => {
+    const a = parseOlpArgv(['--json', '--port=4567', '--name', 'foo', 'positional']);
+    assert.equal(a.flags.json, true);
+    assert.equal(a.flags.port, '4567');
+    assert.equal(a.flags.name, 'foo');
+    assert.deepEqual(a.positional, ['positional']);
+  });
+
+  it('32b — `olp` (no args) prints USAGE and returns exit code 1', async () => {
+    const cap = makeCapture();
+    const code = await runOlpCli([], { out: cap.out, err: cap.err, useColor: false });
+    assert.equal(code, 1, 'no-args should return 1');
+    assert.match(cap.stdout, /OLP operator CLI/);
+    assert.match(cap.stdout, /Subcommands:/);
+  });
+
+  it('32c — `olp help` prints USAGE and returns exit code 0', async () => {
+    const cap = makeCapture();
+    const code = await runOlpCli(['help'], { out: cap.out, err: cap.err, useColor: false });
+    assert.equal(code, 0);
+    assert.match(cap.stdout, /OLP operator CLI/);
+  });
+
+  it('32d — `olp unknown` prints error + USAGE on stderr, returns exit code 1', async () => {
+    const cap = makeCapture();
+    const code = await runOlpCli(['frobnicate'], { out: cap.out, err: cap.err, useColor: false });
+    assert.equal(code, 1);
+    assert.match(cap.stderr, /unknown subcommand "frobnicate"/);
+    assert.match(cap.stderr, /OLP operator CLI/);
+  });
+
+  it('32e — `olp providers` (local, no HTTP) → lists registry entries', async () => {
+    const cap = makeCapture();
+    const code = await runOlpCli(['providers'], { out: cap.out, err: cap.err, useColor: false });
+    assert.equal(code, 0);
+    // All three shipped plugin keys must appear
+    assert.match(cap.stdout, /anthropic/);
+    assert.match(cap.stdout, /openai/);
+    assert.match(cap.stdout, /mistral/);
+    // No providers enabled in the empty TMP32 config → all show disabled
+    assert.match(cap.stdout, /disabled/);
+  });
+
+  it('32f — `olp providers --json` emits parseable JSON with providers[]', async () => {
+    const cap = makeCapture();
+    const code = await runOlpCli(['providers', '--json'], { out: cap.out, err: cap.err, useColor: false });
+    assert.equal(code, 0);
+    const body = JSON.parse(cap.stdout);
+    assert.ok(Array.isArray(body.providers));
+    assert.ok(body.providers.length >= 3);
+    const names = body.providers.map(p => p.name);
+    assert.ok(names.includes('anthropic'));
+    assert.ok(names.includes('openai'));
+    assert.ok(names.includes('mistral'));
+  });
+
+  it('32g — `olp chain show` with no chains in config prints "no chains configured"', async () => {
+    const cap = makeCapture();
+    const code = await runOlpCli(['chain', 'show'], { out: cap.out, err: cap.err, useColor: false });
+    assert.equal(code, 0);
+    assert.match(cap.stdout, /no chains configured/);
+  });
+
+  it('32h — `olp status` against an ephemeral OLP server with owner token → 200', async () => {
+    // Spin up an ephemeral server bound to a random port; CLI talks to it.
+    __setProvidersEnabled({});
+    __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+    const mod = await import('./server.mjs');
+    mod.__clearCache();
+    mod.__clearRecentErrors();
+    mod.__resetRequestCounters();
+
+    const server32 = mod.createOlpServer();
+    await new Promise((resolve, reject) => {
+      server32.listen(0, '127.0.0.1', resolve);
+      server32.once('error', reject);
+    });
+    const port32 = server32.address().port;
+    try {
+      // Create owner key + use it via OLP_API_KEY env (resolveBearerToken reads it first)
+      const { plaintext_token } = createKey({
+        name: '32h-owner', owner_tier: 'owner', providers_enabled: '*', olpHome: TMP32,
+      });
+      const SAVED_TOK = process.env.OLP_API_KEY;
+      process.env.OLP_API_KEY = plaintext_token;
+      try {
+        const cap = makeCapture();
+        const code = await runOlpCli(
+          ['status', `--proxy-url=http://127.0.0.1:${port32}`, '--json'],
+          { out: cap.out, err: cap.err, useColor: false },
+        );
+        assert.equal(code, 0, `status JSON exit non-zero; stderr=${cap.stderr}`);
+        const body = JSON.parse(cap.stdout);
+        assert.equal(body.ok, true);
+        assert.ok(typeof body.version === 'string');
+        assert.ok(typeof body.uptime_ms === 'number');
+      } finally {
+        if (SAVED_TOK === undefined) delete process.env.OLP_API_KEY;
+        else process.env.OLP_API_KEY = SAVED_TOK;
+      }
+    } finally {
+      await new Promise(r => server32.close(r));
+      __resetProvidersEnabled();
+      __setAuthConfig({ allow_anonymous: true, owner_only_endpoints: [], fallback_detail_header_policy: 'all' });
+    }
+  });
+
+  it('32i — `olp status` against a non-existent port → exit 2 ECONNREFUSED', async () => {
+    // Pick a random high port unlikely to be in use; the CLI must detect
+    // ECONNREFUSED and surface the helpful hint.
+    const cap = makeCapture();
+    const code = await runOlpCli(
+      ['status', '--proxy-url=http://127.0.0.1:1'],  // port 1 → ECONNREFUSED on macOS/Linux
+      { out: cap.out, err: cap.err, useColor: false },
+    );
+    assert.equal(code, 2, `expected ECONNREFUSED → exit 2, got ${code}; stderr=${cap.stderr}`);
+    assert.match(cap.stderr, /unreachable|ECONNREFUSED/);
+  });
+
+  it('32j — resolveBearerToken precedence: OLP_API_KEY > OLP_OWNER_TOKEN > null', () => {
+    const SAVED_API = process.env.OLP_API_KEY;
+    const SAVED_OWN = process.env.OLP_OWNER_TOKEN;
+    try {
+      // 1. Neither set → null
+      delete process.env.OLP_API_KEY;
+      delete process.env.OLP_OWNER_TOKEN;
+      assert.equal(olpResolveBearerToken(), null);
+
+      // 2. Only OLP_OWNER_TOKEN → that wins
+      process.env.OLP_OWNER_TOKEN = 'owner-tok-32j';
+      assert.equal(olpResolveBearerToken(), 'owner-tok-32j');
+
+      // 3. OLP_API_KEY also set → API key wins
+      process.env.OLP_API_KEY = 'api-key-32j';
+      assert.equal(olpResolveBearerToken(), 'api-key-32j');
+    } finally {
+      if (SAVED_API === undefined) delete process.env.OLP_API_KEY;
+      else process.env.OLP_API_KEY = SAVED_API;
+      if (SAVED_OWN === undefined) delete process.env.OLP_OWNER_TOKEN;
+      else process.env.OLP_OWNER_TOKEN = SAVED_OWN;
+    }
+  });
+});
+
+// ── Suite 33: D65 lib/doctor.mjs framework (ADR 0010 § Phase 4 D64-D67) ───
+//
+// Framework tests for `olp doctor`. Uses runDoctor()'s opts.injectChecks
+// hook to drive every kind branch (noop / fresh_install / fix_server /
+// fix_oauth / fix_provider / fix_config) deterministically without depending
+// on real filesystem or network state.
+
+import {
+  runDoctor as runOlpDoctor,
+  buildBuiltinChecks as buildOlpBuiltinChecks,
+  collectProviderChecks as collectOlpProviderChecks,
+  deriveKind as deriveOlpKind,
+  deriveNextAction as deriveOlpNextAction,
+  resolveProxyUrl as resolveOlpProxyUrl,
+  DOCTOR_SCHEMA_VERSION,
+} from './lib/doctor.mjs';
+
+describe('Suite 33 — D65 lib/doctor.mjs framework (ADR 0010 § Phase 4 D64-D67)', () => {
+
+  // Helper: build a fake check with deterministic status + optional evidence
+  function fakeCheck(id, category, status, message = 'fake', evidence) {
+    return {
+      id,
+      category,
+      async run() {
+        return evidence ? { status, message, evidence } : { status, message };
+      },
+    };
+  }
+
+  it('33a — all-ok checks → kind=noop, next_action.ai_executable=[]', async () => {
+    const result = await runOlpDoctor({
+      injectChecks: [
+        fakeCheck('system.node_version', 'system', 'ok', 'Node 20'),
+        fakeCheck('server.running', 'server', 'ok', 'live'),
+        fakeCheck('auth.owner_key_exists', 'auth', 'ok', 'present'),
+      ],
+    });
+    assert.equal(result.schema_version, DOCTOR_SCHEMA_VERSION);
+    assert.equal(result.fail_count, 0);
+    assert.equal(result.kind, 'noop');
+    assert.deepEqual(result.next_action.ai_executable, []);
+    assert.deepEqual(result.next_action.human_required, []);
+    assert.equal(result.next_action.verify, 'already healthy');
+    assert.match(result.summary, /all 3 checks ok/);
+  });
+
+  it('33b — server.running FAIL → kind=fix_server + ai_executable propagates', async () => {
+    const result = await runOlpDoctor({
+      injectChecks: [
+        fakeCheck('server.running', 'server', 'fail', 'unreachable', {
+          fix_commands: ['olp restart'],
+        }),
+        fakeCheck('auth.owner_key_exists', 'auth', 'ok', 'present'),
+      ],
+    });
+    assert.equal(result.fail_count, 1);
+    assert.equal(result.kind, 'fix_server');
+    assert.deepEqual(result.next_action.ai_executable, ['olp restart']);
+    assert.equal(result.next_action.verify, 'olp doctor');
+  });
+
+  it('33c — auth.owner_key_exists FAIL (no server fail) → kind=fix_oauth', async () => {
+    const result = await runOlpDoctor({
+      injectChecks: [
+        fakeCheck('server.running', 'server', 'ok', 'live'),
+        fakeCheck('auth.owner_key_exists', 'auth', 'fail', 'no owner', {
+          fix_commands: ['npx olp-keys keygen --owner'],
+        }),
+      ],
+    });
+    assert.equal(result.kind, 'fix_oauth');
+    assert.deepEqual(result.next_action.ai_executable, ['npx olp-keys keygen --owner']);
+  });
+
+  it('33d — config.exists FAIL beats everything else → kind=fresh_install', async () => {
+    const result = await runOlpDoctor({
+      injectChecks: [
+        fakeCheck('config.exists', 'config', 'fail', 'missing', {
+          fix_commands: ['mkdir -p ~/.olp'],
+        }),
+        fakeCheck('server.running', 'server', 'fail', 'unreachable', {
+          fix_commands: ['olp restart'],
+        }),
+        fakeCheck('auth.owner_key_exists', 'auth', 'fail', 'no owner'),
+      ],
+    });
+    assert.equal(result.kind, 'fresh_install');
+    // ai_executable concatenates all FAIL evidence.fix_commands
+    assert.ok(result.next_action.ai_executable.includes('mkdir -p ~/.olp'));
+    assert.ok(result.next_action.ai_executable.includes('olp restart'));
+  });
+
+  it('33e — provider-category FAIL only → kind=fix_provider, human_steps propagate', async () => {
+    const result = await runOlpDoctor({
+      injectChecks: [
+        fakeCheck('server.running', 'server', 'ok', 'live'),
+        fakeCheck('auth.owner_key_exists', 'auth', 'ok', 'present'),
+        fakeCheck('anthropic.oauth_token_present', 'provider', 'fail', 'missing token', {
+          human_steps: ['run: claude  (browser OAuth)'],
+        }),
+      ],
+    });
+    assert.equal(result.kind, 'fix_provider');
+    assert.deepEqual(result.next_action.ai_executable, []);
+    assert.deepEqual(result.next_action.human_required, ['run: claude  (browser OAuth)']);
+  });
+
+  it('33f — collectProviderChecks reads plugin doctorChecks() (ADR 0002 Amendment 7)', () => {
+    // Synthetic plugin map that includes one plugin WITH doctorChecks() + one
+    // plugin WITHOUT (default behaviour — back-compat — contributes nothing).
+    const providers = new Map();
+    providers.set('alpha', {
+      name: 'alpha',
+      doctorChecks() {
+        return [
+          { id: 'alpha.cli_available', category: 'provider', async run() { return { status: 'ok', message: 'alpha bin ok' }; } },
+          { id: 'alpha.auth_present', category: 'provider', async run() { return { status: 'fail', message: 'alpha missing' }; } },
+        ];
+      },
+    });
+    providers.set('legacy', {
+      name: 'legacy',
+      // No doctorChecks() — plugin pre-amendment 7; collectProviderChecks ignores it
+    });
+    const checks = collectOlpProviderChecks({ providersOverride: providers });
+    const ids = checks.map(c => c.id).sort();
+    assert.deepEqual(ids, ['alpha.auth_present', 'alpha.cli_available']);
+    // Categories normalized to 'provider'
+    assert.ok(checks.every(c => c.category === 'provider'));
+  });
+
+  it('33g — plugin doctorChecks() that throws is captured (does not crash framework)', async () => {
+    const providers = new Map();
+    providers.set('bad', {
+      name: 'bad',
+      doctorChecks() { throw new Error('boom from bad plugin'); },
+    });
+    const checks = collectOlpProviderChecks({ providersOverride: providers });
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0].id, 'bad.doctor_checks_threw');
+    // Run it — should resolve to fail without re-throwing
+    const r = await checks[0].run();
+    assert.equal(r.status, 'fail');
+    assert.match(r.message, /boom from bad plugin/);
+  });
+
+  it('33h — --check filter restricts to matching id/category/prefix', async () => {
+    // Filter by category
+    const r1 = await runOlpDoctor({
+      injectChecks: [
+        fakeCheck('a.x', 'provider', 'ok'),
+        fakeCheck('b.y', 'system', 'ok'),
+      ],
+      checkFilter: 'system',
+    });
+    assert.equal(r1.checks.length, 1);
+    assert.equal(r1.checks[0].id, 'b.y');
+
+    // Filter by id prefix
+    const r2 = await runOlpDoctor({
+      injectChecks: [
+        fakeCheck('anthropic.cli_available', 'provider', 'ok'),
+        fakeCheck('anthropic.oauth_token_present', 'provider', 'ok'),
+        fakeCheck('openai.cli_available', 'provider', 'ok'),
+      ],
+      checkFilter: 'anthropic',
+    });
+    assert.equal(r2.checks.length, 2);
+    assert.ok(r2.checks.every(c => c.id.startsWith('anthropic.')));
+
+    // Filter by exact id
+    const r3 = await runOlpDoctor({
+      injectChecks: [
+        fakeCheck('anthropic.cli_available', 'provider', 'ok'),
+        fakeCheck('anthropic.oauth_token_present', 'provider', 'ok'),
+      ],
+      checkFilter: 'anthropic.cli_available',
+    });
+    assert.equal(r3.checks.length, 1);
+    assert.equal(r3.checks[0].id, 'anthropic.cli_available');
+  });
+
+  it('33i — built-in checks run against a temp OLP_HOME (no config → fresh_install)', async () => {
+    // skipNetwork: true so server.* checks don't run against the localhost port.
+    const tmpEmpty = mkdtempSync(pathJoin(tmpdir(), 'olp-doc-33i-'));
+    try {
+      const result = await runOlpDoctor({
+        olpHome: tmpEmpty,
+        skipNetwork: true,
+        // Don't load real provider plugins for this run; pass an empty Map.
+        providersOverride: new Map(),
+      });
+      assert.equal(result.schema_version, DOCTOR_SCHEMA_VERSION);
+      // config.exists must FAIL (no ~/.olp/config.json in tmpEmpty)
+      const configCheck = result.checks.find(c => c.id === 'config.exists');
+      assert.ok(configCheck, 'config.exists check should run');
+      assert.equal(configCheck.status, 'fail');
+      // kind must be fresh_install per the precedence rule
+      assert.equal(result.kind, 'fresh_install');
+      // ai_executable must include the mkdir + printf seed bootstrap
+      assert.ok(result.next_action.ai_executable.some(c => c.startsWith('mkdir -p')));
+    } finally {
+      rmSync(tmpEmpty, { recursive: true, force: true });
+    }
+  });
+
+  it('33j — anthropic plugin doctorChecks() returns the documented probe set', () => {
+    // Plugin contract: ADR 0002 Amendment 7. anthropic.mjs ships
+    // anthropic.cli_available + anthropic.oauth_token_present.
+    const checks = anthropic.doctorChecks();
+    assert.ok(Array.isArray(checks));
+    const ids = checks.map(c => c.id).sort();
+    assert.deepEqual(ids, ['anthropic.cli_available', 'anthropic.oauth_token_present']);
+    assert.ok(checks.every(c => c.category === 'provider'));
+    assert.ok(checks.every(c => typeof c.run === 'function'));
+  });
+
+  it('33k — resolveProxyUrl: explicit > env OLP_PROXY_URL > OLP_PORT > default', () => {
+    const SAVED_URL = process.env.OLP_PROXY_URL;
+    const SAVED_PORT = process.env.OLP_PORT;
+    try {
+      delete process.env.OLP_PROXY_URL;
+      delete process.env.OLP_PORT;
+      // 1. default = http://127.0.0.1:4567
+      assert.equal(resolveOlpProxyUrl(), 'http://127.0.0.1:4567');
+      // 2. OLP_PORT env
+      process.env.OLP_PORT = '9999';
+      assert.equal(resolveOlpProxyUrl(), 'http://127.0.0.1:9999');
+      // 3. OLP_PROXY_URL wins over OLP_PORT
+      process.env.OLP_PROXY_URL = 'https://example.com:8443';
+      assert.equal(resolveOlpProxyUrl(), 'https://example.com:8443');
+      // 4. Explicit opts wins over everything
+      assert.equal(resolveOlpProxyUrl({ proxyUrl: 'http://override:1234' }), 'http://override:1234');
+    } finally {
+      if (SAVED_URL === undefined) delete process.env.OLP_PROXY_URL;
+      else process.env.OLP_PROXY_URL = SAVED_URL;
+      if (SAVED_PORT === undefined) delete process.env.OLP_PORT;
+      else process.env.OLP_PORT = SAVED_PORT;
+    }
+  });
+
+  it('33l — deriveKind / deriveNextAction pure-function shape', () => {
+    // deriveKind unit
+    assert.equal(deriveOlpKind([{ status: 'ok', category: 'server', id: 'a' }]), 'noop');
+    assert.equal(deriveOlpKind([
+      { status: 'fail', category: 'server', id: 's.r' },
+      { status: 'fail', category: 'auth', id: 'a.o' },
+    ]), 'fix_server');  // server beats auth
+
+    // deriveNextAction aggregates evidence
+    const na = deriveOlpNextAction([
+      { status: 'fail', id: 'x', category: 'provider', evidence: { fix_commands: ['cmd1'], human_steps: ['step1'] } },
+      { status: 'fail', id: 'y', category: 'provider', evidence: { fix_commands: ['cmd2'] } },
+      { status: 'ok',   id: 'z', category: 'provider' },
+    ], 'fix_provider');
+    assert.deepEqual(na.ai_executable, ['cmd1', 'cmd2']);
+    assert.deepEqual(na.human_required, ['step1']);
+    assert.equal(na.verify, 'olp doctor');
+  });
+});

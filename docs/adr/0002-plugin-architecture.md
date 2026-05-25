@@ -7,7 +7,26 @@
 
 ## Amendments
 
-> **Note on numbering.** Sequence is 1, 3, 4, 5, 6 — Amendment 2 was never written. The reserved slot was originally planned for a separate `maxConcurrent` ratification, but that content was folded into Amendment 1 (the retroactive contract-sync amendment) at filing time and the gap was not backfilled. The gap is intentional and load-bearing — no missing content; do not renumber Amendments 3+ to close it (cross-references to Amendment N from other docs would silently break).
+> **Note on numbering.** Sequence is 1, 3, 4, 5, 6, 7 — Amendment 2 was never written. The reserved slot was originally planned for a separate `maxConcurrent` ratification, but that content was folded into Amendment 1 (the retroactive contract-sync amendment) at filing time and the gap was not backfilled. The gap is intentional and load-bearing — no missing content; do not renumber Amendments 3+ to close it (cross-references to Amendment N from other docs would silently break).
+
+### Amendment 7 — 2026-05-26: Add OPTIONAL `doctorChecks()` to the Provider contract (D67 — Phase 4 operator UX)
+
+- **Context:** ADR 0010 § Phase 4 D64-D67 ships `bin/olp.mjs` operator CLI + `olp doctor` framework. `olp doctor` runs a set of `Check` objects (id / category / async `run()` returning `{ status, message, evidence? }`) and discriminates the next remediation step via a `kind` field (`noop` / `fix_server` / `fix_oauth` / `fix_provider` / `fresh_install`). The framework needs per-provider checks so a user with a broken `claude` install gets a different fix recipe than a user with a broken `vibe` install. Hardcoding the recipes in `bin/olp.mjs` would re-introduce the kind of per-provider knowledge drift that ADR 0002 § Decision exists to prevent — when a new provider plugin lands, the operator CLI would have to be edited too.
+- **Change — add to Provider contract:**
+  - Introduce **OPTIONAL** `doctorChecks()` returning `DoctorCheck[]` where each `DoctorCheck` has the shape:
+    - `id: string` — unique per check, conventionally `<provider>.<probe-name>` (e.g. `anthropic.cli_available`, `anthropic.oauth_token_present`).
+    - `category: 'provider'` — fixed for plugin-contributed checks. The framework reserves `'server'`, `'auth'`, `'config'`, `'system'` for built-in checks.
+    - `async run(): { status: 'ok' | 'fail' | 'warn', message: string, evidence?: { fix_commands?: string[], human_steps?: string[], reference?: string } }` — runs the probe. `status: 'fail'` makes `olp doctor` exit non-zero and contributes to the `kind: fix_provider` discriminator; `evidence.fix_commands[]` is concatenated into `next_action.ai_executable[]` and `evidence.human_steps[]` into `next_action.human_required[]`.
+- **Backwards compatibility:** Plugins that omit `doctorChecks()` contribute zero provider checks. Their healthCheck() return value continues to flow through `/health.providers.status.<name>` exactly as today. No existing plugin behaviour changes; no existing test breaks. `validateProvider` in `lib/providers/base.mjs` is updated to type-check `doctorChecks` only when present (must be a function); absence is allowed.
+- **What `doctorChecks()` is for vs. what `healthCheck()` is for:**
+  - `healthCheck()` answers "is this provider currently usable?" — checked at the request-execution layer; output feeds `/health` and per-request retry decisions.
+  - `doctorChecks()` answers "if this provider is broken, what specific actionable steps fix it?" — checked at the operator layer; output feeds `olp doctor` + the `next_action.ai_executable[]` repair templates that a downstream AI agent can paste-and-run.
+- **Suggested probe set (per plugin):**
+  - `<provider>.cli_available` — spawn `<bin> --version` with short timeout (≤3s); fail → fix_commands include install instruction.
+  - `<provider>.<auth-artifact>_present` — check whether the auth file / env var the plugin's `readAuthArtifact()` reads is populated; fail → human_steps include the login command (which usually requires browser interaction and so cannot be in `ai_executable[]`).
+- **Authority:** ADR 0010 § Phase 4 D64-D67 (this is the addition called out by that charter). No provider CLI doc citation needed — `doctorChecks()` is an internal contract field. Implementation lands in D67 (this PR): `lib/providers/anthropic.mjs`, `lib/providers/codex.mjs`, `lib/providers/mistral.mjs` each gain a `doctorChecks()` method covering `cli_available` + `<auth-artifact>_present`.
+- **Tests:** Suite 32 (`bin/olp.mjs` CLI smoke) and Suite 33 (`olp doctor` framework) in `test-features.mjs` cover the contract amendment. Suite 33 specifically asserts: (a) a plugin without `doctorChecks()` contributes no provider checks (default behaviour), (b) a plugin with a failing `doctorChecks()` probe triggers `kind: fix_provider` and propagates its `evidence.fix_commands[]` into `next_action.ai_executable[]`, (c) all-passing checks yield `kind: noop`.
+- **Procedural mechanism:** CC 开发铁律 v1.6 § 11 (IDR) — the contract amendment, the plugin implementations, the doctor framework, and the CLI scaffold are tightly coupled. They land as a single PR (D64-D67 bundle) because reviewing them separately cannot verify that consumer + producer line up. Iron Rule 10 fresh-context reviewer per CLAUDE.md hard requirement #3.
 
 ### Amendment 6 — 2026-05-24: `maxConcurrent` runtime enforcement landed (D38, issue #1)
 

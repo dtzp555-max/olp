@@ -12035,3 +12035,426 @@ describe('Suite 26 — D52 audit rotation (Phase 3, ADR 0008 § 5)', () => {
     });
   });
 });
+
+// ── Suite 27: D57 streaming singleflight (cache layer) ─────────────────────
+//
+// Authority: ADR 0005 Amendment 8 §§1-11, 14 (issue #16, D57).
+//
+// Cache-layer unit tests for the streaming-singleflight tee fan-out. Each
+// test constructs a fake sourceFactory that returns an async generator
+// producing a fixed chunk sequence; the cache store coordinates dedup +
+// late-joiner replay + per-client backpressure. No real provider CLIs are
+// spawned; no HTTP requests issued. D58 will wire this into server.mjs in a
+// separate PR (Iron Rule 11).
+//
+// Test count: 12 (one per Amendment 8 §§1-11 + §14 fixture + composite-key
+// isolation). Aim for +12 tests minimum per D57 prompt.
+
+describe('Suite 27 — D57 streaming singleflight (cache layer)', () => {
+  // Helper: build a deterministic async source. Each yielded chunk waits a
+  // microtask so the tee/queue dynamics are observable across concurrent
+  // attached clients.
+  function makeChunkSequence(chunks, opts = {}) {
+    let returnedCount = 0;
+    const gen = (async function* fakeStream() {
+      try {
+        for (const c of chunks) {
+          if (opts.signal && opts.signal.aborted) return;
+          yield c;
+          await new Promise(r => setImmediate(r));
+        }
+      } finally {
+        returnedCount++;
+        if (opts.onReturn) opts.onReturn(returnedCount);
+      }
+    })();
+    return gen;
+  }
+
+  // D57 — ADR 0005 Amendment 8 §1: cache-hit + single client + source-mode
+  it('27a — single client streaming: behaviour identical to today (source role, full sequence)', async () => {
+    const store = new CacheStore({ _warnFn: () => {} });
+    let spawns = 0;
+    const factory = () => {
+      spawns++;
+      return makeChunkSequence(['a', 'b', 'c']);
+    };
+    const r = await store.getOrComputeStreaming('k1', 'ck-27a', factory);
+    assert.equal(r.isFirst, true);
+    assert.equal(r.role, 'source');
+    const out = [];
+    for await (const c of r.stream) out.push(c);
+    assert.deepEqual(out, ['a', 'b', 'c']);
+    assert.equal(spawns, 1);
+    // After completion, the cache should have an entry for replay.
+    const cached = await store.get('k1', 'ck-27a');
+    assert.ok(cached, 'cache populated post-completion');
+    assert.deepEqual(cached.value, ['a', 'b', 'c']);
+  });
+
+  // D57 — ADR 0005 Amendment 8 §1, §4: 2 concurrent identical streams
+  it('27b — 2 concurrent identical streams: only 1 sourceFactory call; identical chunks in order', async () => {
+    const store = new CacheStore({ _warnFn: () => {} });
+    let spawns = 0;
+    const factory = () => {
+      spawns++;
+      return makeChunkSequence(['x', 'y', 'z']);
+    };
+    const p1 = store.getOrComputeStreaming('k', 'ck-27b', factory, { clientId: 'A' });
+    const p2 = store.getOrComputeStreaming('k', 'ck-27b', factory, { clientId: 'B' });
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.equal(r1.isFirst, true);
+    assert.equal(r1.role, 'source');
+    assert.equal(r2.isFirst, false);
+    assert.equal(r2.role, 'attached');
+    const out1 = [];
+    const out2 = [];
+    const c1 = (async () => { for await (const c of r1.stream) out1.push(c); })();
+    const c2 = (async () => { for await (const c of r2.stream) out2.push(c); })();
+    await Promise.all([c1, c2]);
+    assert.equal(spawns, 1, 'sourceFactory invoked exactly once');
+    assert.deepEqual(out1, ['x', 'y', 'z']);
+    assert.deepEqual(out2, ['x', 'y', 'z']);
+  });
+
+  // D57 — ADR 0005 Amendment 8 §5: mid-stream join (replay burst + live tail)
+  //  + post-completion join (cache_hit)
+  it('27c — 3 concurrent, mid-stream join: A=source, B=attached (burst + tail), C=cache_hit', async () => {
+    const store = new CacheStore({ _warnFn: () => {} });
+    let spawns = 0;
+    // Six chunks. A iterates fast; B attaches after A has consumed ~3.
+    const factory = () => {
+      spawns++;
+      return makeChunkSequence(['1', '2', '3', '4', '5', '6']);
+    };
+    const r1 = await store.getOrComputeStreaming('k', 'ck-27c', factory, { clientId: 'A' });
+    assert.equal(r1.role, 'source');
+
+    // A iterates the first 3 chunks before B attaches.
+    const itA = r1.stream;
+    const outA = [];
+    const n1 = await itA.next(); outA.push(n1.value);
+    const n2 = await itA.next(); outA.push(n2.value);
+    const n3 = await itA.next(); outA.push(n3.value);
+
+    // Now B attaches mid-stream. Its replay drain picks up everything in
+    // accumulatedChunks at attach-time + the live tail thereafter.
+    const r2 = await store.getOrComputeStreaming('k', 'ck-27c', factory, { clientId: 'B' });
+    assert.equal(r2.role, 'attached');
+
+    // A finishes consuming.
+    const outA2 = [];
+    for await (const c of itA) outA2.push(c);
+    const outB = [];
+    for await (const c of r2.stream) outB.push(c);
+
+    assert.deepEqual([...outA, ...outA2], ['1', '2', '3', '4', '5', '6']);
+    // B receives the full sequence too (burst replays earlier chunks + live tail).
+    assert.deepEqual(outB, ['1', '2', '3', '4', '5', '6']);
+    assert.equal(spawns, 1, 'still only 1 spawn');
+
+    // C attaches AFTER source completion → cache_hit (not inflight, not respawn).
+    const r3 = await store.getOrComputeStreaming('k', 'ck-27c', factory, { clientId: 'C' });
+    assert.equal(r3.role, 'cache_hit');
+    assert.equal(r3.isFirst, false);
+    const outC = [];
+    for await (const c of r3.stream) outC.push(c);
+    assert.deepEqual(outC, ['1', '2', '3', '4', '5', '6']);
+    assert.equal(spawns, 1, 'no additional spawns');
+  });
+
+  // D57 — ADR 0005 Amendment 8 §9: first client early-return, others continue
+  it('27d — first client iterator early-return mid-stream: others continue; source NOT aborted; cache written', async () => {
+    const warnings = [];
+    const store = new CacheStore({ _warnFn: (msg, meta) => warnings.push({ msg, meta }) });
+    let sourceReturned = false;
+    const factory = () => (async function* () {
+      try {
+        for (let i = 0; i < 6; i++) {
+          yield `chunk-${i}`;
+          await new Promise(r => setImmediate(r));
+        }
+      } finally { sourceReturned = true; }
+    })();
+    const r1 = await store.getOrComputeStreaming('k', 'ck-27d', factory, { clientId: 'A' });
+    const r2 = await store.getOrComputeStreaming('k', 'ck-27d', factory, { clientId: 'B' });
+    // A early-returns after 2 chunks; B keeps consuming.
+    const itA = r1.stream;
+    const outA = [];
+    outA.push((await itA.next()).value);
+    outA.push((await itA.next()).value);
+    await itA.return(); // simulates HTTP client close
+    const outB = [];
+    for await (const c of r2.stream) outB.push(c);
+    // Source should have completed normally (not aborted) because B was still attached.
+    assert.equal(sourceReturned, true);
+    assert.deepEqual(outB, ['chunk-0', 'chunk-1', 'chunk-2', 'chunk-3', 'chunk-4', 'chunk-5']);
+    // Cache should be populated post-completion (B was a live client to the end).
+    const cached = await store.get('k', 'ck-27d');
+    assert.ok(cached, 'cache populated despite A\'s mid-stream return');
+    // No abort warning emitted.
+    assert.equal(warnings.filter(w => w.msg === 'streaming_inflight_abort').length, 0);
+  });
+
+  // D57 — ADR 0005 Amendment 8 §9: all clients disconnect → source aborted, no cache
+  it('27e — all clients disconnect mid-stream: source aborted via AbortController; no cache write; next call respawns', async () => {
+    const warnings = [];
+    const store = new CacheStore({ _warnFn: (msg, meta) => warnings.push({ msg, meta }) });
+    let spawns = 0;
+    let sourceReturned = false;
+    const factory = () => {
+      spawns++;
+      return (async function* () {
+        try {
+          for (let i = 0; i < 20; i++) {
+            yield `c-${i}`;
+            await new Promise(r => setImmediate(r));
+          }
+        } finally { sourceReturned = true; }
+      })();
+    };
+    const r1 = await store.getOrComputeStreaming('k', 'ck-27e', factory, { clientId: 'A' });
+    const itA = r1.stream;
+    await itA.next();
+    await itA.next();
+    await itA.return();
+    // Wait microtasks for the tee task to observe attachedClients.size === 0 and abort.
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(sourceReturned, true);
+    assert.equal(warnings.filter(w => w.msg === 'streaming_inflight_abort').length, 1);
+    // No cache entry — subsequent call respawns (no inflight, no cache hit).
+    const cached = await store.get('k', 'ck-27e');
+    assert.equal(cached, null, 'no cache write on abort');
+    const r2 = await store.getOrComputeStreaming('k', 'ck-27e', factory, { clientId: 'B' });
+    assert.equal(r2.role, 'source', 'subsequent call gets fresh source spawn');
+    assert.equal(spawns, 2);
+    // Drain r2 so it doesn't dangle.
+    for await (const _c of r2.stream) { /* drain */ }
+  });
+
+  // D57 — ADR 0005 Amendment 8 §4: source throws mid-stream
+  it('27f — source throws mid-stream: all attached clients receive the error; no cache write; entry removed', async () => {
+    const warnings = [];
+    const store = new CacheStore({ _warnFn: (msg, meta) => warnings.push({ msg, meta }) });
+    const err = new Error('synthetic source failure');
+    const factory = () => (async function* () {
+      yield 'a';
+      await new Promise(r => setImmediate(r));
+      yield 'b';
+      await new Promise(r => setImmediate(r));
+      throw err;
+    })();
+    const r1 = await store.getOrComputeStreaming('k', 'ck-27f', factory, { clientId: 'A' });
+    const r2 = await store.getOrComputeStreaming('k', 'ck-27f', factory, { clientId: 'B' });
+    // Both clients should reject when the source throws.
+    let e1, e2;
+    const c1 = (async () => { try { for await (const _c of r1.stream) {} } catch (e) { e1 = e; } })();
+    const c2 = (async () => { try { for await (const _c of r2.stream) {} } catch (e) { e2 = e; } })();
+    await Promise.all([c1, c2]);
+    assert.ok(e1, 'client A received error');
+    assert.ok(e2, 'client B received error');
+    assert.equal(e1.message, 'synthetic source failure');
+    assert.equal(e2.message, 'synthetic source failure');
+    // No cache write.
+    const cached = await store.get('k', 'ck-27f');
+    assert.equal(cached, null);
+    // Inflight entry removed (next call would respawn).
+    assert.equal(store.stats('k').inflightCount, 0);
+  });
+
+  // D57 — ADR 0005 Amendment 8 §8: backpressure — slow client overflows queue
+  it('27g — backpressure: slow client queue overflow → STREAM_BACKPRESSURE terminator; fast client unaffected', async () => {
+    const warnings = [];
+    const store = new CacheStore({ _warnFn: (msg, meta) => warnings.push({ msg, meta }) });
+    // Inject perClientQueueCap=1024 bytes; chunks ~256B each.
+    const bigText = 'x'.repeat(250);
+    const factory = () => makeChunkSequence(
+      [{ idx: 0, t: bigText }, { idx: 1, t: bigText }, { idx: 2, t: bigText }, { idx: 3, t: bigText }, { idx: 4, t: bigText }, { idx: 5, t: bigText }, { type: 'stop', finish_reason: 'stop' }]
+    );
+    const r1 = await store.getOrComputeStreaming('k', 'ck-27g', factory, { clientId: 'fast', perClientQueueCap: 1024 });
+    const r2 = await store.getOrComputeStreaming('k', 'ck-27g', factory, { clientId: 'slow', perClientQueueCap: 1024 });
+    // Fast drains immediately; slow defers consumption.
+    const fastOut = [];
+    const fast = (async () => { for await (const c of r1.stream) fastOut.push(c); })();
+    await fast;
+    // Now consume slow's stream; should hit backpressure terminator.
+    const slowOut = [];
+    for await (const c of r2.stream) slowOut.push(c);
+    // Fast client received the full sequence.
+    assert.equal(fastOut.length, 7);
+    assert.deepEqual(fastOut[6], { type: 'stop', finish_reason: 'stop' });
+    // Slow client received some prefix + the STREAM_BACKPRESSURE terminator.
+    assert.deepEqual(slowOut[slowOut.length - 2], { type: 'stop', finish_reason: 'length' });
+    assert.equal(slowOut[slowOut.length - 1], '[DONE]');
+    assert.ok(slowOut.length < 7, 'slow client cut short before reaching natural end');
+    // Backpressure warning emitted for slow client.
+    const bp = warnings.filter(w => w.msg === 'stream_backpressure_disconnect');
+    assert.ok(bp.length >= 1, 'at least one stream_backpressure_disconnect emitted');
+    assert.ok(bp.some(w => w.meta.client_id === 'slow'), 'slow client identified in warning');
+  });
+
+  // D57 — ADR 0005 Amendment 8 §10: replay buffer cap — cache write skipped
+  it('27h — replay cap exceeded: cache write skipped; first caller still receives full stream; late joiner past cap gets STREAM_BACKPRESSURE', async () => {
+    const warnings = [];
+    const store = new CacheStore({ _warnFn: (msg, meta) => warnings.push({ msg, meta }) });
+    const big = 'y'.repeat(400);
+    // Source emits 6 chunks at ~400B each → ~2400B total, exceeds replay cap 1024.
+    const factory = () => makeChunkSequence(
+      [{ t: big }, { t: big }, { t: big }, { t: big }, { t: big }, { t: big }]
+    );
+    const r1 = await store.getOrComputeStreaming('k', 'ck-27h', factory, {
+      clientId: 'first',
+      accumulatedReplayCap: 1024,
+      perClientQueueCap: 1024 * 1024, // huge per-client cap so first caller never overflows
+    });
+    // First caller iterates through.
+    const itA = r1.stream;
+    const outA = [];
+    // Pull 2 chunks then attempt late join while past cap.
+    outA.push((await itA.next()).value);
+    outA.push((await itA.next()).value);
+    outA.push((await itA.next()).value); // now well past 1024B accumulated
+    // Late joiner attaches past replay cap → gets STREAM_BACKPRESSURE.
+    const r2 = await store.getOrComputeStreaming('k', 'ck-27h', factory, {
+      clientId: 'late',
+      accumulatedReplayCap: 1024,
+      perClientQueueCap: 1024,
+    });
+    assert.equal(r2.role, 'attached');
+    const outLate = [];
+    for await (const c of r2.stream) outLate.push(c);
+    // Late joiner's stream is just the backpressure terminator (drain over cap).
+    assert.deepEqual(outLate, [{ type: 'stop', finish_reason: 'length' }, '[DONE]']);
+    // Drain first caller fully.
+    for await (const c of itA) outA.push(c);
+    assert.equal(outA.length, 6, 'first caller receives full source stream');
+    // Cache write skipped.
+    const cached = await store.get('k', 'ck-27h');
+    assert.equal(cached, null, 'cache NOT written when replay cap exceeded');
+    // Replay-cap-exceeded warning emitted.
+    assert.ok(
+      warnings.some(w => w.msg === 'streaming_inflight_replay_cap_exceeded'),
+      'replay-cap-exceeded warning fired'
+    );
+  });
+
+  // D57 — ADR 0005 Amendment 8 §6: cache TTL race — late joiner attaches via inflight
+  it('27i — cache TTL race: cached entry expires during inflight; late joiner attaches via inflight Map', async () => {
+    const store = new CacheStore({ _warnFn: () => {} });
+    // Pre-populate cache with TTL=10ms — will expire shortly.
+    await store.set('k', 'ck-27i', ['cached-a', 'cached-b'], 10);
+    // Wait so the cached entry expires.
+    await new Promise(r => setTimeout(r, 20));
+    // Now a streaming request comes in: cache is expired → entry is recomputed.
+    let spawns = 0;
+    const factory = () => {
+      spawns++;
+      return makeChunkSequence(['live-1', 'live-2', 'live-3']);
+    };
+    const r1 = await store.getOrComputeStreaming('k', 'ck-27i', factory, { clientId: 'A' });
+    assert.equal(r1.role, 'source', 'expired cache → fresh source spawn');
+    // While the source is running, a late joiner arrives — must attach via inflight Map.
+    const r2 = await store.getOrComputeStreaming('k', 'ck-27i', factory, { clientId: 'B' });
+    assert.equal(r2.role, 'attached', 'late joiner attaches via inflight Map even after cache expiry');
+    assert.equal(spawns, 1, 'no respawn');
+    // Drain both.
+    const o1 = []; for await (const c of r1.stream) o1.push(c);
+    const o2 = []; for await (const c of r2.stream) o2.push(c);
+    assert.deepEqual(o1, ['live-1', 'live-2', 'live-3']);
+    assert.deepEqual(o2, ['live-1', 'live-2', 'live-3']);
+    // Inflight completion overwrites the expired slot.
+    const cached = await store.get('k', 'ck-27i');
+    assert.ok(cached);
+    assert.deepEqual(cached.value, ['live-1', 'live-2', 'live-3']);
+  });
+
+  // D57 — ADR 0005 Amendment 8 §7: sourceFactory throws → first caller errors; no zombie state
+  it('27j — sourceFactory throws (e.g. CONCURRENCY_LIMIT): first caller errors; subsequent call retries; no zombie inflight', async () => {
+    const store = new CacheStore({ _warnFn: () => {} });
+    let attempts = 0;
+    const factory = () => {
+      attempts++;
+      if (attempts === 1) {
+        throw new Error('CONCURRENCY_LIMIT');
+      }
+      return makeChunkSequence(['a', 'b']);
+    };
+    let firstErr;
+    try {
+      await store.getOrComputeStreaming('k', 'ck-27j', factory, { clientId: 'A' });
+    } catch (e) {
+      firstErr = e;
+    }
+    assert.ok(firstErr, 'first call rejected with factory error');
+    assert.equal(firstErr.message, 'CONCURRENCY_LIMIT');
+    // No zombie inflight entry left dangling.
+    assert.equal(store.stats('k').inflightCount, 0, 'no stale streaming-inflight entry');
+    // Subsequent call uses the factory again (it returns a real iterator now).
+    const r2 = await store.getOrComputeStreaming('k', 'ck-27j', factory, { clientId: 'B' });
+    assert.equal(r2.role, 'source');
+    const out = [];
+    for await (const c of r2.stream) out.push(c);
+    assert.deepEqual(out, ['a', 'b']);
+    assert.equal(attempts, 2);
+  });
+
+  // D57 — ADR 0005 Amendment 8 §1: stats accounting (hits / misses / inflightCount)
+  it('27k — stats: hits incremented for cache_hit + attached; misses for source; inflightCount reflects active streaming entries', async () => {
+    const store = new CacheStore({ _warnFn: () => {} });
+    const factory = () => makeChunkSequence(['p', 'q', 'r']);
+
+    // First caller — miss.
+    const r1 = await store.getOrComputeStreaming('k', 'ck-27k', factory, { clientId: 'A' });
+    let stats = store.stats('k');
+    assert.equal(stats.misses, 1, 'first caller increments misses');
+    assert.equal(stats.hits, 0);
+    // Inflight entry alive during source phase.
+    assert.equal(stats.inflightCount, 1, 'streaming entry counted in inflightCount');
+
+    // Concurrent joiner — attached → hit.
+    const r2 = await store.getOrComputeStreaming('k', 'ck-27k', factory, { clientId: 'B' });
+    stats = store.stats('k');
+    assert.equal(stats.hits, 1, 'attached client increments hits');
+    // Drain both.
+    await Promise.all([
+      (async () => { for await (const _c of r1.stream) {} })(),
+      (async () => { for await (const _c of r2.stream) {} })(),
+    ]);
+    // After completion, entry removed from inflight.
+    stats = store.stats('k');
+    assert.equal(stats.inflightCount, 0, 'streaming entry removed post-completion');
+
+    // Third call after completion — cache_hit (also a hit).
+    const r3 = await store.getOrComputeStreaming('k', 'ck-27k', factory, { clientId: 'C' });
+    assert.equal(r3.role, 'cache_hit');
+    for await (const _c of r3.stream) { /* drain */ }
+    stats = store.stats('k');
+    assert.equal(stats.hits, 2, 'cache_hit also increments hits');
+  });
+
+  // D57 — ADR 0005 Amendment 8 §2: composite key isolation (keyId\0cacheKey)
+  it('27l — composite key isolation: same cacheKey + different keyId → two independent inflight entries + two spawns', async () => {
+    const store = new CacheStore({ _warnFn: () => {} });
+    let spawns = 0;
+    const factory = () => {
+      spawns++;
+      return makeChunkSequence(['n1', 'n2']);
+    };
+    // Same cacheKey, different keyId.
+    const p1 = store.getOrComputeStreaming('key-A', 'shared-cache-key', factory, { clientId: 'A' });
+    const p2 = store.getOrComputeStreaming('key-B', 'shared-cache-key', factory, { clientId: 'B' });
+    const [r1, r2] = await Promise.all([p1, p2]);
+    // Both should be `source` — no cross-keyId sharing.
+    assert.equal(r1.role, 'source');
+    assert.equal(r2.role, 'source');
+    assert.equal(spawns, 2, 'two spawns because two distinct (keyId,cacheKey) composites');
+    // Drain.
+    const out1 = []; for await (const c of r1.stream) out1.push(c);
+    const out2 = []; for await (const c of r2.stream) out2.push(c);
+    assert.deepEqual(out1, ['n1', 'n2']);
+    assert.deepEqual(out2, ['n1', 'n2']);
+    // Stats: each keyId has its own miss counter.
+    assert.equal(store.stats('key-A').misses, 1);
+    assert.equal(store.stats('key-B').misses, 1);
+  });
+});

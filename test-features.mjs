@@ -12894,4 +12894,37 @@ describe('Suite 28 — D58 streaming singleflight (server.mjs HTTP wiring, ADR 0
       try { releaseSig(); } catch { /* already released */ }
     }
   });
+
+  it('28i — stop-less exhaustion: source generator returns without {type:"stop"} → cache NOT populated (D58 follow-up to D58 reviewer P2-2)', async () => {
+    // ADR 0005 § "Cache write conditions" item 1 (D16 truncated-not-cached
+    // invariant): if the source generator exhausts without emitting a stop
+    // chunk, the response is treated as truncated and MUST NOT persist in
+    // cache. D57's cache layer is IR-agnostic and writes accumulatedChunks
+    // on any source exhaustion; D58's server.mjs handles the IR semantics by
+    // calling cacheStore.delete(...) immediately after on the no-stop path.
+    // This test pins the end-to-end behaviour from the HTTP layer.
+    const counter = { count: 0 };
+    const fake = {
+      ...savedAnthropic28,
+      spawn: async function* (_ir, _ctx) {
+        counter.count++;
+        yield { type: 'delta', content: 'no-stop-1' };
+        yield { type: 'delta', content: 'no-stop-2' };
+        // Generator returns WITHOUT a stop chunk — truncation path.
+      },
+    };
+    lp28.set('anthropic', fake);
+    const r1 = await makeStreamRequest({ prompt: 'd58-28i' });
+    assert.equal(r1.status, 200, '28i r1: SSE response 200');
+    assert.equal(counter.count, 1, '28i r1: spawned once');
+    // The synthetic truncation marker {type:"stop", finish_reason:"length"}
+    // should appear (D26 F19 in-band signal); [DONE] terminator follows.
+    assert.ok(r1.body.includes('"finish_reason":"length"'),
+      `28i r1: truncation marker expected; body=${r1.body.slice(0, 300)}`);
+    assert.ok(r1.body.includes('[DONE]'), '28i r1: [DONE] terminator');
+    // Subsequent identical request must respawn (cache was NOT populated).
+    const r2 = await makeStreamRequest({ prompt: 'd58-28i' });
+    assert.equal(r2.status, 200, '28i r2: SSE response 200');
+    assert.equal(counter.count, 2, '28i r2: second request triggered a fresh spawn (no cache reuse for truncated entry)');
+  });
 });

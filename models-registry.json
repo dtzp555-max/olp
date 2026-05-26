@@ -5,6 +5,7 @@
     "schema_version": "2026-05-26",
     "comment": "D81 — ADR 0013 Rule 5 mandate: schema_version pinned in registry so downstream consumers can detect schema drift. fields_pinned is load-bearing: if Anthropic adds/renames a header, dashboard consumers comparing field-presence against this list can flag 'schema drift detected'. Last verified: 2026-05-26 via live probe against api.anthropic.com (Path B per ADR 0013 Rule 5).",
     "anthropic": {
+      "status": "live",
       "source": "anthropic-ratelimit-unified-headers",
       "endpoint": "https://api.anthropic.com/v1/messages",
       "fields_pinned": [
@@ -22,6 +23,17 @@
         "overage_disabled_reason",
         "overage_reset"
       ]
+    },
+    "openai": {
+      "status": "unavailable",
+      "reason": "no public quota endpoint exposed by the openai/codex CLI; audit-derived spend tracking only at v0.5.0",
+      "re_entry_point": "lib/providers/openai.mjs DL-N (when OpenAI publishes a documented quota endpoint)"
+    },
+    "mistral": {
+      "status": "unavailable",
+      "reason": "no public quota endpoint accessible to Vibe / Le Chat member / La Plateforme API keys per D84 spike 2026-05-26 (https://docs.mistral.ai/api). Mistral Admin API exposes billing/usage but requires org-admin scope (out of scope for OLP family-tier deployment).",
+      "re_entry_point": "lib/providers/mistral.mjs DL-7 (when Mistral publishes a member-key-accessible usage endpoint, or when OLP scope expands to admin-key deployment)",
+      "admin_api_reference": "https://docs.mistral.ai/admin/security-access/admin-api"
     }
   },
   "bootstrapCreated": 1778630400,

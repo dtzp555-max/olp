@@ -8,13 +8,15 @@
 
 ### Amendment 1 — 2026-05-26: D84 Mistral probe NO-GO (post-D79-close spike)
 
-The D-day table originally listed D84 as "optional, depends on D79-close 30-min Mistral docs spike". The spike completed 2026-05-26 with verdict **NO-GO** — Mistral does not expose a programmatic quota/usage endpoint:
+The D-day table originally listed D84 as "optional, depends on D79-close 30-min Mistral docs spike". The spike completed 2026-05-26 with verdict **NO-GO** — Mistral does not expose a programmatic quota/usage endpoint **accessible to Vibe / Le Chat member / La Plateforme API keys** (the key tier OLP uses for spawning the `vibe` CLI):
 
-- `docs.mistral.ai/api` covers Chat, FIM, Embeddings, Classifiers, Files, Models, Batch, OCR, Audio, Events, Beta (Agents/Conversations/Libraries/Workflows/Observability). No usage/quota/credits/billing/limits endpoint anywhere.
+- `docs.mistral.ai/api` (the public API spec) covers Chat, FIM, Embeddings, Classifiers, Files, Models, Batch, OCR, Audio, Events, Beta (Agents/Conversations/Libraries/Workflows/Observability). No usage/quota/credits/billing/limits endpoint accessible to a member API key.
 - Direct probe `https://api.mistral.ai/v1/usage` returns 404.
-- Mistral's own "Limits and Usage" help article says limits are viewable only via the web console (`admin.mistral.ai/plateforme/limits`); no API endpoint mentioned.
+- Mistral's "Limits and Usage" help article documents limit viewing via the `admin.mistral.ai/plateforme/limits` web console.
 - No `x-ratelimit-*` response headers documented on `/v1/chat/completions`. (Third-party summaries mentioning these headers are unsourced — appears to be OpenAI-convention extrapolation.)
 - OLP `lib/providers/mistral.mjs` already records this independently — DL-7 comment: "If quota/budget API surfaces in Le Chat Pro, pin the endpoint here."
+
+**Out-of-scope but worth pinning for future revisit.** Mistral's [Admin API](https://docs.mistral.ai/admin/security-access/admin-api) DOES expose programmatic "Billing and usage queries", and the [Usage limits docs](https://docs.mistral.ai/admin/user-management-finops/usage-limits) describe usage/cost queries via that surface. The Admin API requires an **org-admin scoped API key** (separate from the member key OLP uses). For OLP's family-tier deployment posture (a maintainer's personal Le Chat Pro / La Plateforme account, not an organization's admin console), provisioning + storing an org-admin token raises the credential-scope ceiling beyond what the trusted-LAN deployment context (ADR 0011) was designed for. The NO-GO at v0.5.0 is therefore "out of scope for OLP's current deployment posture", NOT "Mistral has no programmatic surface". If the deployment posture expands to an org-admin context (e.g., a small-business multi-user deployment), this decision should be re-evaluated.
 
 **Disposition:**
 - D84 row dropped from D-day plan (struck through below).

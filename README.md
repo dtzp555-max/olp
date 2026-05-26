@@ -209,7 +209,7 @@ Per-IDE setup details: [`docs/integrations/`](./docs/integrations/README.md). Te
 
 ## Supported Providers
 
-Source of truth: [`models-registry.json`](./models-registry.json). This table is regenerated from the registry per the [`release_kit`](./CLAUDE.md) overlay; do not edit it out of sync.
+Source of truth: [`models-registry.json`](./models-registry.json). Per-provider columns are sourced from the registry's `providers.<key>` block (model metadata + tier) and `quota_probe.<key>` block (D81+; probe status / reason / source). This table is regenerated from the registry per the [`release_kit`](./CLAUDE.md) overlay; do not edit it out of sync.
 
 OLP distinguishes **Candidate Providers** (declared as intended, not yet pinned) from **Enabled Providers** (authority pin filled + plugin landed + Phase audit passed). The v0.1 founding commit ships **zero Enabled Providers** — enablement is a Phase audit deliverable, not a bootstrap claim. See [`ALIGNMENT.md` § Provider Inventory](./ALIGNMENT.md) for the transition gate.
 
@@ -219,7 +219,7 @@ OLP distinguishes **Candidate Providers** (declared as intended, not yet pinned)
 |---|---|---|---|---|---|
 | `anthropic` | `claude -p` | Pro / Max OAuth (pre-2026-06-15); Agent SDK Credit pool after | ✅ Live (13 `anthropic-ratelimit-unified-*` headers; opt-in via `quota_probe_enabled`) | D (re-eval post-2026-06-15) | Phase 1 |
 | `openai` | `codex exec --json` | ChatGPT Pro OAuth or API key | ❌ Not available (no public quota API) — audit-derived spend tracking only | D | Phase 2 |
-| `mistral` | `vibe --prompt --output json` | Le Chat Pro API key | ❌ Not available per D84 spike 2026-05-26 (no `/v1/usage` endpoint at docs.mistral.ai/api) — audit-derived spend tracking only | D | Phase 3 |
+| `mistral` | `vibe --prompt --output json` | Le Chat Pro API key | ❌ Not implemented at v0.5.0 — no public quota endpoint accessible to Vibe / Le Chat member / La Plateforme API keys per D84 spike 2026-05-26. Mistral's [Admin API](https://docs.mistral.ai/admin/security-access/admin-api) does expose billing / usage queries but requires an org-admin scope (out of scope for OLP family-tier deployment). Audit-derived spend tracking only at v0.5.0. | D | Phase 3 |
 | `grok` | `grok -p --output-format streaming-json` | xAI Build `xai-...` API key | TBD (Phase 8+) | C | Phase 8+ |
 | `kimi` | `kimi -p --output-format stream-json` | Moonshot Kimi API key | TBD (Phase 8+) | C | Phase 8+ |
 | `minimax` | TBD | MiniMax Token Plan (¥29+/mo) | TBD (Phase 8+) | B | Phase 8+ |
@@ -308,7 +308,7 @@ The probe is **opt-in** (default off) per ADR 0013 Rule 4 — a fresh OLP instal
 
 The probe reads the OAuth token from (in order): `CLAUDE_CODE_OAUTH_TOKEN` env var, `~/.claude/.credentials.json`, macOS Keychain entry `"Claude Code-credentials"`. Make sure Claude Code is logged in (`claude setup-token` or equivalent) before opting in.
 
-`olp doctor` adds a `anthropic.quota_probe_reachable` check when the probe is enabled — surfaces `kind: fix_oauth` on 401/403 with a recovery recipe, `kind: fix_provider` on 429 or network failure, and `status: ok` with the parsed utilization data on success.
+`olp doctor` adds a `anthropic.quota_probe_reachable` check when the probe is enabled. The check has `category: 'provider'`, so any failure (401/403 token-expiry, 429 rate-limit, network error) discriminates to `kind: fix_provider`. The `human_steps` recovery recipe inside the check distinguishes the underlying cause (re-login via `claude setup-token` for auth failures vs wait-and-retry for rate-limit) — the discriminator is uniformly `fix_provider` but the actionable text is auth-aware. Successful probes return `status: ok` with the parsed 5h / 7d utilization in the message body; stale-cache returns `status: warn`. Routing an auth-class failure to `kind: fix_oauth` (the other discriminator the framework supports) would require splitting this check across the `provider` / `auth` boundary — deferred to v1.x if `olp doctor` consumers report the ambiguity.
 
 ### Provider coverage
 
@@ -316,7 +316,7 @@ The probe reads the OAuth token from (in order): `CLAUDE_CODE_OAUTH_TOKEN` env v
 |---|---|---|
 | `anthropic` | ✅ Live — 13 fields via `anthropic-ratelimit-unified-*` headers | This section |
 | `openai` (codex) | ❌ Not available — `openai/codex` CLI has no public quota API | Falls back to audit-derived request counts |
-| `mistral` | ❌ Not available per D84 spike 2026-05-26 — Mistral docs expose limits only via the `admin.mistral.ai/plateforme/limits` web console | Falls back to audit-derived request counts |
+| `mistral` | ❌ Not implemented at v0.5.0 — no public quota endpoint accessible to Vibe / Le Chat member / La Plateforme API keys. Mistral's Admin API does expose billing / usage queries but is gated to org-admin scope and out of scope for OLP family-tier deployment. | Falls back to audit-derived request counts |
 
 If Mistral ever publishes a usage endpoint, `lib/providers/mistral.mjs` DL-7 marks the re-entry point.
 

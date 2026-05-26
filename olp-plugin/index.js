@@ -138,12 +138,32 @@ export function fmtHealth(body) {
   if (body.uptime_human || body.uptimeHuman) {
     out += `Uptime: ${body.uptime_human ?? body.uptimeHuman}\n`;
   }
+  // D74 P2-4 fix: server.mjs /health full payload is
+  //   body.providers = { enabled: N, available: N, status: { <name>: {...} } }
+  // The plugin previously iterated Object.entries(body.providers), which
+  // surfaced `enabled`, `available`, and `status` as pseudo-providers
+  // (typeof status === 'object' → loop body fired with name='status').
+  // Walk providers.status when present; fall back to providers.* for the
+  // older OCP shape that lacks the .status wrapper.
   if (body.providers && typeof body.providers === "object") {
-    out += `\nProviders:\n`;
-    for (const [name, s] of Object.entries(body.providers)) {
-      if (typeof s !== "object" || s === null) continue;
-      const i = statusIcon(s?.ok ? "ok" : "fail");
-      out += `  ${i} ${name}\n`;
+    const enabled = body.providers.enabled;
+    const available = body.providers.available;
+    if (typeof enabled === "number" || typeof available === "number") {
+      out += `Providers: ${enabled ?? "?"} enabled / ${available ?? "?"} available\n`;
+    }
+    const statusMap = body.providers.status && typeof body.providers.status === "object"
+      ? body.providers.status
+      : body.providers;
+    const entries = Object.entries(statusMap).filter(
+      ([name, s]) => typeof s === "object" && s !== null && name !== "enabled" && name !== "available" && name !== "status"
+    );
+    if (entries.length > 0) {
+      out += `\nProviders:\n`;
+      for (const [name, s] of entries) {
+        const i = statusIcon(s?.ok ? "ok" : "fail");
+        const spawn = typeof s?.activeSpawns === "number" ? `  spawns=${s.activeSpawns}` : "";
+        out += `  ${i} ${name}${spawn}\n`;
+      }
     }
   }
   return out;

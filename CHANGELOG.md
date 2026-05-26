@@ -6,6 +6,24 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 (empty — Phase 5 entries land here once Phase 5 opens)
 
+## v0.4.1 — 2026-05-26
+
+### Post-Phase-4 hotfix batch (D74) — maintainer-review findings
+
+Patch release fixing 5 issues caught by maintainer post-v0.4.0 independent review. Every finding was a real runtime bug that the per-D-day fresh-context opus reviewers all missed because they reviewed against spec text, not against the runtime contract (default `auth.allow_anonymous: false`, real `/health` payload shape, real `/cache/stats` payload shape, real `/v0/management/dashboard-data` payload shape). **Phase 4 lesson: future implementation D-days MUST include at least one test that boots the server with the default production config and exercises the new feature end-to-end** — not just stub-mocked codepaths.
+
+- **[P1-1] `olp doctor` no longer false-negatives on auth-required `/health`.** `lib/doctor.mjs` now accepts an `authHeaders` option (threaded from `bin/olp.mjs` `cmdDoctor` via the existing `authHeaders()` chain) and passes it to the `server.running` + `server.version` probes. The `server.running` check now distinguishes 401/403 ("server up but bearer token missing/invalid — set `OLP_API_KEY`") from "server unreachable" — so the `kind` discriminator routes to a clean fix-auth path instead of `fix_server` when the operator just forgot to export the env var.
+- **[P1-2] `bin/olp-connect` validates token shape + shell-quotes rc writes.** New `validate_olp_token <key> <source>` helper enforces the `^olp_[A-Za-z0-9_-]{43}$` regex (per ADR 0007 § 3 token format) at all 3 input sites: `--key` arg, `/health.anonymousKey` server-advertised consumption, and the interactive prompt fallback. New `shell_quote <value>` helper wraps rc-file writes (`export OPENAI_BASE_URL=$(shell_quote ...)`) so even a hypothetical bypass of the validator can't inject shell metacharacters into a sourced rc. systemd `environment.d/olp.conf` write additionally rejects embedded newlines. Hostile or malformed keys can no longer persist as shell startup injection.
+- **[P2-3] `olp usage` + `olp cache` human formatter rewritten against the real payload shape.** `cmdUsage` previously read `body.usage_24h.requests` / `body.providers` / `body.top_fallback_chains` — all undefined under the actual server payload shape — so users saw "requests: ?" + missing per-provider quota + missing top-chains. Now reads `body.window_24h.request_count` / `body.cache_hit_24h.hit_rate` / `body.quota` / `body.top_fallback_chains_24h` per `server.mjs:2027` + `lib/audit-query.mjs`. `cmdCache` previously read `body.entries` / `body.bytes` / `body.maxBytes` (OCP-era field names). Now reads `body.size` / `body.inflightCount` per `CacheStore.stats()` and computes hit rate from `hits + misses`.
+- **[P2-4] `olp-plugin/` `fmtHealth` iterates `providers.status` correctly.** Previously walked `Object.entries(body.providers)` which surfaced `enabled` / `available` / `status` as pseudo-providers (chat output showed `🟢 status` instead of `🟢 anthropic`). Now extracts the real provider map from `body.providers.status` and renders enabled/available counts in a header line + per-provider names with `activeSpawns` when present. Falls back to flat `body.providers.*` for the older OCP shape (backwards compat).
+- **[P3-5] Stale v0.3.0-era doc strings updated.** README header status line + Implementation Status § now reflect v0.4.0 shipped + Phase 5 open. `server.mjs` startup banner no longer hardcodes "Phase 1 in progress" (now just lists version + provider count — derives accurate state from `VERSION` without future maintenance touch-ups).
+
+**Phase 4 process learning recorded.** Per Iron Rule 第二律 (evidence over "should work"), every D-day review pass must include at least one runtime smoke against the default production config. The D-day reviewer rubric is updated implicitly — D74 Suite 36 tests pin the wire-contract shape so a future D-day refactoring server payloads can't silently re-break the CLI / plugin / docs.
+
+- **Test count delta:** 696 (v0.4.0) → 704 (v0.4.1). +8 D74 regression tests in Suite 36.
+- **Files touched:** `lib/doctor.mjs` (P1-1), `bin/olp.mjs` (P1-1 + P2-3), `bin/olp-connect` (P1-2), `olp-plugin/index.js` (P2-4), `server.mjs` (P3-5 banner), `README.md` (P3-5), `test-features.mjs` (Suite 36 regression), `package.json` (version), `CHANGELOG.md` (this entry).
+- **Authority:** maintainer independent review of `main` / `v0.4.0` / commit `ee4d945` (2026-05-26 session); Iron Rule 第二律 evidence-over-should-work; CLAUDE.md `release_kit.phase_rolling_mode` cross-Phase discipline ("hotfix to a shipped Phase N deliverable → bump patch, tag, release before next push").
+
 ## v0.4.0 — 2026-05-26
 
 ### Phase 4 — Operator + Client UX (D60 → D73)

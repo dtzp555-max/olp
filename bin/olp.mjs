@@ -301,29 +301,50 @@ async function cmdUsage(flags, io) {
   try { body = JSON.parse(res.body); }
   catch { io.errln('Error: server returned non-JSON body'); return 2; }
   if (io.wantJson) { io.emitJson(body); return 0; }
+  // D74 P2-3 fix: server payload shape is { generated_at, window_24h: { request_count, status_2xx,
+  // status_4xx, status_5xx, by_provider, by_owner_tier, by_path, median_latency_ms, p95_latency_ms },
+  // cache_hit_24h: { total, hit, miss, bypass, streaming_attached, hit_rate, by_provider }, quota: [{provider, ...}],
+  // spend_trend_30d: [{date, request_count, by_provider}], top_fallback_chains_24h: [{chain, count, ...}],
+  // cache_stats: { hits, misses, size, inflightCount } } per server.mjs:2027 + lib/audit-query.mjs.
   io.log(colorize('OLP usage (24h)', ANSI.bold, io.useColor));
   io.log('─'.repeat(60));
-  const u24 = body.usage_24h ?? body.usage24h ?? body['24h'] ?? {};
-  if (typeof u24 === 'object' && Object.keys(u24).length > 0) {
-    io.log(`  requests: ${u24.requests ?? '?'}`);
-    io.log(`  cache hits: ${u24.cache_hits ?? '?'}`);
-    io.log(`  fallbacks: ${u24.fallbacks ?? '?'}`);
+  const w24 = body.window_24h ?? {};
+  const cache24 = body.cache_hit_24h ?? {};
+  if (typeof w24 === 'object' && (w24.request_count ?? 0) > 0) {
+    io.log(`  requests:        ${w24.request_count}`);
+    io.log(`  2xx / 4xx / 5xx: ${w24.status_2xx ?? 0} / ${w24.status_4xx ?? 0} / ${w24.status_5xx ?? 0}`);
+    if (typeof w24.median_latency_ms === 'number') {
+      io.log(`  latency p50/p95: ${w24.median_latency_ms}ms / ${w24.p95_latency_ms ?? 0}ms`);
+    }
+    if (typeof cache24.hit_rate === 'number') {
+      const pct = (cache24.hit_rate * 100).toFixed(1);
+      io.log(`  cache hit rate:  ${pct}% (hit=${cache24.hit ?? 0} miss=${cache24.miss ?? 0}${cache24.streaming_attached ? ` streaming_attached=${cache24.streaming_attached}` : ''})`);
+    }
   } else {
     io.log('  (no 24h usage data — server may not have processed any requests yet)');
   }
-  if (Array.isArray(body.providers)) {
+  if (Array.isArray(body.quota) && body.quota.length > 0) {
     io.log('');
     io.log(colorize('Per-provider quota', ANSI.bold, io.useColor));
     io.log('─'.repeat(60));
-    for (const p of body.providers) {
-      io.log(`  ${String(p.name ?? '?').padEnd(12)} ${p.percent_used != null ? `${p.percent_used}% used` : 'no quota api'}`);
+    for (const p of body.quota) {
+      const label = String(p.provider ?? '?').padEnd(12);
+      if (p.error) {
+        io.log(`  ${label} error: ${p.error}`);
+      } else if (typeof p.percent_used === 'number') {
+        io.log(`  ${label} ${p.percent_used}% used${p.resets_in_human ? ` (resets in ${p.resets_in_human})` : ''}`);
+      } else if (p.available === false) {
+        io.log(`  ${label} unavailable`);
+      } else {
+        io.log(`  ${label} no quota api`);
+      }
     }
   }
-  if (Array.isArray(body.top_fallback_chains)) {
+  if (Array.isArray(body.top_fallback_chains_24h) && body.top_fallback_chains_24h.length > 0) {
     io.log('');
-    io.log(colorize('Top fallback chains', ANSI.bold, io.useColor));
+    io.log(colorize('Top fallback chains (24h)', ANSI.bold, io.useColor));
     io.log('─'.repeat(60));
-    for (const f of body.top_fallback_chains.slice(0, 10)) {
+    for (const f of body.top_fallback_chains_24h.slice(0, 10)) {
       io.log(`  ${String(f.count ?? '?').padStart(5)}  ${(f.chain ?? []).join(' → ')}`);
     }
   }
@@ -360,13 +381,20 @@ async function cmdCache(flags, io) {
   try { body = JSON.parse(res.body); }
   catch { io.errln('Error: server returned non-JSON body'); return 2; }
   if (io.wantJson) { io.emitJson(body); return 0; }
-  io.log(colorize('OLP cache', ANSI.bold, io.useColor));
+  // D74 P2-3 fix: cacheStore.stats() returns { hits, misses, size, inflightCount }
+  // per lib/cache/store.mjs:320. There is no entries / evictions / bytes / maxBytes
+  // in the OLP cache model — those were OCP-era field names. Compute a hit rate from
+  // the numerator/denominator instead of fabricating bytes.
+  const hits = body.hits ?? 0;
+  const misses = body.misses ?? 0;
+  const denom = hits + misses;
+  const hitRate = denom > 0 ? ((hits / denom) * 100).toFixed(1) : '0.0';
+  io.log(colorize('OLP cache (live in-memory)', ANSI.bold, io.useColor));
   io.log('─'.repeat(60));
-  io.log(`  entries:  ${body.entries ?? '?'}`);
-  io.log(`  hits:     ${body.hits ?? 0}`);
-  io.log(`  misses:   ${body.misses ?? 0}`);
-  io.log(`  evictions:${body.evictions ?? 0}`);
-  io.log(`  bytes:    ${formatBytes(body.bytes ?? 0)} (max ${formatBytes(body.maxBytes ?? 0)})`);
+  io.log(`  entries:        ${body.size ?? 0}`);
+  io.log(`  hits / misses:  ${hits} / ${misses}  (hit rate ${hitRate}%)`);
+  io.log(`  inflight:       ${body.inflightCount ?? 0}`);
+  if (body.generated_at) io.log(`  generated_at:   ${body.generated_at}`);
   return 0;
 }
 
@@ -574,10 +602,16 @@ async function cmdDoctor(flags, io) {
   const proxyUrl = resolveProxyUrl({ proxyUrl: flags['proxy-url'] });
   const checkFilter = typeof flags.check === 'string' ? flags.check : undefined;
 
+  // D74 P1-1: pass authHeaders so server.running / server.version checks
+  // succeed under the default production posture (auth.allow_anonymous:
+  // false). resolveBearerToken returns null when no env var is set; the
+  // doctor still runs but distinguishes 401 from "server down" by status
+  // code per the updated check.
   const result = await runDoctor({
     olpHome,
     proxyUrl,
     checkFilter,
+    authHeaders: authHeaders(),
   });
 
   if (io.wantJson) {

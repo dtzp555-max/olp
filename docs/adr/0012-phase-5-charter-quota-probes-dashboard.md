@@ -4,6 +4,24 @@
 **Date:** 2026-05-26
 **D-day:** D79 (charter + ADR 0002 Amendment 8 + ADR 0013 land together as the constitutional layer of Phase 5)
 
+## Amendments
+
+### Amendment 1 — 2026-05-26: D84 Mistral probe NO-GO (post-D79-close spike)
+
+The D-day table originally listed D84 as "optional, depends on D79-close 30-min Mistral docs spike". The spike completed 2026-05-26 with verdict **NO-GO** — Mistral does not expose a programmatic quota/usage endpoint:
+
+- `docs.mistral.ai/api` covers Chat, FIM, Embeddings, Classifiers, Files, Models, Batch, OCR, Audio, Events, Beta (Agents/Conversations/Libraries/Workflows/Observability). No usage/quota/credits/billing/limits endpoint anywhere.
+- Direct probe `https://api.mistral.ai/v1/usage` returns 404.
+- Mistral's own "Limits and Usage" help article says limits are viewable only via the web console (`admin.mistral.ai/plateforme/limits`); no API endpoint mentioned.
+- No `x-ratelimit-*` response headers documented on `/v1/chat/completions`. (Third-party summaries mentioning these headers are unsourced — appears to be OpenAI-convention extrapolation.)
+- OLP `lib/providers/mistral.mjs` already records this independently — DL-7 comment: "If quota/budget API surfaces in Le Chat Pro, pin the endpoint here."
+
+**Disposition:**
+- D84 row dropped from D-day plan (struck through below).
+- Mistral dashboard row in D82 UI shows "spend tracking only" badge sourced from `audit-query.mjs` aggregates (request count, estimated cost from `estimateCost()`).
+- `DL-7` in `mistral.mjs` is the documented re-entry point if Mistral ever publishes a usage endpoint.
+- Phase 5 total D-day budget revised: ~5 D-days (down from ~6).
+
 ---
 
 ## Context
@@ -38,7 +56,7 @@ Phase 5 scope is **Provider quota probes + dashboard enrichment**. The phase ope
 | **D81** | `lib/audit-query.mjs` + `/v0/management/dashboard-data` extended to surface the new quota shape per provider (utilization, reset, representative-claim, fallback-percentage, overage-status). Audit-query stays in-memory scan per ADR 0008 Lane 2 = A (no SQLite). Schema migration documented in ADR 0008 § Amendment | ADR 0008 + this charter | 1d |
 | **D82** | `dashboard.html` Claude.ai-style restructure — per-provider rows replace the current single Quota panel; each row: provider badge, model placeholder, utilization bar (5h + 7d), reset countdown ("Your limit will reset at HH:MM AM/PM" format from the user-shared claude.ai screenshot), status badge, representative-claim hint. 1-minute auto-refresh via `setInterval` with `document.visibilityState` guard. Manual refresh button calls `/v0/management/dashboard-data` directly | v1.x roadmap #8 + maintainer reference screenshot | 1.5d |
 | **D83** | Test coverage — Suite 38 quota-probe unit tests (mock HTTP server returning the 13 headers; assert parse + cache + backoff + stale-on-429); Suite 39 dashboard rendering smoke (curl `/dashboard` after pre-seeding mock quota cache; assert HTML contains expected utilization strings); update Suite 33 doctor checks for new `anthropic.quota_probe_reachable` check | Test convention from existing suites | 1d |
-| **D84** | (optional) `lib/providers/mistral.mjs:quotaStatus()` — Mistral GO/NO-GO decided at D79 close (30-min docs spike before D80 starts), NOT mid-phase. If Mistral exposes `/v1/usage` or equivalent → D84 ports the probe with a parallel ADR 0002 Amendment 8 invocation. If NOT exposed → D84 is dropped from the plan and mistral row shows "spend tracking only" badge sourced from audit-query. Codex explicitly skipped — `openai/codex` CLI has no public quota API. GO/NO-GO outcome documented in this charter as a D79-close amendment | Live audit at D79 close (~30 min spike) | 0.5d if GO; 0d if NO-GO |
+| ~~D84~~ **DROPPED** | ~~Mistral `quotaStatus()` port — depends on D79-close spike~~ **NO-GO per 2026-05-26 spike (see § Amendment 1).** Mistral dashboard row in D82 shows "spend tracking only" badge sourced from `audit-query.mjs` aggregates. `DL-7` hook point in `mistral.mjs` already marks the location for future upgrade if Mistral ever publishes a usage endpoint. Codex permanently skipped (no public API). | n/a (dropped) | 0d |
 | **close** | v0.5.0 release PR — `package.json` `0.4.4 → 0.5.0`, CHANGELOG promotion, `release_kit.phase_rolling_mode.current_pre_release_identifier` advance to Phase 6 token | `CLAUDE.md release_kit overlay` | maintainer-triggered |
 
 ### Out of Phase 5 scope (with explicit triggers)

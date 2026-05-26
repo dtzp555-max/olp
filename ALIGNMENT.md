@@ -196,9 +196,19 @@ In addition to the recurring 14 May audit below, the following one-shot audits a
 
 ## Class-specific Exceptions
 
-(none at project founding)
+Any Rule 2 or Rule 3 deviation lands here as a numbered exception with PR link, reviewer, and rationale.
 
-Any future Rule 3 deviation lands here as a numbered exception with PR link, reviewer, and rationale.
+### 1. Anthropic plan-usage probe via direct `/v1/messages` call (Phase 5, D79 — 2026-05-26)
+
+**Class:** Rule 2(a) — provider-plugin scope. The Anthropic plugin's `quotaStatus()` calls `POST https://api.anthropic.com/v1/messages` directly rather than spawning `claude -p`. Under the strict reading of Rule 2(a), plugins must mirror provider-CLI behaviour; under the strict reading, this is a deviation because the spawn path goes through the CLI binary and the probe path does not.
+
+**Authority:** ADR 0002 Amendment 8 (governance) + ADR 0013 (implementation discipline) + ADR 0012 (Phase 5 charter). Schema pin: `~/.cc-rules/memory/learnings/anthropic_plan_usage_probe_schema_2026_05_26.md` (compiled-binary `strings` + live API probe evidence). PR #50.
+
+**Rationale:** Claude Code's compiled binary makes the same `POST /v1/messages` call internally (verified by `strings` over the v2.1.142 / v2.1.150 Mach-O / ELF binary). The probe mirrors that observed CLI behaviour without introducing a new wire format or output assumption. The exemption is bounded by ADR 0002 Amendment 8's three constraints (READ-ONLY, subscription-scope, idempotent-failure) + ADR 0013's seven implementation rules (notably Rule 2's per-endpoint enumeration — only `POST /v1/messages` is permitted).
+
+**Reviewer:** fresh-context opus subagent on PR #50 (Iron Rule 10 + CLAUDE.md hard requirement #3). Verdict: APPROVE_WITH_MINOR. Six in-PR nits folded in; three outside-PR nits documented and addressed (this entry is one of them — N9).
+
+**Re-evaluation trigger:** if Anthropic publishes a public documented quota endpoint (e.g. `GET /v1/usage`), this exception is RETIRED and the plugin migrates to the documented endpoint, deleting this exception by amendment PR. Until that hypothetical retirement, this exception is the canonical entry.
 
 ### Controlled deviations (entry-surface scope)
 

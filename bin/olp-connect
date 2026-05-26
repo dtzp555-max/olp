@@ -114,6 +114,35 @@ key_display() {
   fi
 }
 
+# D74 P1-2: validate OLP API key format. Per ADR 0007 § 3, tokens are
+# `olp_` + 32 random bytes base64url-encoded (43 chars, no padding). This
+# regex pins the on-the-wire shape so a malformed or hostile `--key` /
+# server-advertised `anonymousKey` never gets persisted into a shell rc.
+# Returns 0 on valid, 1 on invalid (with diagnostic to stderr).
+validate_olp_token() {
+  local k="$1" source="$2"
+  if [[ ! "$k" =~ ^olp_[A-Za-z0-9_-]{43}$ ]]; then
+    log_err "Rejected $source: token format does not match ^olp_[A-Za-z0-9_-]{43}$ (ADR 0007 § 3)."
+    log_err "  Got ${#k}-char value starting with '$(echo "$k" | cut -c1-8)...'"
+    log_err "  Expected: olp_ followed by 43 base64url chars. Run 'npx olp-keys list' on the server"
+    log_err "  to confirm the key format, or have the operator regenerate with 'npx olp-keys keygen'."
+    return 1
+  fi
+  return 0
+}
+
+# D74 P1-2: POSIX shell-quote a value before interpolating into a shell rc
+# write. Wraps in single quotes + escapes embedded single quotes per:
+#   foo'bar  →  'foo'\''bar'
+# Even with the validator above, this is defense-in-depth: any non-token
+# string that slips through (e.g., environment.d KEY=VALUE writes) MUST be
+# safe to source. Same helper pattern as lib/doctor.mjs _shellQuote.
+shell_quote() {
+  local s="$1"
+  # Escape any single quotes: ' → '\''
+  printf "'%s'" "${s//\'/\'\\\'\'}"
+}
+
 # Detect Claude Code and print warn-only message. Per ADR 0010 § Out of
 # Phase 4 scope, OLP does NOT ship /v1/messages and CC is not a supported
 # client. The user is steered toward Cline + OLP.
@@ -297,17 +326,20 @@ append_olp_block() {
   if $DRY_RUN; then
     log_change "[dry-run] would append OLP block to $rc_file:"
     log_change "    # OLP LAN (added by olp-connect)"
-    log_change "    export OPENAI_BASE_URL=$base_url/v1"
-    [[ -n "$key" ]] && log_change "    export OPENAI_API_KEY=$(key_display "$key")"
+    log_change "    export OPENAI_BASE_URL=$(shell_quote "$base_url/v1")"
+    [[ -n "$key" ]] && log_change "    export OPENAI_API_KEY=$(shell_quote "$(key_display "$key")")"
     log_change "    # /OLP LAN"
     return 0
   fi
+  # D74 P1-2: shell-quote values before writing to rc files. Defense-in-depth
+  # alongside validate_olp_token — even if a future code path bypasses the
+  # validator, the rc file remains safe to source.
   {
     echo ""
     echo "# OLP LAN (added by olp-connect)"
-    echo "export OPENAI_BASE_URL=$base_url/v1"
+    echo "export OPENAI_BASE_URL=$(shell_quote "$base_url/v1")"
     if [[ -n "$key" ]]; then
-      echo "export OPENAI_API_KEY=$key"
+      echo "export OPENAI_API_KEY=$(shell_quote "$key")"
     fi
     echo "# /OLP LAN"
   } >> "$rc_file"
@@ -341,6 +373,14 @@ set_system_env() {
       return 0
     fi
     mkdir -p "$env_dir" 2>/dev/null
+    # D74 P1-2: systemd environment.d format is KEY=VALUE per line. While
+    # systemd does its own parsing (no shell sourcing), reject embedded
+    # newlines defensively — validate_olp_token already enforces the
+    # restricted charset for the API key, so this is belt-and-braces.
+    if [[ "$base_url" == *$'\n'* || "$key" == *$'\n'* ]]; then
+      log_err "Refusing to write environment.d entry: value contains newline."
+      return 2
+    fi
     {
       echo "OPENAI_BASE_URL=$base_url/v1"
       if [[ -n "$key" ]]; then
@@ -363,8 +403,13 @@ main() {
       --port=*)  port="${1#*=}"; shift ;;
       --key)     key="${2:?--key requires a value}"
                  [[ -z "$key" ]] && { log_err "--key cannot be empty (omit --key for zero-config / auto-discovery)"; exit 1; }
+                 # D74 P1-2: reject malformed --key before it ever reaches an rc write.
+                 validate_olp_token "$key" "--key flag" || exit 1
                  shift 2 ;;
-      --key=*)   key="${1#*=}"; shift ;;
+      --key=*)   key="${1#*=}"
+                 [[ -z "$key" ]] && { log_err "--key cannot be empty (omit --key for zero-config / auto-discovery)"; exit 1; }
+                 validate_olp_token "$key" "--key flag" || exit 1
+                 shift ;;
       --no-system-env) NO_SYSTEM_ENV=true; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       --version) show_version; exit 0 ;;
@@ -457,6 +502,13 @@ try:
     print(k if isinstance(k, str) and k else '')
 except: print('')" 2>/dev/null || echo "")
     if [[ -n "$anon_key" ]]; then
+      # D74 P1-2: validate server-advertised token shape before consuming.
+      # A hostile or misconfigured server could otherwise inject arbitrary
+      # strings into the user's rc file via the `anonymousKey` field.
+      if ! validate_olp_token "$anon_key" "/health.anonymousKey from $remote_host"; then
+        log_err "Refusing to consume malformed advertised key. Use --key explicitly or contact the OLP operator."
+        exit 2
+      fi
       key="$anon_key"
       log_ok "Using server-advertised anonymous key: $(key_display "$key")"
       log_info "  (set by remote via auth.advertise_anonymous_key=true; see ADR 0011 for"
@@ -479,6 +531,8 @@ except: print('')" 2>/dev/null || echo "")
           log_err "  Re-run with: olp-connect $host --key olp_..."
           exit 2
         fi
+        # D74 P1-2: also validate the interactively-prompted key.
+        validate_olp_token "$key" "interactive prompt" || exit 1
       fi
     fi
   fi

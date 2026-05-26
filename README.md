@@ -2,7 +2,7 @@
 
 A personal- and family-scale multi-provider LLM proxy. One HTTP endpoint, many subscriptions behind it, automatic routing, automatic fallback, content-addressed caching — so your IDEs and family clients keep working as long as *any* of your subscriptions has quota left.
 
-> **Status:** v0.3.0 shipped (2026-05-25) — Phase 1 multi-provider proxy core (v0.1.0 + v0.1.1) + Phase 2 multi-key auth + audit + owner gating + keygen CLI (v0.2.0) + Phase 3 Dashboard + audit query layer + daily audit rotation (v0.3.0). Phase 4 (per-key per-provider auth + audit retention + SQLite hybrid + provider-cost weights) is the next planned milestone. Sections marked _placeholder_ land alongside the relevant phase of work (see [phase plan](#phase-plan)).
+> **Status:** v0.4.0 shipped (2026-05-26) — Phase 1 multi-provider proxy core (v0.1.0 + v0.1.1) + Phase 2 multi-key auth + audit + owner gating + keygen CLI (v0.2.0) + Phase 3 Dashboard + audit query layer + daily audit rotation (v0.3.0) + Phase 4 Operator + Client UX (v0.4.0): SSE heartbeat / `olp` Node CLI + `olp doctor` framework / `olp-connect` zero-config LAN setup / `/health.anonymousKey` opt-in / `/olp` Telegram-Discord plugin / 6-IDE integration docs. Phase 5 scope is open — candidates per ADR 0010 § Out-of-Phase-4-scope: `/v1/messages` (gated on ADR 0009 P0 outcome + named family CC user), context-window-exceeded fallback trigger, per-(provider, model) live stats. Sections marked _placeholder_ land alongside the relevant phase of work (see [phase plan](#phase-plan)).
 
 ---
 
@@ -252,9 +252,9 @@ Use a dedicated bot key — not the maintainer's personal owner key — so revoc
 
 ---
 
-## Implementation status (as of 2026-05-25, post-v0.2.0)
+## Implementation status (as of 2026-05-26, post-v0.4.0)
 
-Phase 1 closed at v0.1.1 (multi-provider proxy core + pre-Phase-2 cleanup). Phase 2 closed at v0.2.0 (multi-key auth + audit + owner gating + keygen CLI; ADR 0007 § 10 all 11 acceptance criteria shipped). Phase 3 closed at v0.3.0 (Dashboard + `lib/audit-query.mjs` + daily audit rotation; ADR 0008 § 10 all 15 acceptance criteria shipped). Phase 4 (per-key per-provider auth + audit retention + SQLite hybrid + provider-cost weights) is the next planned milestone. This table reflects what is currently shipped vs. what is designed for later phases.
+Phase 1 closed at v0.1.1 (multi-provider proxy core + pre-Phase-2 cleanup). Phase 2 closed at v0.2.0 (multi-key auth + audit + owner gating + keygen CLI; ADR 0007 § 10 all 11 acceptance criteria shipped). Phase 3 closed at v0.3.0 (Dashboard + `lib/audit-query.mjs` + daily audit rotation; ADR 0008 § 10 all 15 acceptance criteria shipped). Phase 4 closed at v0.4.0 (Operator + Client UX per ADR 0010: SSE heartbeat + `recentErrors[20]` + `/v0/management/status` / `olp` Node CLI + `olp doctor` framework + ADR 0002 Amendment 7 / `olp-connect` bash + `/health.anonymousKey` + ADR 0011 / `olp-plugin/` Telegram-Discord + 6-IDE integration docs). Phase 5 scope is open — candidates per ADR 0010 § Out-of-Phase-4-scope. This table reflects what is currently shipped vs. what is designed for later phases.
 
 | File / artifact | Status | Notes |
 |---|---|---|
@@ -289,7 +289,9 @@ Behaviors that work correctly at personal/family scale but have ratified follow-
 - **Soft triggers configured but inert.** `routing.soft_triggers` in `~/.olp/config.json` is honored by the engine's evaluation logic but `quotaStatus()` polling is not wired (ADR 0004 Amendment 2). A startup warning fires if the field is non-empty so the inert state is visible.
 - **Multi-key auth + owner gating + keygen CLI shipped at v0.2.0 (D44 + D45 + D46 + D47).** `lib/keys.mjs` (core), `lib/audit.mjs` (audit), owner-vs-guest `/health` payload trimming + `X-OLP-Fallback-Detail` policy gating, `bin/olp-keys.mjs` (keygen CLI). All 11 ADR 0007 § 10 acceptance criteria covered. v0.2.0 maintainer-merged 2026-05-25.
 
-- **Phase 3 (Dashboard + audit query layer + rotation) shipped to main (D48-D54); v0.3.0 release pending.** `docs/adr/0008-dashboard-and-audit-query.md` ratified at D48. `lib/audit-query.mjs` (D49) implements the 5-function aggregate query API (in-memory ndjson scan, PII-guarded). 4 new owner-only_block endpoints at D50 (`/dashboard`, `/v0/management/dashboard-data`, `/v0/management/quota`, `/cache/stats`). `dashboard.html` full multi-panel UI at D51 (vanilla HTML+JS+fetch, 30s poll with visibilitychange pause). Daily audit rotation at D52 (synchronous on first append after UTC midnight; `audit-YYYY-MM-DD.ndjson` naming) + optional `bin/olp-audit-rotate.mjs` cron tool. `tried_providers` schema semantic fix at D53 (D45 P2 deferral). Phase 3 close to v0.3.0 is maintainer-triggered per CLAUDE.md `release_kit.phase_close_trigger`.
+- **Phase 3 (Dashboard + audit query layer + rotation) shipped at v0.3.0 (D48–D54).** `docs/adr/0008-dashboard-and-audit-query.md` + `lib/audit-query.mjs` (D49) + 4 owner-only_block endpoints (D50) + `dashboard.html` (D51) + daily audit rotation (D52) + `tried_providers` schema fix (D53). All 15 ADR 0008 § 10 acceptance criteria covered.
+
+- **Phase 4 (Operator + Client UX) shipped at v0.4.0 (D60 → D73).** ADR 0010 (charter) + ADR 0011 (anonymous-key trusted-LAN limits) + ADR 0002 Amendment 7 (provider `doctorChecks()` contract). Default `OLP_PORT` 3456 → 4567 so OLP and OCP can co-host. SSE heartbeat (D61) + `recentErrors[20]` + `/v0/management/status` (D62-D63). `bin/olp.mjs` Node CLI + `bin/olp-keys.mjs` + `lib/doctor.mjs` framework with `next_action.ai_executable[]` (D64-D67). `bin/olp-connect` bash zero-config IDE auto-config + opt-in `/health.anonymousKey` (D68-D70). `olp-plugin/` OpenClaw `/olp` Telegram-Discord plugin (read-only, no chat mutations) + 6 IDE integration docs at `docs/integrations/*.md` (D71-D73). Test count 623 → 696.
 
   **Bootstrap workflow (D47):** for first-run / production setup:
 

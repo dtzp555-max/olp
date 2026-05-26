@@ -2241,8 +2241,11 @@ if (isMain) {
   const server = createOlpServer();
   server.listen(PORT, '127.0.0.1', () => {
     const enabledCount = loadedProviders.size;
+    // D74 P3-5: banner no longer hardcodes the phase. Derives from VERSION
+    // (which advances at every Phase close) so banner stays accurate
+    // without future-maintenance touch-ups at every Phase boundary.
     process.stdout.write(
-      `OLP v${VERSION} listening on :${PORT} (${enabledCount} providers enabled — Phase 1 in progress)\n`,
+      `OLP v${VERSION} listening on :${PORT} (${enabledCount} providers enabled)\n`,
     );
   });
 }

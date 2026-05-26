@@ -14861,7 +14861,7 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
     // The bash validator: ^olp_[A-Za-z0-9_-]{43}$. Anything else is rejected
     // before it can touch a shell rc file or environment.d entry.
     const result = _spawnSyncS36('bash', [
-      '/Users/taodeng/olp/bin/olp-connect',
+      _joinS36(import.meta.dirname ?? process.cwd(), 'bin/olp-connect'),
       '127.0.0.1',
       '--port', '1',
       '--key', 'not-an-olp-token',
@@ -14878,7 +14878,7 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
     // the connect step (exit 2), but only AFTER the --key validator passes.
     const goodKey = 'olp_' + 'A'.repeat(43);
     const result = _spawnSyncS36('bash', [
-      '/Users/taodeng/olp/bin/olp-connect',
+      _joinS36(import.meta.dirname ?? process.cwd(), 'bin/olp-connect'),
       '127.0.0.1',
       '--port', '1',
       '--key', goodKey,
@@ -14909,7 +14909,7 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
     assert.ok(!('bytes' in stats), 'must NOT have OCP-era bytes field');
     assert.ok(!('maxBytes' in stats), 'must NOT have OCP-era maxBytes field');
     // Also pin that cmdCache reads body.size (not body.entries) by grepping the source
-    const cliSrc = _readFileSyncS36('/Users/taodeng/olp/bin/olp.mjs', 'utf8');
+    const cliSrc = _readFileSyncS36(_joinS36(import.meta.dirname ?? process.cwd(), 'bin/olp.mjs'), 'utf8');
     assert.ok(/body\.size\b/.test(cliSrc), 'cmdCache must read body.size for entries display');
     assert.ok(/body\.inflightCount\b/.test(cliSrc), 'cmdCache must read body.inflightCount');
     assert.ok(!/body\.entries\b/.test(cliSrc), 'cmdCache must NOT read body.entries (OCP-era field)');
@@ -14921,7 +14921,7 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
     // cache_hit_24h / quota / spend_trend_30d / top_fallback_chains_24h /
     // cache_stats. Pre-D74 cmdUsage read body.usage_24h.requests / body.providers
     // / body.top_fallback_chains — none of which exist in the actual payload.
-    const serverSrc = _readFileSyncS36('/Users/taodeng/olp/server.mjs', 'utf8');
+    const serverSrc = _readFileSyncS36(_joinS36(import.meta.dirname ?? process.cwd(), 'server.mjs'), 'utf8');
     assert.ok(/window_24h:\s*auditAggregateRequests/.test(serverSrc),
       'handleManagementDashboardData must emit window_24h field');
     assert.ok(/cache_hit_24h:\s*auditCacheHitRateWindow/.test(serverSrc),
@@ -14931,7 +14931,7 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
     assert.ok(/cache_stats:\s*cacheStore\.stats/.test(serverSrc),
       'handleManagementDashboardData must emit cache_stats field');
     // Now pin cmdUsage reads the matching keys
-    const cliSrc = _readFileSyncS36('/Users/taodeng/olp/bin/olp.mjs', 'utf8');
+    const cliSrc = _readFileSyncS36(_joinS36(import.meta.dirname ?? process.cwd(), 'bin/olp.mjs'), 'utf8');
     assert.ok(/body\.window_24h\b/.test(cliSrc), 'cmdUsage must read body.window_24h');
     assert.ok(/body\.cache_hit_24h\b/.test(cliSrc), 'cmdUsage must read body.cache_hit_24h');
     assert.ok(/body\.top_fallback_chains_24h\b/.test(cliSrc),
@@ -14977,7 +14977,7 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
 
   it('36h (P3-5) — server startup banner does not hardcode a stale phase', () => {
     // Pre-D74 banner literal said "Phase 1 in progress" forever.
-    const serverSrc = _readFileSyncS36('/Users/taodeng/olp/server.mjs', 'utf8');
+    const serverSrc = _readFileSyncS36(_joinS36(import.meta.dirname ?? process.cwd(), 'server.mjs'), 'utf8');
     assert.ok(!/Phase 1 in progress/.test(serverSrc),
       'startup banner must not hardcode "Phase 1 in progress" (stale post v0.4.0)');
     assert.ok(!/Phase 2 in progress/.test(serverSrc));

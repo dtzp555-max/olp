@@ -8,7 +8,7 @@
 3. **Where** does the work live in the tree today (file + anchor).
 4. **When** does it need to land (trigger: load profile, security event, governance amendment).
 
-**Reading order for a v1.x sprint kickoff.** As of 2026-05-25, #1 (streaming SF, D57+D58) and #2 (multi-key auth, Phase 2) are CLOSED, and #4 and #7 closed in D56. Remaining v1.x scope: #3 (soft trigger reactivation), #5 (provider cacheKeyFields mask), #6 (streaming SPAWN_FAILED salvage — unbundled from #1 at #1 close). All three remaining items have explicit "trigger to start" gates that have not fired.
+**Reading order for a v1.x sprint kickoff.** As of 2026-05-26, #1 (streaming SF, D57+D58), #2 (multi-key auth, Phase 2), #4 and #7 (closed in D56), and #8 (dashboard enrichment, D82 Phase 5) are CLOSED. Remaining v1.x scope: #3 (soft trigger reactivation), #5 (provider cacheKeyFields mask), #6 (streaming SPAWN_FAILED salvage — unbundled from #1 at #1 close). All three remaining items have explicit "trigger to start" gates that have not fired.
 
 ---
 
@@ -88,8 +88,9 @@
 - **Tracking.** Not a GitHub issue. Tracked here.
 - **Trigger to start.** First report of streaming-path SPAWN_FAILED mid-stream where partial-chunk salvage would have helped a downstream caller. Practically unlikely at family scale.
 
-## #8 — Dashboard enrichment: per-provider subscription quota + reset times + 1-min refresh + manual refresh (D78 follow-up)
+## #8 — Dashboard enrichment: per-provider subscription quota + reset times + 1-min refresh + manual refresh (D78 follow-up) — ✅ **CLOSED (D82, v0.5.0)**
 
+- **Status.** Closed at D82 (Phase 5). `dashboard.html` restructured to Claude.ai-style per-provider rows rendering `quota_v2`. Closed by PR on branch `d82-dashboard-ui-claude-ai-style`; ships with v0.5.0. 60s quota auto-refresh + manual refresh button + visibilityState guard implemented. Graceful fallback to legacy `quota` field when server runs a pre-D81 build.
 - **What.** Phase 3 dashboard (D51 `dashboard.html`, v0.3.0) shows: per-provider quota (currently always "n/a — no quota api"), last-24h request count + cache hit + fallback rate, 30d request-count sparkline, top fallback chains. **Maintainer request 2026-05-26 post-D78**: extend to show what each enabled provider's subscription is actually consuming, with reset times visible, refresh once per minute (current 30s is OK but maintainer specified 1min target), and a manual refresh button. Reference design: Claude.ai's own `claude.ai/settings/usage` page — current session bar with "Resets in 1hr 6min", weekly all-models bar with "Resets Sun 9:00 PM", per-model bar (Sonnet only), additional features (routine runs), usage credits + monthly spend limit + auto-reload toggle.
 - **Why deferred.** v0.3.0/v0.4.x ships the dashboard frame but `provider.quotaStatus()` returns `null` in all three v0.1 plugins (anthropic / openai / mistral). The ratifying spec in ADR 0004 Amendment 2 punts `quotaStatus()` to v1.x ("soft trigger reactivation") — this dashboard ask is the **operator-facing reason** that work would land.
 - **What this requires.** Per-provider plugin work + dashboard.html UI work + audit-query.mjs aggregation:

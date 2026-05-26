@@ -1,16 +1,24 @@
 <!DOCTYPE html>
 <!--
-  OLP Dashboard — Phase 3 / D51
+  OLP Dashboard — Phase 5 / D82
   ------------------------------
-  Multi-panel owner-only dashboard per ADR 0008 § 6. Polls
-  /v0/management/dashboard-data every 30 seconds (paused when the
-  page is hidden via document.visibilityState).
+  Multi-panel owner-only dashboard per ADR 0008 § 6.
 
-  Panels (per spec v0.1 § 4.6 + ADR 0008 Lane 5 = B full):
-    1. Per-provider quota / credit pool
-    2. Per-provider 24h request count + cache hit rate + fallback rate
-    3. 30-day spend trend (SVG sparkline; per-provider in tooltip)
-    4. Top 10 fallback chains by trigger count
+  Panels:
+    0. Plan Usage (new D82 — Claude.ai-style per-provider rows; quota_v2; 1-min refresh)
+    1. Per-provider quota / credit pool (legacy; kept for graceful fallback when quota_v2 absent)
+    2. Per-provider 24h request count + cache hit rate + fallback rate (30s refresh)
+    3. 30-day spend trend (SVG sparkline; per-provider in tooltip) (30s refresh)
+    4. Top 10 fallback chains by trigger count (30s refresh)
+
+  Refresh cadence:
+    - Plan Usage panel: 60s (separate timer; visibilityState-guarded per ADR 0012 D82)
+    - Other panels: 30s (original poll cadence; paused when tab hidden)
+
+  Authority:
+    - ADR 0008 § 6 — dashboard layout + owner-only_block
+    - ADR 0012 D82 — quota_v2 Claude.ai-style restructure
+    - v1.x roadmap #8 — closed by this D-day
 
   No build step, no framework, no external dependencies. Vanilla JS +
   fetch + DOM render. Owner-only_block: anonymous / guest / no-auth all
@@ -43,15 +51,234 @@
   .chain { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.85rem; color: #374151; }
   .pill { display: inline-block; background: #e5e7eb; color: #374151; padding: 0.05rem 0.4rem; border-radius: 3px; font-size: 0.75rem; }
   footer { margin-top: 2rem; color: #9ca3af; font-size: 0.75rem; text-align: center; }
+
+  /* ───────────────────────────────────────────
+     Plan Usage panel — D82 Claude.ai-style rows
+     ─────────────────────────────────────────── */
+  .plan-usage-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  .plan-usage-header h2 { margin: 0; }
+  .plan-usage-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    font-size: 0.8rem;
+    color: #6b7280;
+  }
+  .refresh-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.35rem 0.75rem;
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    color: #374151;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+  .refresh-btn:hover:not(:disabled) { background: #f9fafb; border-color: #9ca3af; }
+  .refresh-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .refresh-btn .spin { display: inline-block; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .provider-row {
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 0.75rem;
+    background: #fff;
+  }
+  .provider-row:last-child { margin-bottom: 0; }
+  .provider-row.unavailable { background: #f9fafb; }
+  .provider-row.stale { border-color: #fcd34d; }
+
+  .provider-row-top {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .provider-badge {
+    display: inline-block;
+    padding: 0.2rem 0.55rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #fff;
+  }
+  .provider-badge.anthropic { background: #cc4b24; }
+  .provider-badge.codex     { background: #10a37f; }
+  .provider-badge.mistral   { background: #6d5acd; }
+  .provider-badge.openai    { background: #10a37f; }
+  .provider-badge.default   { background: #6b7280; }
+
+  .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .status-dot.live        { background: #10b981; }
+  .status-dot.stale       { background: #f59e0b; }
+  .status-dot.unavailable { background: #9ca3af; }
+
+  .status-chip {
+    display: inline-block;
+    padding: 0.1rem 0.45rem;
+    border-radius: 99px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  .status-chip.live        { background: #d1fae5; color: #065f46; }
+  .status-chip.stale       { background: #fef3c7; color: #92400e; }
+  .status-chip.unavailable { background: #f3f4f6; color: #6b7280; }
+
+  .chip-sm {
+    display: inline-block;
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    color: #374151;
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+  }
+  .schema-tag {
+    margin-left: auto;
+    font-size: 0.7rem;
+    color: #9ca3af;
+  }
+  .unavailable-reason {
+    font-size: 0.875rem;
+    color: #9ca3af;
+    font-style: italic;
+    padding: 0.25rem 0 0;
+  }
+  .last-fresh-tag {
+    font-size: 0.7rem;
+    color: #9ca3af;
+  }
+
+  .utilization-bars { display: flex; flex-direction: column; gap: 0.6rem; }
+  .util-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .util-label {
+    flex: 0 0 180px;
+    font-size: 0.8rem;
+    color: #6b7280;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  @media (max-width: 600px) {
+    .util-label { flex: 0 0 100%; }
+    .util-row { flex-direction: column; align-items: flex-start; }
+    .grid { grid-template-columns: 1fr; }
+  }
+  .util-bar-wrap {
+    flex: 1 1 120px;
+    min-width: 80px;
+    height: 8px;
+    background: #e5e7eb;
+    border-radius: 99px;
+    overflow: hidden;
+  }
+  .util-bar-fill {
+    height: 100%;
+    border-radius: 99px;
+    transition: width 0.3s ease;
+  }
+  .util-bar-fill.green  { background: linear-gradient(90deg, #34d399, #10b981); }
+  .util-bar-fill.amber  { background: linear-gradient(90deg, #fbbf24, #f59e0b); }
+  .util-bar-fill.red    { background: linear-gradient(90deg, #f87171, #ef4444); }
+
+  .util-pct {
+    flex: 0 0 40px;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: #374151;
+    text-align: right;
+  }
+  .util-reset {
+    flex: 0 0 auto;
+    font-size: 0.75rem;
+    color: #6b7280;
+    white-space: nowrap;
+  }
+  .rep-claim-badge {
+    display: inline-block;
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    background: #ede9fe;
+    color: #5b21b6;
+    border: 1px solid #ddd6fe;
+    font-weight: 600;
+  }
+  .overage-chip {
+    display: inline-block;
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    background: #fef3c7;
+    color: #92400e;
+    border: 1px solid #fcd34d;
+  }
+  .overage-chip.allowed {
+    background: #d1fae5;
+    color: #065f46;
+    border-color: #6ee7b7;
+  }
+  .provider-row-bottom {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.65rem;
+    flex-wrap: wrap;
+  }
 </style>
 </head>
 <body>
 <h1>OLP Dashboard</h1>
 <div id="meta" class="meta">Loading…</div>
 <div id="banner-slot"></div>
+
+<!-- Plan Usage panel (D82 — Claude.ai-style; full width) -->
+<section class="panel" style="max-width: 1200px; margin-bottom: 1rem;">
+  <div class="plan-usage-header">
+    <h2>Plan Usage</h2>
+    <div class="plan-usage-meta">
+      <span id="quota-last-refresh"></span>
+      <button class="refresh-btn" id="quota-refresh-btn" title="Refresh quota data">
+        <span id="quota-refresh-icon">↻</span> Refresh
+      </button>
+    </div>
+  </div>
+  <div id="panel-plan-usage"><div class="panel-loading">Loading…</div></div>
+</section>
+
 <div class="grid">
-  <section class="panel">
-    <h2>Quota (per provider)</h2>
+  <section class="panel" id="legacy-quota-section" style="display:none;">
+    <h2>Quota (per provider) — legacy</h2>
     <div id="panel-quota"><div class="panel-loading">Loading…</div></div>
   </section>
   <section class="panel">
@@ -67,15 +294,21 @@
     <div id="panel-chains"><div class="panel-loading">Loading…</div></div>
   </section>
 </div>
-<footer>OLP Dashboard · poll every 30s · paused when tab hidden · v0.3.0-phase3</footer>
+<footer>OLP Dashboard · Plan Usage: 60s refresh · other panels: 30s · paused when tab hidden · v0.5.0-phase5</footer>
 <script>
 (function () {
   'use strict';
-  const POLL_INTERVAL_MS = 30000;
-  let pollHandle = null;
 
+  /* ─────────────── constants ─────────────── */
+  const POLL_INTERVAL_MS = 30000;        // 30s for legacy panels
+  const QUOTA_POLL_INTERVAL_MS = 60000;  // 60s for Plan Usage (D82)
+  let pollHandle = null;
+  let quotaRefreshTimer = null;
+
+  /* ─────────────── DOM helpers ─────────────── */
   function fmtNum(n) { return (n ?? 0).toLocaleString(); }
   function fmtPct(rate) { return (rate * 100).toFixed(1) + '%'; }
+
   function el(tag, attrs, ...children) {
     const node = document.createElement(tag);
     if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -97,6 +330,205 @@
     return node;
   }
 
+  /* ─────────────── Reset countdown helper (D82 § B) ─────────────── */
+  /**
+   * formatResetCountdown(epochSeconds) → human-readable string
+   *
+   * - past:          "Resetting now…"
+   * - < 1 hour:      "Resets in 23 min"
+   * - < 24 hours:    "Resets in 12hr 30min"
+   * - < 7 days:      "Resets Sun 9:00 PM"
+   * - >= 7 days:     "Resets May 31 9:00 PM"
+   */
+  function formatResetCountdown(epochSeconds) {
+    if (epochSeconds == null) return '—';
+    const nowMs = Date.now();
+    const targetMs = epochSeconds * 1000;
+    const diffMs = targetMs - nowMs;
+
+    if (diffMs <= 0) return 'Resetting now…';
+
+    const diffSec = Math.floor(diffMs / 1000);
+    const diffMin = Math.floor(diffSec / 60);
+    const diffHr  = Math.floor(diffMin / 60);
+    const diffDay = Math.floor(diffHr  / 24);
+
+    if (diffMin < 60) {
+      return 'Resets in ' + diffMin + ' min';
+    }
+    if (diffHr < 24) {
+      const remMin = diffMin - diffHr * 60;
+      if (remMin === 0) return 'Resets in ' + diffHr + 'hr';
+      return 'Resets in ' + diffHr + 'hr ' + remMin + 'min';
+    }
+    // Format as "Resets <day-of-week> <time>" or "Resets <month> <day> <time>"
+    const target = new Date(targetMs);
+    const timeStr = target.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    if (diffDay < 7) {
+      const dayStr = target.toLocaleString('en-US', { weekday: 'short' });
+      return 'Resets ' + dayStr + ' ' + timeStr;
+    }
+    const dateStr = target.toLocaleString('en-US', { month: 'short', day: 'numeric' });
+    return 'Resets ' + dateStr + ' ' + timeStr;
+  }
+
+  /* ─────────────── "Updated N min ago" helper ─────────────── */
+  function formatAgo(epochMs) {
+    if (epochMs == null) return '';
+    const diffMs = Date.now() - epochMs;
+    if (diffMs < 0) return 'just now';
+    const diffSec = Math.floor(diffMs / 1000);
+    if (diffSec < 60) return 'Updated just now';
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin === 1) return 'Updated 1 min ago';
+    if (diffMin < 60) return 'Updated ' + diffMin + ' min ago';
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr === 1) return 'Updated ~1hr ago';
+    return 'Updated ~' + diffHr + 'hr ago';
+  }
+
+  /* ─────────────── Utilization bar color ─────────────── */
+  function utilizationColor(fraction) {
+    if (fraction == null) return 'green';
+    if (fraction >= 0.80) return 'red';
+    if (fraction >= 0.50) return 'amber';
+    return 'green';
+  }
+
+  /* ─────────────── Provider badge color class ─────────────── */
+  function providerBadgeClass(name) {
+    const n = (name || '').toLowerCase();
+    if (n === 'anthropic') return 'anthropic';
+    if (n === 'codex')     return 'codex';
+    if (n === 'mistral')   return 'mistral';
+    if (n === 'openai')    return 'openai';
+    return 'default';
+  }
+
+  /* ─────────────── Plan Usage renderer (quota_v2) ─────────────── */
+  function renderPlanUsage(quotaV2) {
+    const target = document.getElementById('panel-plan-usage');
+    target.innerHTML = '';
+
+    if (!Array.isArray(quotaV2) || quotaV2.length === 0) {
+      target.appendChild(el('div', { class: 'panel-loading' }, 'No quota data available.'));
+      return;
+    }
+
+    const frag = document.createDocumentFragment();
+
+    for (const entry of quotaV2) {
+      const status = entry.status || 'unavailable';
+      const rowEl = el('div', { class: 'provider-row ' + status });
+
+      /* ── top bar: badge + status dot + chips + schema tag ── */
+      const topBar = el('div', { class: 'provider-row-top' });
+
+      topBar.appendChild(el('span', { class: 'provider-badge ' + providerBadgeClass(entry.provider) }, (entry.provider || '').toUpperCase()));
+      topBar.appendChild(el('span', { class: 'status-dot ' + status, title: 'Status: ' + status }));
+      topBar.appendChild(el('span', { class: 'status-chip ' + status }, status));
+
+      if (entry.schema_version) {
+        topBar.appendChild(el('span', { class: 'schema-tag' }, 'schema: ' + entry.schema_version));
+      }
+
+      rowEl.appendChild(topBar);
+
+      /* ── unavailable: just show reason, no bars ── */
+      if (status === 'unavailable') {
+        const reason = entry.reason || 'no public quota api or probe disabled';
+        rowEl.appendChild(el('div', { class: 'unavailable-reason' }, reason));
+        frag.appendChild(rowEl);
+        continue;
+      }
+
+      /* ── utilization bars (5h + 7d) ── */
+      const util = entry.utilization || {};
+      const reset = entry.reset || {};
+      const barsWrap = el('div', { class: 'utilization-bars' });
+
+      const windows = [
+        { key: '5h', label: 'Current 5-hour session' },
+        { key: '7d', label: 'Weekly all-models' },
+      ];
+
+      for (const w of windows) {
+        const frac = util[w.key];
+        const resetEpoch = reset[w.key];
+        const color = utilizationColor(frac);
+        const pctStr = frac != null ? Math.round(frac * 100) + '%' : '—';
+        const fillPct = frac != null ? Math.min(100, Math.round(frac * 100)) : 0;
+        const resetStr = formatResetCountdown(resetEpoch);
+
+        const utilRow = el('div', { class: 'util-row' });
+
+        utilRow.appendChild(el('span', { class: 'util-label', title: w.label },
+          w.label + (frac != null ? ': ' + pctStr : '')
+        ));
+
+        const barWrap = el('div', { class: 'util-bar-wrap' });
+        barWrap.appendChild(el('div', {
+          class: 'util-bar-fill ' + color,
+          style: 'width: ' + fillPct + '%',
+          'aria-valuenow': fillPct,
+          'aria-valuemin': '0',
+          'aria-valuemax': '100',
+          role: 'progressbar',
+        }));
+        utilRow.appendChild(barWrap);
+
+        utilRow.appendChild(el('span', { class: 'util-pct' }, pctStr));
+        utilRow.appendChild(el('span', { class: 'util-reset' }, resetStr));
+
+        barsWrap.appendChild(utilRow);
+      }
+
+      rowEl.appendChild(barsWrap);
+
+      /* ── bottom chips: representative-claim, overage, last-fresh ── */
+      const bottomBar = el('div', { class: 'provider-row-bottom' });
+
+      if (entry.representative_claim) {
+        const claimLabel = entry.representative_claim === 'five_hour' ? '5-hour claim'
+          : entry.representative_claim === 'seven_day' ? '7-day claim'
+          : entry.representative_claim;
+        bottomBar.appendChild(el('span', { class: 'rep-claim-badge', title: 'Binding window: ' + entry.representative_claim }, claimLabel));
+      }
+
+      if (entry.overage) {
+        const ov = entry.overage;
+        const ovStatus = (ov.status || 'unknown').toLowerCase();
+        const isAllowed = ovStatus === 'allowed' || ovStatus === 'active';
+        const chipClass = isAllowed ? 'overage-chip allowed' : 'overage-chip';
+        const label = 'Overage: ' + (ov.status || '—')
+          + (ov.disabled_reason ? ' (' + ov.disabled_reason + ')' : '');
+        bottomBar.appendChild(el('span', { class: chipClass, title: label }, label));
+      }
+
+      if (entry.fallback_percentage != null) {
+        const fpPct = Math.round(entry.fallback_percentage * 100) + '%';
+        bottomBar.appendChild(el('span', { class: 'chip-sm', title: 'Fallback rate (last window)' }, 'Fallback ' + fpPct));
+      }
+
+      if (entry.last_fresh_at) {
+        bottomBar.appendChild(el('span', { class: 'last-fresh-tag' }, formatAgo(entry.last_fresh_at)));
+      }
+
+      if (status === 'stale') {
+        const staleTitle = entry.last_fresh_at
+          ? 'Last successful probe was ' + formatAgo(entry.last_fresh_at) + '; backoff active'
+          : 'Probe data is stale; backoff active';
+        bottomBar.appendChild(el('span', { class: 'chip-sm', style: 'color: #92400e; background: #fef3c7; border-color: #fcd34d;', title: staleTitle }, '⚠ stale data'));
+      }
+
+      rowEl.appendChild(bottomBar);
+      frag.appendChild(rowEl);
+    }
+
+    target.appendChild(frag);
+  }
+
+  /* ─────────────── Legacy quota renderer (graceful fallback) ─────────────── */
   function renderQuota(data) {
     const target = document.getElementById('panel-quota');
     target.innerHTML = '';
@@ -129,6 +561,28 @@
     target.appendChild(table);
   }
 
+  /* ─────────────── Plan Usage top-level render + quota routing ─────────────── */
+  function renderQuotaSection(data) {
+    const hasV2 = Array.isArray(data.quota_v2) && data.quota_v2.length > 0;
+    const legacySection = document.getElementById('legacy-quota-section');
+
+    if (hasV2) {
+      // D82: use enriched quota_v2 rows; hide legacy panel
+      legacySection.style.display = 'none';
+      renderPlanUsage(data.quota_v2);
+    } else {
+      // Graceful fallback: show legacy quota panel (older server build without D81)
+      legacySection.style.display = '';
+      // Also show legacy data in Plan Usage panel with a note
+      const target = document.getElementById('panel-plan-usage');
+      target.innerHTML = '';
+      target.appendChild(el('div', { class: 'panel-loading', style: 'color:#6b7280;' },
+        'quota_v2 not available (server may not have D81 yet). See legacy Quota panel below.'));
+      renderQuota(data.quota);
+    }
+  }
+
+  /* ─────────────── Other panel renderers (unchanged from D51) ─────────────── */
   function render24h(window24h, cacheHit24h) {
     const target = document.getElementById('panel-24h');
     target.innerHTML = '';
@@ -196,7 +650,7 @@
     const minLabel = svgEl('text', { x: 4, y: height - 4, 'font-size': 10, fill: '#6b7280' });
     minLabel.textContent = '0';
     svg.appendChild(minLabel);
-    // Date labels (first + last only at v0.3.0; mid labels deferred — added if needed by Phase 4 UX feedback)
+    // Date labels (first + last only)
     if (spendTrend30d.length > 0) {
       const firstDate = svgEl('text', { x: padding.left, y: height - 4, 'font-size': 10, fill: '#6b7280' });
       firstDate.textContent = spendTrend30d[0].date.slice(5);
@@ -240,6 +694,7 @@
     target.appendChild(table);
   }
 
+  /* ─────────────── Error / clear banner ─────────────── */
   function showError(message) {
     const slot = document.getElementById('banner-slot');
     slot.innerHTML = '';
@@ -250,6 +705,7 @@
     document.getElementById('banner-slot').innerHTML = '';
   }
 
+  /* ─────────────── Fetch ─────────────── */
   async function fetchDashboardData() {
     const res = await fetch('/v0/management/dashboard-data', {
       headers: { 'Accept': 'application/json' },
@@ -266,24 +722,82 @@
     return await res.json();
   }
 
+  /* ─────────────── Quota-only refresh (D82 § C — 60s timer) ─────────────── */
+  let _lastQuotaFetchedAt = null;
+
+  async function refreshQuotaV2() {
+    try {
+      const data = await fetchDashboardData();
+      clearError();
+      _lastQuotaFetchedAt = Date.now();
+      renderQuotaSection(data);
+      updateQuotaLastRefreshLabel();
+    } catch (err) {
+      console.warn('OLP quota refresh failed:', err.message);
+    }
+  }
+
+  function updateQuotaLastRefreshLabel() {
+    const span = document.getElementById('quota-last-refresh');
+    if (!span) return;
+    if (_lastQuotaFetchedAt) {
+      span.textContent = 'Updated ' + new Date(_lastQuotaFetchedAt).toLocaleTimeString();
+    }
+  }
+
+  /* ─────────────── 60s quota timer with visibilityState guard ─────────────── */
+  function startQuotaRefresh() {
+    if (quotaRefreshTimer !== null) return;
+    quotaRefreshTimer = setInterval(refreshQuotaV2, QUOTA_POLL_INTERVAL_MS);
+  }
+  function stopQuotaRefresh() {
+    if (quotaRefreshTimer === null) return;
+    clearInterval(quotaRefreshTimer);
+    quotaRefreshTimer = null;
+  }
+
+  /* ─────────────── Manual refresh button (D82 § D) ─────────────── */
+  (function wireRefreshButton() {
+    const btn = document.getElementById('quota-refresh-btn');
+    const icon = document.getElementById('quota-refresh-icon');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      icon.textContent = '⟳';
+      icon.classList.add('spin');
+      try {
+        await refreshQuotaV2();
+      } finally {
+        icon.classList.remove('spin');
+        icon.textContent = '↻';
+        // Re-enable after 2s spam guard
+        setTimeout(() => { btn.disabled = false; }, 2000);
+      }
+    });
+  })();
+
+  /* ─────────────── Full 30s refresh (legacy panels + meta) ─────────────── */
   async function refresh() {
     try {
       const data = await fetchDashboardData();
       clearError();
       const generated = data.generated_at ? new Date(data.generated_at) : new Date();
       document.getElementById('meta').textContent =
-        'Last refresh: ' + generated.toLocaleString() + ' · next in ~30s';
-      renderQuota(data.quota);
+        'Last refresh: ' + generated.toLocaleString() + ' · quota every 60s · other panels every 30s';
+      // Quota section: also render on each full refresh to keep in sync
+      _lastQuotaFetchedAt = Date.now();
+      renderQuotaSection(data);
+      updateQuotaLastRefreshLabel();
       render24h(data.window_24h, data.cache_hit_24h);
       renderTrend(data.spend_trend_30d);
       renderChains(data.top_fallback_chains_24h);
     } catch (err) {
-      // Error banner already shown by fetchDashboardData; keep panels in
-      // their last-good state. Console for operator debugging.
       console.warn('OLP dashboard refresh failed:', err.message);
     }
   }
 
+  /* ─────────────── 30s poll (legacy panels) ─────────────── */
   function startPolling() {
     if (pollHandle !== null) return;
     pollHandle = setInterval(refresh, POLL_INTERVAL_MS);
@@ -294,14 +808,24 @@
     pollHandle = null;
   }
 
-  // Pause when tab hidden, resume on visible (ADR 0008 § 6.5).
+  /* ─────────────── visibilitychange (both timers) ─────────────── */
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') stopPolling();
-    else { refresh(); startPolling(); }
+    if (document.visibilityState === 'hidden') {
+      stopPolling();
+      stopQuotaRefresh();
+    } else {
+      refresh();
+      startPolling();
+      refreshQuotaV2();
+      startQuotaRefresh();
+    }
   });
 
-  // Initial fetch + start poll.
-  refresh().finally(startPolling);
+  /* ─────────────── Boot ─────────────── */
+  refresh().finally(() => {
+    startPolling();
+    if (document.visibilityState === 'visible') startQuotaRefresh();
+  });
 })();
 </script>
 </body>

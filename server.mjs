@@ -71,11 +71,13 @@ import {
 } from './lib/keys.mjs';
 import { appendAuditEvent } from './lib/audit.mjs';
 // Phase 3 / D50 — management endpoints consume the audit aggregate query layer.
+// D81 (Phase 5) — adds aggregateProviderQuota for quota_v2 shape.
 import {
   aggregateRequests as auditAggregateRequests,
   topFallbackChains as auditTopFallbackChains,
   spendTrendDaily as auditSpendTrendDaily,
   cacheHitRateWindow as auditCacheHitRateWindow,
+  aggregateProviderQuota as auditAggregateProviderQuota,
 } from './lib/audit-query.mjs';
 
 // ── Config ────────────────────────────────────────────────────────────────
@@ -2059,8 +2061,10 @@ async function handleDashboard(req, res) {
 async function handleManagementDashboardData(req, res) {
   return _runOwnerOnlyManagementEndpoint(req, res, 'GET', '/v0/management/dashboard-data',
     async (_req, res2, _identity, _auditCtx) => {
-      // Quota panel: collect quotaStatus from each loaded provider; null on
+      // Quota panel (legacy): collect quotaStatus from each loaded provider; null on
       // throw or null return → "unavailable" indicator.
+      // DEPRECATED: kept for backwards compat with current dashboard.html (D82 will
+      // switch consumers to quota_v2; legacy 'quota' key removed at v1.0.0 or earlier).
       const quota = [];
       for (const [name, provider] of loadedProviders) {
         try {
@@ -2071,12 +2075,27 @@ async function handleManagementDashboardData(req, res) {
         }
       }
 
+      // quota_v2 (D81 / Phase 5): normalized per-provider quota shape for enriched
+      // dashboard rendering. Built from aggregateProviderQuota() in lib/audit-query.mjs.
+      // Each entry contains: provider, status, schema_version, last_fresh_at,
+      // utilization, reset, representative_claim, fallback_percentage, overage, raw_available.
+      // Providers with null quotaStatus() return { status: 'unavailable', reason: ... }.
+      // Authority: ADR 0008 Amendment (D81) + ADR 0012 D81 + ADR 0013 Rule 5.
+      let quota_v2 = [];
+      try {
+        quota_v2 = await auditAggregateProviderQuota({ providers: loadedProviders });
+      } catch (err) {
+        // Graceful degradation: quota_v2 is optional enrichment; don't fail entire payload.
+        logEvent('warn', 'dashboard_data_quota_v2_failed', { error: err?.message ?? String(err) });
+      }
+
       const WINDOW_24H = 24 * 60 * 60 * 1000;
       const payload = {
         generated_at: new Date().toISOString(),
         window_24h: auditAggregateRequests({ windowMs: WINDOW_24H, logEvent }),
         cache_hit_24h: auditCacheHitRateWindow({ windowMs: WINDOW_24H, logEvent }),
         quota,
+        quota_v2,
         spend_trend_30d: auditSpendTrendDaily({ days: 30, logEvent }),
         top_fallback_chains_24h: auditTopFallbackChains({ windowMs: WINDOW_24H, limit: 10, logEvent }),
         cache_stats: cacheStore.stats(),
@@ -2093,6 +2112,7 @@ async function handleManagementDashboardData(req, res) {
 async function handleManagementQuota(req, res) {
   return _runOwnerOnlyManagementEndpoint(req, res, 'GET', '/v0/management/quota',
     async (_req, res2, _identity, _auditCtx) => {
+      // Legacy quota array (backwards compat).
       const quota = [];
       for (const [name, provider] of loadedProviders) {
         try {
@@ -2102,7 +2122,14 @@ async function handleManagementQuota(req, res) {
           quota.push({ provider: name, error: err?.message ?? String(err), available: null });
         }
       }
-      sendJSON(res2, 200, { generated_at: new Date().toISOString(), quota });
+      // quota_v2 (D81): normalized per-provider quota shape per ADR 0008 Amendment (D81).
+      let quota_v2 = [];
+      try {
+        quota_v2 = await auditAggregateProviderQuota({ providers: loadedProviders });
+      } catch (err) {
+        logEvent('warn', 'management_quota_v2_failed', { error: err?.message ?? String(err) });
+      }
+      sendJSON(res2, 200, { generated_at: new Date().toISOString(), quota, quota_v2 });
     });
 }
 

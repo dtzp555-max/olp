@@ -4,23 +4,49 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-### D79 — Phase 5 constitutional layer: charter ADR 0012 + ADR 0002 Amendment 8 + ADR 0013
+(empty — Phase 6 entries land here once Phase 6 opens)
 
-Three coupled governance documents land together as the D79 constitutional layer (Iron Rule 11 IDR — reviewing them separately cannot verify consumer-producer alignment). Phase 5 opens 2026-05-26; no code changes yet.
+## v0.5.0 — 2026-05-26
 
-- **ADR 0012 (Phase 5 charter).** Scope: port OCP's plan-usage probe to `lib/providers/anthropic.mjs:quotaStatus()` (D80) + extend `/v0/management/dashboard-data` for the new shape (D81) + Claude.ai-style dashboard restructure with 1-min auto-refresh + manual refresh button (D82) + Suite 38/39 quota-probe + dashboard tests (D83) + optional mistral probe at D84 (codex skipped — no public API) + v0.5.0 close (maintainer-triggered). D-day plan covers ~6 D-days.
-- **ADR 0002 Amendment 8 (direct-API READ-ONLY exemption).** Plugin contract amendment permitting `quotaStatus()` to call provider HTTP APIs directly, subject to three constraints: READ-ONLY (no mutating calls), subscription-scope (reuses spawn-path credentials), idempotent failure (returns `null` on any error, never throws). No other contract method gains this permission. Cites OCP `server.mjs:842-1109` as the port reference + `~/.cc-rules/memory/learnings/anthropic_plan_usage_probe_schema_2026_05_26.md` as the live schema pin.
-- **ADR 0013 (OAuth READ-ONLY consumption + schema-drift mitigation).** Implementation discipline for ADR 0002 Amendment 8. Seven rules: (1) credential reuse via plugin's `readAuthArtifact()` — no new OAuth grant, (2) READ-ONLY at the wire — one probe per cache miss with `max_tokens:1`, headers-only parse, body discarded, (3) cache TTL 5min + 60s-3600s exponential refresh backoff + stale-cache-on-failure, (4) opt-in via `~/.olp/config.json providers.<name>.quota_probe_enabled` (default false), (5) schema-drift mitigation via dual-path verification (compiled-binary `strings` + live API probe diff), (6) failure transparency through `olp doctor` + dashboard staleness markers, (7) explicit out-of-scope clarifications.
+**Phase 5 — Provider Quota Probes + Dashboard Enrichment.** OLP gains live subscription-quota observability for Anthropic Pro/Max subscribers, surfaced through a Claude.ai-style Plan Usage panel on the owner-only dashboard. The probe is opt-in, READ-ONLY, idempotent on failure, and 5-min-cached with 60s→3600s exponential backoff. Six D-days, seven PRs, zero blocking reviewer findings, no flaky tests; 720 → 756 total tests.
 
-**Pre-flight institutional-knowledge audit.** Phase 5 was unblocked by a 2026-05-26 audit per Iron Rule 12 (prior-art search before brainstorming). The audit verified:
-- OCP's plan-usage probe (`server.mjs:842-1109`) still works against current `api.anthropic.com` — tested live from PI231 OAuth credentials.
-- 13 `anthropic-ratelimit-unified-*` response headers confirmed (3 new fields since OCP's 2026-04 capture: `5h-status`, `7d-status`, `overage-reset`; no removals or renames).
-- Claude Code v2.1.x is now distributed as compiled native binary (Mach-O / ELF) — OCP's "grep cli.js" verification is no longer applicable. ADR 0013 Rule 5 replaces it with dual-path verification (compiled-binary `strings` + live API probe diff).
-- OAuth refresh path (`platform.claude.com/v1/oauth/token`, client_id `9d1c250a-...`, 60s-3600s exponential backoff) all unchanged.
+### What's new for users
 
-Audit memory persists at `~/.cc-rules/memory/learnings/anthropic_plan_usage_probe_schema_2026_05_26.md` (cross-machine git-sync).
+- **Live plan usage on the dashboard.** Per-provider rows show 5-hour + 7-day utilization bars with reset countdowns ("Resets in 1hr 6min" / "Resets Sun 9:00 PM"), status badges (allowed / rejected), representative-claim chips ("five_hour" / "seven_day"), overage-status indicators, and a `↻ Refresh` button. 60-second auto-refresh pauses when the tab is hidden.
+- **Anthropic quota probe.** Opt-in via `~/.olp/config.json providers.anthropic.quota_probe_enabled: true`. Parses the canonical `anthropic-ratelimit-unified-*` response-header schema (13 fields) from a minimal `POST /v1/messages` probe. Reuses the spawn-path OAuth credentials — env var → `~/.claude/.credentials.json` → macOS Keychain. Refresh-on-401, stale-cache-on-failure.
+- **`olp doctor anthropic.quota_probe_reachable`.** New check surfaces probe health. Returns `status: ok` with parsed utilization when fresh, `warn` on stale cache, `fail` with `human_steps[]` auth-aware recipe (re-login via `claude setup-token` or wait-and-retry).
+- **Provider matrix.** Anthropic ✅ live (13 fields). OpenAI ❌ no public quota API. Mistral ❌ no member-key-accessible quota endpoint (Admin API exists but org-admin-scoped, out of scope for trusted-LAN deployment per ADR 0011). All three pinned in `models-registry.json quota_probe.<provider>` block.
 
-**Authority cited at D79 commit body:** ALIGNMENT.md Rules 1 + 2 + 5; CLAUDE.md release_kit (Phase 5 open); audit memory; OCP server.mjs:842-1109 as port reference; live `/v1/messages` probe transcript from 2026-05-26.
+### What's new for contributors
+
+- **ADR 0012 (Phase 5 charter)** — D-day plan + exit gate + scope boundaries (`docs/adr/0012-phase-5-charter-quota-probes-dashboard.md`).
+- **ADR 0002 Amendment 8** — first Class-specific Exception to the plugin contract: `quotaStatus()` may call provider HTTP APIs directly, subject to three constraints (READ-ONLY, subscription-scope, idempotent-failure) and the per-endpoint enumeration in ADR 0013 Rule 2.
+- **ADR 0013** — seven rules covering OAuth READ-ONLY consumption + dual-path schema-drift mitigation (compiled-binary `strings` + live API probe diff, since Claude Code v2.1.x is now a Mach-O / ELF binary with no `cli.js` to grep).
+- **`models-registry.json quota_probe.schema_version`** — pinned at `2026-05-26` (13 fields). Bump on schema-drift events per ADR 0013 Rule 5.
+- **Test seams** — 5 underscore-prefixed exports in `lib/providers/anthropic.mjs` (`_setQuotaUrlsForTest`, `_resetQuotaProbeStateForTest`, `_resetQuotaStateOnlyForTest`, `_getQuotaProbeStateForTest`, `_setQuotaAuthReadFnForTest`) for hermetic probe testing. Production code must not call them.
+- **ALIGNMENT.md § Class-specific Exceptions** — gains its first numbered exception (Anthropic plan-usage probe via direct `/v1/messages`).
+- **Audit memory at `~/.cc-rules/memory/learnings/anthropic_plan_usage_probe_schema_2026_05_26.md`** — schema canon + verification protocol + OCP institutional history.
+
+### D-day-level changes (Phase 5)
+
+- **D79** (PR #50 + cleanup PR #51): governance layer — ADR 0012 charter, ADR 0002 Amendment 8, ADR 0013, ALIGNMENT.md Class-specific Exceptions entry, D84 Mistral NO-GO disposition.
+- **D80** (PR #52): ported OCP `server.mjs:842-1109` to `lib/providers/anthropic.mjs:quotaStatus()`. Adds macOS-keychain reader to `readAuthArtifact()`. Parses all 13 fields including 3 new since OCP's 2026-04 capture (`5h-status`, `7d-status`, `overage-reset`). Implements 5min cache + 60s-3600s exponential refresh backoff + stale-cache-on-failure + opt-in config flag + `anthropic.quota_probe_reachable` doctor check. ~250 LOC.
+- **D81** (PR #53): added `lib/audit-query.mjs aggregateProviderQuota()` + `/v0/management/dashboard-data quota_v2` field + `/v0/management/quota quota_v2` field. Pinned `quota_probe.schema_version` in `models-registry.json`. Legacy `quota` field stays alongside for backwards compat until v1.0.0. ADR 0008 Amendment 1 documents the shape.
+- **D82** (PR #54): `dashboard.html` restructure — Claude.ai-style Plan Usage panel above the existing 4 panels. Per-provider rows with utilization bars, reset countdowns, status chips, representative-claim badges, overage chips, "Updated N min ago" labels. 60s `setInterval` with `visibilitychange` pause/resume. Manual refresh button with 2s spam guard. Graceful fallback to legacy `quota` when `quota_v2` absent. Closes v1.x roadmap #8.
+- **D83** (PR #55): Suite 38 (20 quota-probe unit tests covering all 13-header parse + cache + backoff + 401-refresh + 429-stale + schema_version + 5 doctor status paths) + Suite 39 (8 dashboard rendering smoke tests covering /dashboard 200/401 + key D82 HTML strings). Added 5 test seams to anthropic.mjs. 727 → 755 tests, 0 fail. Fold-in commit added 38j positive-path coverage (38j2: 401 → refresh succeeds → retry 200) per reviewer finding; total 756.
+- **Close-prep** (PR #56): README § Plan Usage section + § Supported Providers Quota-probe column + dashboard screenshot + `docs/exit-gates/phase-5-e2e.json` live verification artifact. Fold-in commit addressed 3 maintainer accuracy findings (doctor-kind framing / Mistral admin-API acknowledgment / SPOT drift closure via `quota_probe.openai` + `quota_probe.mistral` registry entries).
+
+### Out of Phase 5 scope (deferred to later)
+
+- **D84 Mistral probe.** NO-GO per 2026-05-26 spike: no member-key-accessible quota endpoint at `docs.mistral.ai/api`. Re-entry point pinned at `lib/providers/mistral.mjs DL-7`; re-evaluate if Mistral publishes a member-key surface or if OLP deployment posture expands to org-admin scope (Mistral Admin API exists).
+- **OpenAI / codex probe.** Permanently skipped — `openai/codex` CLI has no public quota API.
+- **`X-OLP-Cost-USD` per-request header.** Deferred to Phase 6 (depends on per-(provider, model) cost weights table).
+- **`context_window_exceeded` fallback trigger.** Deferred (trigger condition not yet observed).
+- **Automated schema-drift detector.** ADR 0013 Rule 5 codifies a procedural runbook (Annual Alignment Audit + `olp doctor` probe-failure + manual maintainer attention at major `claude --version` bumps), not an automated alarm.
+
+### Authority cited
+
+ALIGNMENT.md Rules 1 + 2 + 5; CLAUDE.md release_kit (Phase 5 close trigger); ADR 0012 § Exit gate; ADR 0013 Rule 5 schema-drift protocol; OCP `server.mjs:842-1109` as port reference; live `/v1/messages` probe transcripts captured 2026-05-26 from PI231 (D79 audit) + MacBook (D80 + Phase 5 close-prep E2E); audit memory at `~/.cc-rules/memory/learnings/anthropic_plan_usage_probe_schema_2026_05_26.md`.
 
 ## v0.4.4 — 2026-05-26
 

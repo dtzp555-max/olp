@@ -27,7 +27,10 @@
   raw_available: boolean,
   // v0.5.1 (F3 — ADR 0013 Rule 6):
   failure: { kind, message, backoff_until? } | null,
-  failure_kind: 'opt_in_off'|'no_credentials'|'auth_failed'|'rate_limited'|'schema_drift'|'network'|'other' | null,
+  failure_kind: 'no_credentials'|'auth_failed'|'rate_limited'|'schema_drift'|'network'|'other' | null,
+  // Note: 'opt_in_off' is NOT in this enum — when probe is opted out, the row's status
+  // is 'unavailable' (not 'unreachable'); failure_kind stays null. Distinguishing
+  // "user opted out" from "provider has no API" requires reading config separately.
   backoff_until: number | null,  // epoch-ms when next probe attempt is allowed
 }
 ```

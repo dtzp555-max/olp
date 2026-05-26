@@ -6,6 +6,30 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 (empty — Phase 5 entries land here once Phase 5 opens)
 
+## v0.4.3 — 2026-05-26
+
+### D76 — README install-path overhaul + `OLP_BIND` env + AI-driven install prompt + ADR 0011 amendment
+
+Patch release closing the install-experience gap. v0.4.0–v0.4.2 README's Quick Start was placeholder text with fictional commands (`npm install -g @dtzp555-max/olp` — package isn't published; `olp setup` / `olp start` — don't exist). 10 real gaps catalogued + fixed in one D-day; `OLP_BIND` env wired so the documented LAN onboarding flow actually works; AI-driven install prompt added per the Phase 4 charter brainstorm's #2 OCP inheritance candidate (was deferred at D64-D67 to the doctor framework only; D76 closes the README half).
+
+- **G1-G7 (README "Quick Start" was fictional)** — rewrote § "Manual install" with the real sequence: prerequisites (Node ≥ 18 + provider CLI install matrix) → `git clone` → `npm test` verify → `olp-keys keygen --owner` first → provider OAuth (claude/codex/mistral per-CLI flows) → write `~/.olp/config.json` with the minimum that actually serves traffic → `npm start` → smoke-test → IDE pointing. Each step empirically verified against the PI231 + Mac mini E2E session (2026-05-26).
+- **G8 (LAN unreachable — F5)** — added `OLP_BIND` env (default `127.0.0.1`). Operators set `OLP_BIND=0.0.0.0` (or a specific LAN IP) to accept LAN connections so `olp-connect <ip>` can actually reach the server. Pre-D76 the server was hard-coded to `server.listen(PORT, '127.0.0.1', ...)`, making the documented LAN-onboarding flow only usable through an SSH tunnel. ADR 0011's original wording referenced a `BIND_ADDRESS` concept that didn't exist; D76 makes it operational.
+- **G10 (no AI-install pattern)** — README § "Install with your AI (the fast path)" added. Verbatim prompt that the operator pastes into Claude Code / Cursor / Copilot / Aider; the AI follows the README + uses `olp doctor --json` machine-readable `next_action.ai_executable[]` (D64-D67) for self-repair, stopping only when `human_required[]` is non-empty (the provider OAuth dances). This closes the Phase 4 brainstorm Top-5 inheritance candidate #2 — the OCP "paste this prompt" pattern that D64-D67 only half-built.
+- **Opening compressed** — § "Why OLP" (3 paragraphs of OCP billing history) removed from the top. The OCP-trigger context moved to § "Migration from OCP" at the bottom, condensed into a single paragraph. New users land on value-prop + § "What you get" + § "Install with your AI" / § "Manual install" without needing to digest 2026-05-14 / 2026-06-15 Anthropic billing history first. OCP users get a one-line pointer at the top.
+- **§ "Configuration" full schema documentation** — replaced the placeholder with the actual `~/.olp/config.json` schema including every field that v0.4.x reads. Cross-references ADR 0004/0007/0010/0011.
+- **§ "Environment Variables" extended** — added `OLP_BIND`, `OLP_API_KEY`, `OLP_OWNER_TOKEN`, `OLP_PROXY_URL` rows that were used throughout the manual-install flow but undocumented.
+
+**ADR 0011 § "Deployment configurations" amendment.** Codifies the three deployment trust contexts (`127.0.0.1` loopback / RFC1918 + tailnet LAN / `0.0.0.0` public — with `advertise_anonymous_key: true` only safe in the first two). Documents the new `anonymous_key_advertised_with_lan_bind` startup warn event. Closes ADR 0011's pre-D76 dangling reference to a non-existent `BIND_ADDRESS`.
+
+**Test count:** 714 (v0.4.2) → 717 (v0.4.3). +3 D76 regression tests in Suite 36 (36s/36t/36u) pinning `OLP_BIND` wiring + safety warn + ADR amendment.
+
+**Out of D76 scope (deferred):**
+- F6 (doctor client-side vs server-side check separation) — needs design ADR for a `--remote` mode. Phase 5.
+- D75 reviewer P2-1 (ADR 0004 amendment for per-hop schema) + P2-2 (defensive `typeof hopModel === 'string'`) — both genuine follow-ups, neither blocking.
+- `scripts/migrate-from-ocp.mjs` — Phase 7.
+
+**Authority:** PI231 + Mac mini E2E session (2026-05-26, post-v0.4.2 verification revealed the 10 README gaps); ADR 0011 amendment self-cites; Phase 4 charter (ADR 0010) Top-5 inheritance candidate #2 (AI-driven self-repair). Process learning: every D-day reviewer rubric should add "open README in §-Quick-Start and verify the commands literally exist + work in the current repo" — would have caught G1-G7 at v0.4.0.
+
 ## v0.4.2 — 2026-05-26
 
 ### Post-v0.4.1 hotfix batch (D75) — real-machine E2E findings

@@ -18,6 +18,14 @@
  *               so OLP can co-host with OCP for migration windows. ADR 0010 §
  *               Default port. Set OLP_PORT=3456 explicitly to restore the
  *               pre-D60 default when not co-hosting with OCP.)
+ *   OLP_BIND  — listen address (default: 127.0.0.1 since D76 / v0.4.3). Set
+ *               to 0.0.0.0 (or a specific interface IP) to accept connections
+ *               from LAN clients (required for olp-connect <ip> to actually
+ *               reach the server). Server emits a startup warn if BIND
+ *               resolves to a non-loopback address AND auth.allow_anonymous
+ *               is true (anonymous-key over LAN may be acceptable; anonymous-
+ *               key over public internet is not — see ADR 0011 § Deployment
+ *               configurations).
  */
 
 import { createServer } from 'node:http';
@@ -77,6 +85,14 @@ const pkg = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8'));
 const VERSION = pkg.version;
 
 const PORT = parseInt(process.env.OLP_PORT ?? '4567', 10);
+// F5 / D76: OLP_BIND env. Defaults to 127.0.0.1 (loopback only — secure
+// default). Operators expose LAN by setting OLP_BIND=0.0.0.0 (or a specific
+// interface). Per ADR 0011 § Deployment configurations:
+//   - 127.0.0.1: trusted single-machine; safe with any auth posture
+//   - RFC1918 / tailnet / specific LAN IP: trusted-LAN — anonymous_key OK
+//   - 0.0.0.0: ALL interfaces — operator MUST ensure auth posture matches the
+//     network reachability (e.g. no advertise_anonymous_key on public IP)
+const BIND = process.env.OLP_BIND ?? '127.0.0.1';
 const BODY_LIMIT = 5 * 1024 * 1024; // 5 MB
 
 // ── Logging ───────────────────────────────────────────────────────────────
@@ -251,6 +267,19 @@ if (_authConfig.advertise_anonymous_key === true) {
   } else if (findAdvertisedKey() === null) {
     logEvent('warn', 'anonymous_key_advertised_but_no_anonymous_key_exists', {
       message: 'auth.advertise_anonymous_key=true but no active key with plaintext_advertise exists. Run `olp-keys keygen --anonymous --advertise` to create one. /health.anonymousKey will NOT be emitted until then. See ADR 0011.',
+    });
+  }
+  // F5 / D76 (ADR 0011 Deployment configurations): publishing the anonymous
+  // key via /health is only safe when /health is reachable ONLY from a
+  // trusted network. If OLP_BIND is set to a non-loopback address AND
+  // advertise_anonymous_key is true, warn the operator. We can't tell from
+  // here whether the non-loopback bind is "trusted LAN" (RFC1918 / tailnet)
+  // or "public internet" — that's the operator's responsibility. The warn is
+  // a checkpoint, not a hard gate.
+  if (BIND !== '127.0.0.1' && BIND !== 'localhost' && BIND !== '::1') {
+    logEvent('warn', 'anonymous_key_advertised_with_lan_bind', {
+      message: `auth.advertise_anonymous_key=true with OLP_BIND=${BIND} — /health.anonymousKey will be reachable from any host that can connect to ${BIND}:${PORT}. Confirm this address is on a trusted LAN (RFC1918 / tailnet) — never a public IP. See ADR 0011 § Deployment configurations.`,
+      bind: BIND,
     });
   }
 }
@@ -2258,7 +2287,7 @@ const isMain = (() => {
 
 if (isMain) {
   const server = createOlpServer();
-  server.listen(PORT, '127.0.0.1', () => {
+  server.listen(PORT, BIND, () => {
     const enabledCount = loadedProviders.size;
     // D74 P3-5: banner no longer hardcodes the phase. Derives from VERSION
     // (which advances at every Phase close) so banner stays accurate

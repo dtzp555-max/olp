@@ -81,6 +81,8 @@ BIN_DIR=$(npm root -g)/@anthropic-ai/claude-code/node_modules/@anthropic-ai/clau
 strings "$BIN_DIR/claude" | grep -iE "anthropic-ratelimit|/v1/(messages|oauth)|platform\.claude\.com"
 ```
 
+**Path A prerequisites.** GNU or BSD `strings` (part of binutils/coreutils on Linux + macOS — always present on a normal developer machine; Windows requires WSL or `binutils-mingw`). A locally installed Claude Code v2.1.x (npm-global or volta-managed). A reviewer without `claude` installed can still run Path B but Path A is gated on having the binary on disk. A future Claude Code version that ships as a different distribution shape (e.g. Rust binary, statically linked Go) keeps the protocol valid: `strings` works on any ELF/Mach-O regardless of compile source.
+
 **Path B — Live API probe.** Run the actual probe against `api.anthropic.com` with valid OAuth credentials. Captures what the server returns today:
 
 ```bash
@@ -96,6 +98,14 @@ curl -s -i -m 10 -X POST https://api.anthropic.com/v1/messages \
 Path A tells you what the client expects. Path B tells you what the server actually emits. The diff is the actionable schema delta.
 
 **Required cadence.** The diff MUST be re-run at every major `claude --version` bump (v2.x → v3.x is the next trigger). The current pinned schema lives at `~/.cc-rules/memory/learnings/anthropic_plan_usage_probe_schema_2026_05_26.md`. After re-verification, that memory file MUST be updated (or a successor file written with a new date stamp; the old one cross-linked).
+
+**Trigger for re-running the diff.** There is no automated detector for a major `claude --version` bump at v0.5.0. Three explicit hooks share this responsibility:
+
+1. **Annual Alignment Audit** (`ALIGNMENT.md` § Annual Alignment Audit, every 14 May) — diff is mandatory as part of the audit checklist.
+2. **`olp doctor anthropic.quota_probe_reachable` failure** — if the probe returns non-2xx for any reason other than 401/403/429/network (typical schema breaks manifest as 422 or 400), `olp doctor` surfaces a `kind: fix_provider` recipe whose first step is "re-run the Rule 5 dual-path diff".
+3. **Manual maintainer attention at a major Claude Code release** — if the maintainer sees a major version bump in `claude --version`, kick off the diff before the next Phase opens. Rolling-mode discipline (CLAUDE.md release_kit) means major-version bumps usually intersect with Phase boundaries.
+
+If the diff is missed across a major version bump, the failure mode is graceful degradation: the parser silently drops unknown headers; the dashboard shows older values (cached stale) or `null` per Rule 3; `olp doctor` surfaces the staleness.
 
 **Required action on drift detection.** If a header is renamed or removed:
 

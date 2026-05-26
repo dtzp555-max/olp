@@ -35,10 +35,24 @@ set -euo pipefail
 # fall back to "unknown" when running curl-piped (no on-disk package.json).
 _resolve_version() {
   local script_dir pkg
-  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+  # When curl-piped (`curl ... | bash`), BASH_SOURCE[0] is empty → dirname
+  # yields "." → script_dir resolves to cwd. D78 reviewer P2-1 hardening:
+  # require the suffix-strip to actually fire (script_dir ENDED with /bin),
+  # otherwise we'd happily pick up an unrelated package.json from whatever
+  # directory the user happens to be in when piping. Belt-and-braces.
+  # ${BASH_SOURCE[0]:-} default-empty guards against `set -u` nounset error
+  # when invoked via `curl ... | bash` (no source file → BASH_SOURCE unset).
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-}")" &>/dev/null && pwd)"
+  if [[ "$script_dir" != */bin ]]; then
+    echo "unknown"
+    return
+  fi
   pkg="${script_dir%/bin}/package.json"
+  # D78 reviewer P2-2: pass $pkg via env var instead of -c interpolation
+  # so paths with apostrophes / shell metacharacters can't break the
+  # python invocation. Canonical layout is safe; this is defense-in-depth.
   if [[ -f "$pkg" ]] && command -v python3 >/dev/null 2>&1; then
-    python3 -c "import json,sys;print(json.load(open('$pkg')).get('version','unknown'))" 2>/dev/null || echo "unknown"
+    OLP_PKG_PATH="$pkg" python3 -c 'import json,os;print(json.load(open(os.environ["OLP_PKG_PATH"])).get("version","unknown"))' 2>/dev/null || echo "unknown"
   else
     echo "unknown"
   fi

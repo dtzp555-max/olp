@@ -4,7 +4,23 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-(empty — Phase 5 entries land here once Phase 5 opens)
+### D79 — Phase 5 constitutional layer: charter ADR 0012 + ADR 0002 Amendment 8 + ADR 0013
+
+Three coupled governance documents land together as the D79 constitutional layer (Iron Rule 11 IDR — reviewing them separately cannot verify consumer-producer alignment). Phase 5 opens 2026-05-26; no code changes yet.
+
+- **ADR 0012 (Phase 5 charter).** Scope: port OCP's plan-usage probe to `lib/providers/anthropic.mjs:quotaStatus()` (D80) + extend `/v0/management/dashboard-data` for the new shape (D81) + Claude.ai-style dashboard restructure with 1-min auto-refresh + manual refresh button (D82) + Suite 38/39 quota-probe + dashboard tests (D83) + optional mistral probe at D84 (codex skipped — no public API) + v0.5.0 close (maintainer-triggered). D-day plan covers ~6 D-days.
+- **ADR 0002 Amendment 8 (direct-API READ-ONLY exemption).** Plugin contract amendment permitting `quotaStatus()` to call provider HTTP APIs directly, subject to three constraints: READ-ONLY (no mutating calls), subscription-scope (reuses spawn-path credentials), idempotent failure (returns `null` on any error, never throws). No other contract method gains this permission. Cites OCP `server.mjs:842-1109` as the port reference + `~/.cc-rules/memory/learnings/anthropic_plan_usage_probe_schema_2026_05_26.md` as the live schema pin.
+- **ADR 0013 (OAuth READ-ONLY consumption + schema-drift mitigation).** Implementation discipline for ADR 0002 Amendment 8. Seven rules: (1) credential reuse via plugin's `readAuthArtifact()` — no new OAuth grant, (2) READ-ONLY at the wire — one probe per cache miss with `max_tokens:1`, headers-only parse, body discarded, (3) cache TTL 5min + 60s-3600s exponential refresh backoff + stale-cache-on-failure, (4) opt-in via `~/.olp/config.json providers.<name>.quota_probe_enabled` (default false), (5) schema-drift mitigation via dual-path verification (compiled-binary `strings` + live API probe diff), (6) failure transparency through `olp doctor` + dashboard staleness markers, (7) explicit out-of-scope clarifications.
+
+**Pre-flight institutional-knowledge audit.** Phase 5 was unblocked by a 2026-05-26 audit per Iron Rule 12 (prior-art search before brainstorming). The audit verified:
+- OCP's plan-usage probe (`server.mjs:842-1109`) still works against current `api.anthropic.com` — tested live from PI231 OAuth credentials.
+- 13 `anthropic-ratelimit-unified-*` response headers confirmed (3 new fields since OCP's 2026-04 capture: `5h-status`, `7d-status`, `overage-reset`; no removals or renames).
+- Claude Code v2.1.x is now distributed as compiled native binary (Mach-O / ELF) — OCP's "grep cli.js" verification is no longer applicable. ADR 0013 Rule 5 replaces it with dual-path verification (compiled-binary `strings` + live API probe diff).
+- OAuth refresh path (`platform.claude.com/v1/oauth/token`, client_id `9d1c250a-...`, 60s-3600s exponential backoff) all unchanged.
+
+Audit memory persists at `~/.cc-rules/memory/learnings/anthropic_plan_usage_probe_schema_2026_05_26.md` (cross-machine git-sync).
+
+**Authority cited at D79 commit body:** ALIGNMENT.md Rules 1 + 2 + 5; CLAUDE.md release_kit (Phase 5 open); audit memory; OCP server.mjs:842-1109 as port reference; live `/v1/messages` probe transcript from 2026-05-26.
 
 ## v0.4.4 — 2026-05-26
 

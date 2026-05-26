@@ -100,6 +100,7 @@
   .provider-row:last-child { margin-bottom: 0; }
   .provider-row.unavailable { background: #f9fafb; }
   .provider-row.stale { border-color: #fcd34d; }
+  .provider-row.unreachable { border-color: #fca5a5; background: #fff5f5; }
 
   .provider-row-top {
     display: flex;
@@ -134,6 +135,7 @@
   .status-dot.live        { background: #10b981; }
   .status-dot.stale       { background: #f59e0b; }
   .status-dot.unavailable { background: #9ca3af; }
+  .status-dot.unreachable { background: #ef4444; }
 
   .status-chip {
     display: inline-block;
@@ -147,6 +149,7 @@
   .status-chip.live        { background: #d1fae5; color: #065f46; }
   .status-chip.stale       { background: #fef3c7; color: #92400e; }
   .status-chip.unavailable { background: #f3f4f6; color: #6b7280; }
+  .status-chip.unreachable { background: #fee2e2; color: #991b1b; }
 
   .chip-sm {
     display: inline-block;
@@ -165,6 +168,12 @@
   .unavailable-reason {
     font-size: 0.875rem;
     color: #9ca3af;
+    font-style: italic;
+    padding: 0.25rem 0 0;
+  }
+  .unreachable-reason {
+    font-size: 0.875rem;
+    color: #b91c1c;
     font-style: italic;
     padding: 0.25rem 0 0;
   }
@@ -294,7 +303,7 @@
     <div id="panel-chains"><div class="panel-loading">Loading…</div></div>
   </section>
 </div>
-<footer>OLP Dashboard · Plan Usage: 60s refresh · other panels: 30s · paused when tab hidden · v0.5.0-phase5</footer>
+<footer>OLP Dashboard · Plan Usage: 60s refresh · other panels: 30s · paused when tab hidden · v0.5.1</footer>
 <script>
 (function () {
   'use strict';
@@ -438,6 +447,24 @@
       if (status === 'unavailable') {
         const reason = entry.reason || 'no public quota api or probe disabled';
         rowEl.appendChild(el('div', { class: 'unavailable-reason' }, reason));
+        frag.appendChild(rowEl);
+        continue;
+      }
+
+      /* ── unreachable (v0.5.1): probe failed + no cache — show failure detail ── */
+      if (status === 'unreachable') {
+        const failure = entry.failure || {};
+        const kind = failure.kind || 'unknown';
+        const msg = failure.message || 'probe failed — no cached data available';
+        const shortText = `${kind}: ${msg}`;
+        rowEl.appendChild(el('div', { class: 'unreachable-reason' }, shortText));
+        if (failure.backoff_until) {
+          const backoffMs = Math.max(0, failure.backoff_until - Date.now());
+          const backoffSec = Math.round(backoffMs / 1000);
+          if (backoffSec > 0) {
+            rowEl.appendChild(el('div', { class: 'unavailable-reason' }, `backoff active: ${backoffSec}s remaining`));
+          }
+        }
         frag.appendChild(rowEl);
         continue;
       }

@@ -6,6 +6,46 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 (empty — Phase 6 entries land here once Phase 6 opens)
 
+## v0.5.1 — 2026-05-27
+
+**Hotfix — Quota probe cache/backoff/schema-drift correctness (codex review findings F1–F3).** Three production-quality bugs in the v0.5.0 quota probe, reproduced by codex with local mocks, are corrected. 756 → 759 tests (3 new regression tests); 4 existing test assertions updated to reflect the v0.5.1 return-shape contract.
+
+### Fixes
+
+- **F1 [P1] — Doctor bypass of cache + backoff (ADR 0013 Rule 3).** `anthropic.quota_probe_reachable` doctor check called `_probeOnce(auth)` directly, bypassing the module-level `quotaProbeState.backoffUntil` check. Successive `olp doctor` invocations within a backoff window each hit upstream — violating ADR 0013 Rule 3 (60s-3600s exponential backoff is mandatory for all consumers). **Fix:** doctor check now routes through `quotaStatus()`, which enforces cache + backoff. ADR 0013 Rule 3 clarification added: "All consumers of `quotaStatus()`, including `olp doctor` checks, MUST route through `quotaStatus()` and MUST NOT call `_probeOnce()` directly."
+
+- **F2 [P2] — 200 with empty `anthropic-ratelimit-*` headers cached as live data (ADR 0013 Rule 5).** `_probeOnce` treated any 200 OK (regardless of header content) as a successful probe, caching it with `stale: false` even when zero `anthropic-ratelimit-*` headers were present. A proxy stripping headers, a schema change, or a mock returning `{}` would silently appear as "LIVE" on the dashboard with all bars empty. **Fix:** minimum-viable-schema gate requires these 4 fields non-null: `5h-utilization`, `5h-reset`, `7d-utilization`, `7d-reset`. Any absence → `failureKind: 'schema_drift'`, backoff scheduled, result not cached. ADR 0013 Rule 5 updated with the gate specification.
+
+- **F3 [P2] — Dashboard-data loses failure detail (ADR 0013 Rule 6).** `aggregateProviderQuota()` collapsed all non-null failure modes (no credentials, auth failure, rate limit, schema drift, network error) into `status: 'unavailable', reason: 'no public quota api or probe disabled'` — the same string as providers with no quota API at all. Operator could not tell what to fix. **Fix:** `quotaStatus()` v0.5.1 return contract: `null` reserved for opt-in-off only; probe failures return `{ probe_status: 'unreachable', failure: { kind, message, backoff_until? } }`. `aggregateProviderQuota()` emits new fields `failure_kind`, `failure`, `backoff_until` per row. `status: 'unreachable'` distinguishes "probe failed" from `status: 'unavailable'` ("no API or disabled"). Dashboard renders `unreachable` with a red border + failure.message + backoff countdown.
+
+### Backwards-compat notes
+
+- `quotaStatus()`: `stale: false` → now also includes `probe_status: 'live'` (additive). `stale: true` → now also includes `probe_status: 'stale'` + `failure: {...}` (additive). `null` → NOW RESERVED FOR OPT-IN-OFF ONLY (breaking for callers that relied on `null` to detect "no credentials" or "probe failed" — use `probe_status: 'unreachable'` instead).
+- `ProviderQuotaEntry.status`: gains `'unreachable'` as a new value (additive). Existing `'live'`, `'stale'`, `'unavailable'` semantics unchanged.
+- `ProviderQuotaEntry` gains new fields `failure`, `failure_kind`, `backoff_until` (additive, null when not applicable).
+- `dashboard.html`: handles `unreachable` row (no existing row had this status; additive render path).
+
+### Test changes
+
+- 38f, 38j, 38l: updated assertions from `null` to `probe_status: 'unreachable'` (F3 shape change).
+- 38r: refactored to seed cache + manually expire it + set backoff (F1 — doctor now routes through `quotaStatus()`). Added F1-regression assertion: HTTP call counter stays at 1 after two doctor calls within backoff.
+- 38g, 38k: added `probe_status` + `failure` assertions (verify new fields present on live/stale shapes).
+- **38u** (new): F1 regression — successive doctor calls within backoff window → HTTP counter stays at 1.
+- **38v** (new): F2 regression — 200 + empty ratelimit headers → `probe_status: 'unreachable'` + `failure_kind: 'schema_drift'` + cache stays null.
+- **38w** (new): F3 regression — `lastError` + `failureKind` propagate through `quotaStatus()` shape for all failure modes (rate_limited / auth_failed / schema_drift / no_credentials).
+
+### ADR changes
+
+- **ADR 0013 Rule 3** clarification: doctor checks route through `quotaStatus()`, not `_probeOnce()` directly.
+- **ADR 0013 Rule 5** update: minimum-viable-schema gate specification (4 required fields; absence = schema_drift signal).
+- **ADR 0008 Amendment 2**: richer `ProviderQuotaEntry` shape with `failure`/`failure_kind`/`backoff_until`; `probe_status` on `quotaStatus()` return; `unreachable` status semantics; `dashboard.html` unreachable rendering.
+
+### Authority
+
+ADR 0013 Rules 3, 5, 6 (cache + backoff + schema-drift + failure transparency); ADR 0008 Amendment 2; ADR 0002 Amendment 8 (unchanged); codex review findings F1–F3 (codex PR review on v0.5.0 close PR #57).
+
+---
+
 ## v0.5.0 — 2026-05-26
 
 **Phase 5 — Provider Quota Probes + Dashboard Enrichment.** OLP gains live subscription-quota observability for Anthropic Pro/Max subscribers, surfaced through a Claude.ai-style Plan Usage panel on the owner-only dashboard. The probe is opt-in, READ-ONLY, idempotent on failure, and 5-min-cached with 60s→3600s exponential backoff. Six D-days, seven PRs, zero blocking reviewer findings, no flaky tests; 720 → 756 total tests.

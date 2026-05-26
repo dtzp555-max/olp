@@ -5,6 +5,67 @@
 
 ## Amendments
 
+### Amendment 2 — 2026-05-27: v0.5.1 quota_v2 richer failure-mode shape (codex finding F3)
+
+**Scope:** v0.5.1 hotfix extends `ProviderQuotaEntry` and `aggregateProviderQuota()` to surface richer failure-mode detail, addressing codex review finding F3 (operator cannot distinguish failure modes from the `unavailable` catch-all). Authority: ADR 0013 Rule 6 + codex review findings F1–F3.
+
+#### 1. Extended `ProviderQuotaEntry` shape
+
+```js
+{
+  provider: string,
+  // v0.5.1: 'unreachable' added (probe enabled, creds present, but no cache + probe failed)
+  status: 'live' | 'stale' | 'unreachable' | 'unavailable',
+  reason?: string,           // only when status === 'unavailable' (no API or disabled)
+  schema_version: string|null,
+  last_fresh_at: number|null,
+  utilization: { '5h': number|null, '7d': number|null } | null,
+  reset: { '5h': number|null, '7d': number|null, overall: number|null, overage: number|null } | null,
+  representative_claim: string|null,
+  fallback_percentage: number|null,
+  overage: { status: string|null, disabled_reason: string|null } | null,
+  raw_available: boolean,
+  // v0.5.1 (F3 — ADR 0013 Rule 6):
+  failure: { kind, message, backoff_until? } | null,
+  failure_kind: 'no_credentials'|'auth_failed'|'rate_limited'|'schema_drift'|'network'|'other' | null,
+  // Note: 'opt_in_off' is NOT in this enum — when probe is opted out, the row's status
+  // is 'unavailable' (not 'unreachable'); failure_kind stays null. Distinguishing
+  // "user opted out" from "provider has no API" requires reading config separately.
+  backoff_until: number | null,  // epoch-ms when next probe attempt is allowed
+}
+```
+
+Status semantics:
+- `'unavailable'` — probe disabled (`quota_probe_enabled: false`) OR provider has no public quota API (codex, mistral). `failure`, `failure_kind`, `backoff_until` are null.
+- `'live'` — probe succeeded within TTL. `failure` is null.
+- `'stale'` — probe failed but stale cache exists. `failure.kind` describes why the last probe failed. `last_fresh_at` is the epoch of the last successful probe. `backoff_until` tells when the next attempt is scheduled.
+- `'unreachable'` (new) — probe enabled + creds present (or missing!) but no cache available + probe failed. `failure.kind` distinguishes: `no_credentials`, `auth_failed`, `rate_limited`, `schema_drift`, `network`, `other`. `utilization` and `reset` are null (no data).
+
+#### 2. `quotaStatus()` v0.5.1 return contract
+
+`null` is now RESERVED for `quota_probe_enabled: false` only. All other failure paths return a structured shape:
+
+```js
+null                  // ONLY: opt-in off
+{ probe_status: 'live', ... }    // cache fresh
+{ probe_status: 'stale', ..., failure: { kind, message, backoff_until } }  // cache stale + backoff
+{ probe_status: 'unreachable', source, schemaVersion, failure: { ... } }   // no cache + failed
+```
+
+The `stale: boolean` field is retained for backwards-compat (`stale: false` on live, `stale: true` on stale). New code should use `probe_status`.
+
+#### 3. `dashboard.html` unreachable rendering
+
+A new CSS class `.provider-row.unreachable` (red border + light red background) and `.unreachable-reason` text style handle the new status. `failure.message` and `failure_kind` are surfaced as a short text line under the provider badge. `failure.backoff_until` renders a "backoff active: Xs remaining" note if within window.
+
+#### 4. Authority
+
+- ADR 0013 Rule 6 (failure transparency mandate)
+- Codex review findings F1 (doctor bypass), F2 (200+empty-headers → schema_drift), F3 (failure-mode collapse)
+- v0.5.1 hotfix PR
+
+---
+
 ### Amendment 1 — 2026-05-26: D81 Phase 5 quota_v2 shape + aggregateProviderQuota()
 
 **Scope:** D81 (Phase 5 / ADR 0012 D81) extends the audit-query layer and dashboard-data endpoint to surface the new per-provider quota shape introduced by D80 (`lib/providers/anthropic.mjs:quotaStatus()`). This amendment documents the three new interfaces.

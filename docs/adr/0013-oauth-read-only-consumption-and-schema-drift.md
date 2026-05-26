@@ -47,9 +47,10 @@ The probe MUST NOT call any other HTTP path on the provider's API. No `/v1/model
 
 - Cache TTL: 5 minutes. Cache miss triggers a real probe. Cache hit returns the cached value.
 - The dashboard refreshes every 1 minute; that's served from the cache between probes. A manual refresh button MAY force-clear the cache (per maintainer request 2026-05-26); ADR 0012 D82 documents the button.
-- On refresh failure (token expired, 401/403/429, network error), the probe schedules an exponential backoff: minimum 60s, maximum 3600s. The cache entry is NOT invalidated during backoff; `quotaStatus()` returns the stale cache marked `{ stale: true, last_fresh_at: <epoch> }`. If no stale entry exists, returns `null`.
+- On refresh failure (token expired, 401/403/429, network error), the probe schedules an exponential backoff: minimum 60s, maximum 3600s. The cache entry is NOT invalidated during backoff; `quotaStatus()` returns the stale cache marked `{ stale: true, last_fresh_at: <epoch> }`. If no stale entry exists, returns an `unreachable` shape (v0.5.1+) rather than `null`.
 - Successive successful probes reset the backoff to the minimum.
 - Token refresh (`POST https://platform.claude.com/v1/oauth/token`) follows the same backoff discipline. The probe MUST NOT refresh a token more than once per backoff window. The refresh path is shared with the spawn path; both observe the same backoff.
+- **All consumers of `quotaStatus()`, including `olp doctor` checks, MUST route through `quotaStatus()` and MUST NOT call `_probeOnce()` directly.** `_probeOnce()` is an internal implementation detail. Routing doctor checks through `quotaStatus()` ensures the cache+backoff discipline is enforced for every caller — including operators running `olp doctor` in a debug loop. (Clarification added v0.5.1 to address codex finding F1: the original doctor check bypassed backoff by calling `_probeOnce` directly.)
 
 ### Rule 4 — Opt-in via config
 
@@ -70,7 +71,17 @@ Default: `false`. The maintainer must explicitly opt in after credentials are co
 
 `olp doctor` adds a per-provider check `<provider>.quota_probe_reachable` (only runs if `quota_probe_enabled: true`). Failed check provides a `next_action.ai_executable[]` recipe to either re-authenticate or disable the probe.
 
-### Rule 5 — Schema-drift mitigation protocol
+### Rule 5 — Schema-drift mitigation protocol (minimum-viable-schema gate)
+
+The CC binary-distribution shift means OCP's "grep cli.js" verification is no longer applicable. OLP adopts a two-path protocol for proactive monitoring, AND enforces a minimum-viable-schema gate at parse time:
+
+**Minimum-viable-schema gate (v0.5.1+).** `_probeOnce()` requires at least these 4 fields present (non-null after parse) before treating a response as successful:
+- `anthropic-ratelimit-unified-5h-utilization`
+- `anthropic-ratelimit-unified-5h-reset`
+- `anthropic-ratelimit-unified-7d-utilization`
+- `anthropic-ratelimit-unified-7d-reset`
+
+If any of these 4 is absent, `_probeOnce()` classifies the probe as a schema-drift failure (`failureKind = 'schema_drift'`), schedules backoff, and returns `null`. This means a 200 OK with zero `anthropic-ratelimit-*` headers (e.g. a server-side change, a proxy stripping headers, or a mock returning `{}`) is immediately caught as drift rather than silently cached as "live" data. The other 9 fields are tolerated as absent (overage fields are conditional; top-level status fields may be absent on edge cases). The 5h/7d core 4 are load-bearing — the dashboard's progress bars depend on them. (Gate added v0.5.1 to address codex finding F2.)
 
 The CC binary-distribution shift means OCP's "grep cli.js" verification is no longer applicable. OLP adopts a two-path protocol:
 

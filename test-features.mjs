@@ -15865,10 +15865,10 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
     }
   });
 
-  it('38f — quotaStatus enabled + no auth → returns null without HTTP', async () => {
+  it('38f — quotaStatus enabled + no auth → returns unreachable shape without HTTP (v0.5.1)', async () => {
+    // v0.5.1 (F3): no_credentials is no longer null — it returns probe_status:'unreachable'
+    // so the operator can distinguish "disabled" (null) from "no credentials" (unreachable).
     // Uses _setQuotaAuthReadFnForTest to inject a "no credentials" auth reader.
-    // This prevents the test from being affected by real ~/.claude/.credentials.json
-    // on the developer's machine (which would cause a false pass/fail).
     _saveEnv38();
     const TMP = _mkdtempSync38(_pathJoin38(_tmpdir38(), 'olp-38f-'));
     let requestCount = 0;
@@ -15887,7 +15887,11 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
       resetQuotaStateOnly38();
 
       const result = await quotaStatus38();
-      assert.equal(result, null, '38f: null when auth returns null (no creds)');
+      // v0.5.1: no_credentials → probe_status:'unreachable' (NOT null)
+      // null is now ONLY returned for opt-in disabled.
+      assert.ok(result !== null, '38f: no-creds result should NOT be null in v0.5.1 (F3: null reserved for disabled)');
+      assert.equal(result.probe_status, 'unreachable', '38f: probe_status should be unreachable when no creds');
+      assert.equal(result.failure?.kind, 'no_credentials', '38f: failure.kind should be no_credentials');
       assert.equal(requestCount, 0, '38f: no HTTP request should be made without auth');
     } finally {
       if (mock) await mock.close();
@@ -15916,7 +15920,8 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
 
       const result = await quotaStatus38();
       assert.ok(result !== null, '38g: should return non-null');
-      assert.equal(result.stale, false, '38g: stale=false on fresh probe');
+      assert.equal(result.probe_status, 'live', '38g: probe_status=live on fresh probe (v0.5.1)');
+      assert.equal(result.stale, false, '38g: stale=false on fresh probe (backwards-compat)');
       assert.equal(result.source, 'anthropic-ratelimit-unified-headers', '38g: source field');
       assert.ok(typeof result.probedAt === 'number', '38g: probedAt should be a number');
       assert.ok(typeof result.schemaVersion === 'string', '38g: schemaVersion should be a string');
@@ -16042,7 +16047,11 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
       resetQuotaStateOnly38();
 
       const result = await quotaStatus38();
-      assert.equal(result, null, '38j: 401 with no refreshToken → null (idempotent-failure per ADR 0002 Amendment 8)');
+      // v0.5.1 (F3): 401 with no cache → probe_status:'unreachable' + failure_kind:'auth_failed'
+      // (idempotent-failure per ADR 0002 Amendment 8 still holds — no panic, no retry loop)
+      assert.ok(result !== null, '38j: 401+no-refreshToken → unreachable shape (not null in v0.5.1)');
+      assert.equal(result.probe_status, 'unreachable', '38j: probe_status should be unreachable');
+      assert.equal(result.failure?.kind, 'auth_failed', '38j: failure.kind should be auth_failed on 401');
       assert.equal(apiCallCount, 1, '38j: only one API call made (no retry without refreshToken)');
       assert.equal(oauthCallCount, 0, '38j: no OAuth refresh call without refreshToken');
     } finally {
@@ -16166,8 +16175,11 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
       // Second call hits 429 → should return stale cache
       const r2 = await quotaStatus38();
       assert.ok(r2 !== null, '38k: 429 with stale cache → should return stale cache (not null)');
-      assert.equal(r2.stale, true, '38k: stale should be true');
+      assert.equal(r2.probe_status, 'stale', '38k: probe_status=stale (v0.5.1)');
+      assert.equal(r2.stale, true, '38k: stale should be true (backwards-compat)');
       assert.ok(typeof r2.last_fresh_at === 'number', '38k: last_fresh_at should be present');
+      assert.ok(r2.failure !== null && r2.failure !== undefined, '38k: failure info should be present (F3)');
+      assert.equal(r2.failure.kind, 'rate_limited', '38k: failure.kind should be rate_limited on 429 (F3)');
     } finally {
       if (mock) await mock.close();
       resetQuotaProbe38();
@@ -16194,7 +16206,11 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
       resetQuotaStateOnly38();
 
       const result = await quotaStatus38();
-      assert.equal(result, null, '38l: 429 with no cache → null');
+      // v0.5.1 (F3): 429 with no cache → probe_status:'unreachable' + failure_kind:'rate_limited'
+      // (not null — null is now reserved for opt-in disabled only)
+      assert.ok(result !== null, '38l: 429+no-cache → unreachable shape (not null in v0.5.1)');
+      assert.equal(result.probe_status, 'unreachable', '38l: probe_status should be unreachable');
+      assert.equal(result.failure?.kind, 'rate_limited', '38l: failure.kind should be rate_limited on 429');
 
       // Verify backoff was scheduled
       const state = getQuotaProbeState38();
@@ -16417,7 +16433,12 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
     }
   });
 
-  it('38r — doctor: probe enabled + probe fails + cache stale → warn', async () => {
+  it('38r — doctor: probe enabled + probe fails + cache stale → warn (v0.5.1)', async () => {
+    // v0.5.1 (F1): doctor now routes through quotaStatus() — it respects cache+backoff.
+    // To simulate "stale cache" state: seed cache via a successful probe, then manually
+    // expire the cache (fetchedAt = 0) and set backoffUntil in the future (simulate a
+    // failed probe having scheduled backoff). quotaStatus() will see expired cache +
+    // active backoff → returns probe_status:'stale'. Doctor maps this → 'warn'.
     _saveEnv38();
     const TMP = _mkdtempSync38(_pathJoin38(_tmpdir38(), 'olp-38r-'));
     let callCount = 0;
@@ -16428,13 +16449,8 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
       process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token-38r';
       mock = await _startMockServer((_req, res) => {
         callCount++;
-        if (callCount === 1) {
-          // First: succeed to seed cache
-          res.writeHead(200, _ALL_13_HEADERS);
-        } else {
-          // Subsequent: fail
-          res.writeHead(500, {});
-        }
+        // Always succeed — we only call this once to seed the cache
+        res.writeHead(200, _ALL_13_HEADERS);
         res.end('{}');
       });
       setQuotaUrls38(`${mock.url}/v1/messages`, `${mock.url}/v1/oauth/token`);
@@ -16443,10 +16459,15 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
       // Seed cache with a successful probe
       await quotaStatus38();
       const state = getQuotaProbeState38();
-      // Set cache to expired so doctor re-probes (doctor calls _probeOnce directly)
-      // Doctor check calls _probeOnce(auth) directly — it always makes a fresh probe
-      // regardless of cache. After _probeOnce fails, it checks quotaProbeState.cache.
-      // The state.cache is still the seeded one.
+      assert.ok(state.cache !== null, '38r setup: cache should be seeded');
+
+      // Simulate "stale" state: expire cache + set backoff as if a probe just failed.
+      // Doctor now calls quotaStatus() which will see: cache expired + backoff active
+      // → returns probe_status:'stale'.
+      state.cache.fetchedAt = Date.now() - 10 * 60 * 1000; // 10 min ago (beyond 5min TTL)
+      state.backoffUntil = Date.now() + 60_000; // backoff active for 60s
+      state.lastError = { kind: 'network', message: 'probe timeout', attemptedAt: Date.now() - 10_000 };
+      state.failureKind = 'network';
 
       const checks = doctorChecks38({
         _binaryExistsFn: () => true,
@@ -16454,9 +16475,11 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
       });
       const probeCheck = checks.find(c => c.id === 'anthropic.quota_probe_reachable');
       const result = await probeCheck.run();
-      assert.equal(result.status, 'warn', '38r: failed probe with stale cache → warn');
+      assert.equal(result.status, 'warn', '38r: stale cache → warn');
       assert.ok(result.message.includes('stale') || result.message.includes('failed'),
         '38r: message should mention stale or failure');
+      // F1 regression: callCount should still be 1 — doctor did NOT make a second upstream call
+      assert.equal(callCount, 1, '38r F1 regression: doctor should NOT make additional upstream HTTP calls (respects backoff)');
     } finally {
       if (mock) await mock.close();
       resetQuotaProbe38();
@@ -16525,6 +16548,169 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
         '38t: human_steps should not be empty');
     } finally {
       resetQuotaProbe38();
+      _restoreEnv38();
+      _rmSync38(TMP, { recursive: true, force: true });
+    }
+  });
+
+  // ── 38u–38w: v0.5.1 regression tests (F1/F2/F3 codex review findings) ──────
+
+  it('38u — F1 regression: successive doctor calls within backoff → no upstream HTTP on second call', async () => {
+    // ADR 0013 Rule 3: doctor check MUST respect backoff (F1 — codex review).
+    // Old code called _probeOnce() directly, bypassing backoff.
+    // New code routes through quotaStatus() which enforces backoff.
+    _saveEnv38();
+    const TMP = _mkdtempSync38(_pathJoin38(_tmpdir38(), 'olp-38u-'));
+    let upstreamCallCount = 0;
+    let mock;
+    try {
+      _writeProbeConfig(TMP);
+      process.env.OLP_HOME = TMP;
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token-38u';
+      mock = await _startMockServer((_req, res) => {
+        upstreamCallCount++;
+        // Always return 500 → triggers backoff
+        res.writeHead(500, {});
+        res.end('{}');
+      });
+      setQuotaUrls38(`${mock.url}/v1/messages`, `${mock.url}/v1/oauth/token`);
+      resetQuotaStateOnly38();
+
+      const checks = doctorChecks38({
+        _binaryExistsFn: () => true,
+        _authReadFn: () => ({ accessToken: 'test-token-38u' }),
+      });
+      const probeCheck = checks.find(c => c.id === 'anthropic.quota_probe_reachable');
+
+      // First doctor call: probe fires → 500 → backoff scheduled, counter = 1
+      const r1 = await probeCheck.run();
+      assert.equal(r1.status, 'fail', '38u: first doctor call should fail (500, no cache)');
+      assert.equal(upstreamCallCount, 1, '38u: first doctor call should fire exactly one upstream request');
+
+      // Second doctor call: within backoff window → MUST NOT fire another upstream request
+      const r2 = await probeCheck.run();
+      assert.equal(r2.status, 'fail', '38u: second doctor call should also fail (still in backoff)');
+      assert.equal(upstreamCallCount, 1,
+        '38u F1 regression: second doctor call within backoff MUST NOT fire another upstream request (counter stays 1)');
+    } finally {
+      if (mock) await mock.close();
+      resetQuotaProbe38();
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      _restoreEnv38();
+      _rmSync38(TMP, { recursive: true, force: true });
+    }
+  });
+
+  it('38v — F2 regression: 200 with empty ratelimit headers → classified as failure (schema_drift)', async () => {
+    // ADR 0013 Rule 5 minimum-viable-schema gate (F2 — codex review).
+    // A 200 OK with zero anthropic-ratelimit-* headers was previously cached as
+    // "live" data. With the minimum-field gate, it must be classified as failure.
+    _saveEnv38();
+    const TMP = _mkdtempSync38(_pathJoin38(_tmpdir38(), 'olp-38v-'));
+    let mock;
+    try {
+      _writeProbeConfig(TMP);
+      process.env.OLP_HOME = TMP;
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token-38v';
+      mock = await _startMockServer((_req, res) => {
+        // 200 OK but zero anthropic-ratelimit-* headers → schema_drift trigger
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      });
+      setQuotaUrls38(`${mock.url}/v1/messages`, `${mock.url}/v1/oauth/token`);
+      resetQuotaStateOnly38();
+
+      const result = await quotaStatus38();
+      // Must be classified as failure (unreachable with schema_drift kind)
+      assert.ok(result !== null, '38v: result should not be null (v0.5.1: null only for disabled)');
+      assert.equal(result.probe_status, 'unreachable', '38v F2: 200+no-ratelimit-headers → unreachable (schema_drift)');
+      assert.equal(result.failure?.kind, 'schema_drift', '38v F2: failure.kind should be schema_drift');
+
+      // Verify backoff was scheduled (not a silent success)
+      const state = getQuotaProbeState38();
+      assert.ok(state.backoffUntil > Date.now(), '38v F2: backoff should be scheduled on schema_drift');
+      assert.equal(state.failureKind, 'schema_drift', '38v F2: quotaProbeState.failureKind should be schema_drift');
+
+      // Verify cache is NOT populated (schema drift must not be cached as live data)
+      assert.equal(state.cache, null, '38v F2: cache must remain null — schema_drift must NOT be cached as live data');
+    } finally {
+      if (mock) await mock.close();
+      resetQuotaProbe38();
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      _restoreEnv38();
+      _rmSync38(TMP, { recursive: true, force: true });
+    }
+  });
+
+  it('38w — F3 regression: lastError + failureKind propagate through quotaStatus() shape', async () => {
+    // ADR 0013 Rule 6 failure transparency (F3 — codex review).
+    // Verifies that failure details (kind, message, backoff_until) are present in
+    // the quotaStatus() return shape for each distinct failure mode.
+    _saveEnv38();
+    const TMP = _mkdtempSync38(_pathJoin38(_tmpdir38(), 'olp-38w-'));
+    let mock;
+    try {
+      _writeProbeConfig(TMP);
+      process.env.OLP_HOME = TMP;
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-token-38w';
+
+      // Test 1: rate_limited (429)
+      mock = await _startMockServer((_req, res) => {
+        res.writeHead(429, {});
+        res.end('{}');
+      });
+      setQuotaUrls38(`${mock.url}/v1/messages`, `${mock.url}/v1/oauth/token`);
+      resetQuotaStateOnly38();
+
+      const r1 = await quotaStatus38();
+      assert.equal(r1.probe_status, 'unreachable', '38w: 429 → unreachable');
+      assert.ok(r1.failure !== null, '38w: failure should be present');
+      assert.equal(r1.failure.kind, 'rate_limited', '38w: 429 → failure.kind = rate_limited');
+      assert.ok(typeof r1.failure.message === 'string', '38w: failure.message should be a string');
+      assert.ok(typeof r1.failure.backoff_until === 'number', '38w: failure.backoff_until should be a number');
+
+      await mock.close();
+      mock = null;
+
+      // Test 2: auth_failed (401)
+      resetQuotaStateOnly38();
+      mock = await _startMockServer((_req, res) => {
+        res.writeHead(401, {});
+        res.end('{}');
+      });
+      setQuotaUrls38(`${mock.url}/v1/messages`, `${mock.url}/v1/oauth/token`);
+
+      const r2 = await quotaStatus38();
+      assert.equal(r2.probe_status, 'unreachable', '38w: 401 → unreachable');
+      assert.equal(r2.failure?.kind, 'auth_failed', '38w: 401 → failure.kind = auth_failed');
+
+      await mock.close();
+      mock = null;
+
+      // Test 3: schema_drift (200 + no min fields)
+      resetQuotaStateOnly38();
+      mock = await _startMockServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      });
+      setQuotaUrls38(`${mock.url}/v1/messages`, `${mock.url}/v1/oauth/token`);
+
+      const r3 = await quotaStatus38();
+      assert.equal(r3.probe_status, 'unreachable', '38w: schema_drift → unreachable');
+      assert.equal(r3.failure?.kind, 'schema_drift', '38w: 200+no-min-fields → failure.kind = schema_drift');
+
+      // Test 4: no_credentials
+      resetQuotaStateOnly38();
+      setQuotaAuthFn38(() => null);
+
+      const r4 = await quotaStatus38();
+      assert.equal(r4.probe_status, 'unreachable', '38w: no_credentials → unreachable');
+      assert.equal(r4.failure?.kind, 'no_credentials', '38w: no creds → failure.kind = no_credentials');
+
+    } finally {
+      if (mock) await mock.close();
+      resetQuotaProbe38();
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
       _restoreEnv38();
       _rmSync38(TMP, { recursive: true, force: true });
     }

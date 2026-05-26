@@ -1,0 +1,72 @@
+{
+  "phase": "Phase 5",
+  "exit_gate_item": "9 \u2014 Live MacBook E2E verification (dashboard renders enriched panel with real quota data)",
+  "captured_at_utc": "2026-05-26T07:56:36.651Z",
+  "host": "maintainer's MacBook (Mac client test target per project test-envs; specific IP / Tailscale node redacted per public-repo hygiene)",
+  "server_version": "0.4.4 (pre-v0.5.0-close; main @ commit 2b07a3b \u2014 D83)",
+  "olp_port": 14567,
+  "endpoint_tested": "/v0/management/dashboard-data",
+  "auth": "owner-tier OLP key (temp, revoked post-test)",
+  "config_opt_in": {
+    "providers.anthropic.quota_probe_enabled": true
+  },
+  "quota_v2_shape_proof": [
+    {
+      "provider": "anthropic",
+      "status": "live",
+      "schema_version": "2026-05-26",
+      "last_fresh_at": 1779782166101,
+      "utilization": {
+        "5h": 0.36,
+        "7d": 0.34
+      },
+      "reset": {
+        "5h": 1779794400,
+        "7d": 1780225200,
+        "overall": 1779794400,
+        "overage": null
+      },
+      "representative_claim": "five_hour",
+      "fallback_percentage": 0.5,
+      "overage": {
+        "status": "rejected",
+        "disabled_reason": "org_level_disabled_until"
+      },
+      "raw_available": true
+    },
+    {
+      "provider": "openai",
+      "status": "unavailable",
+      "reason": "no public quota api or probe disabled",
+      "schema_version": null,
+      "last_fresh_at": null,
+      "utilization": null,
+      "reset": null,
+      "representative_claim": null,
+      "fallback_percentage": null,
+      "overage": null,
+      "raw_available": false
+    }
+  ],
+  "result_summary": {
+    "anthropic": {
+      "status": "live",
+      "schema_version": "2026-05-26",
+      "utilization_5h": 0.36,
+      "utilization_7d": 0.34,
+      "representative_claim": "five_hour",
+      "overage_status": "rejected",
+      "fallback_percentage": 0.5
+    },
+    "openai": {
+      "status": "unavailable",
+      "reason": "no public quota api or probe disabled"
+    }
+  },
+  "dashboard_screenshot": "docs/img/dashboard-v0.5.0.png",
+  "post_test_cleanup": [
+    "temp owner key (id=6yullsd-, name=e2e-d83-close-prep) revoked",
+    "~/.olp/config.json providers.anthropic.quota_probe_enabled flag removed (config restored to baseline)",
+    "test server (pid=36163, port=14567) terminated"
+  ]
+}

@@ -14,7 +14,8 @@ A personal- and family-scale multi-provider LLM proxy. One HTTP endpoint, many s
 - **Multi-key auth** — owner key with full visibility, family-member keys with per-key audit log + per-provider scoping
 - **Telegram / Discord** `/olp` slash commands (read-only — for "is OLP up?" checks from anywhere)
 - **AI-driven self-repair** — `olp doctor --json` emits machine-readable `next_action.ai_executable[]` so a Claude Code / Cursor / Copilot session can fix install issues for you (see [§ Install with your AI](#install-with-your-ai-the-fast-path))
-- **Observability** — owner-only `/dashboard` (quota / 24h stats / 30d spend trend / top fallback chains)
+- **Observability** — owner-only `/dashboard` (live Claude.ai-style plan-usage rows / 24h stats / 30d spend trend / top fallback chains)
+- **Plan-usage probe** (Phase 5, v0.5.0) — opt-in per-provider quota probe for Anthropic Pro/Max subscriptions; parses the canonical `anthropic-ratelimit-unified-*` response headers, surfaces 5-hour + 7-day utilization with reset countdowns. See [§ Plan Usage](#plan-usage-live-quota-probe).
 
 ---
 
@@ -208,22 +209,22 @@ Per-IDE setup details: [`docs/integrations/`](./docs/integrations/README.md). Te
 
 ## Supported Providers
 
-Source of truth: [`models-registry.json`](./models-registry.json). This table is regenerated from the registry per the [`release_kit`](./CLAUDE.md) overlay; do not edit it out of sync.
+Source of truth: [`models-registry.json`](./models-registry.json). Per-provider columns are sourced from the registry's `providers.<key>` block (model metadata + tier) and `quota_probe.<key>` block (D81+; probe status / reason / source). This table is regenerated from the registry per the [`release_kit`](./CLAUDE.md) overlay; do not edit it out of sync.
 
 OLP distinguishes **Candidate Providers** (declared as intended, not yet pinned) from **Enabled Providers** (authority pin filled + plugin landed + Phase audit passed). The v0.1 founding commit ships **zero Enabled Providers** — enablement is a Phase audit deliverable, not a bootstrap claim. See [`ALIGNMENT.md` § Provider Inventory](./ALIGNMENT.md) for the transition gate.
 
 ### Candidate Providers
 
-| Provider key | CLI | Subscription / auth | Anticipated Tier | Anticipated Phase |
-|---|---|---|---|---|
-| `anthropic` | `claude -p` | Pro / Max OAuth (pre-2026-06-15); Agent SDK Credit pool after | D (re-eval post-2026-06-15) | Phase 1 |
-| `openai` | `codex exec --json` | ChatGPT Pro OAuth or API key | D | Phase 2 |
-| `mistral` | `vibe --prompt --output json` | Le Chat Pro API key | D | Phase 3 |
-| `grok` | `grok -p --output-format streaming-json` | xAI Build `xai-...` API key | C | Phase 8+ |
-| `kimi` | `kimi -p --output-format stream-json` | Moonshot Kimi API key | C | Phase 8+ |
-| `minimax` | TBD | MiniMax Token Plan (¥29+/mo) | B | Phase 8+ |
-| `glm` | TBD | Zhipu Coding Plan ($10+/mo) | B | Phase 8+ |
-| `qwen` | TBD | Alibaba Coding Plan ($50/mo) | B | Phase 8+ |
+| Provider key | CLI | Subscription / auth | Quota probe (v0.5.0+) | Anticipated Tier | Anticipated Phase |
+|---|---|---|---|---|---|
+| `anthropic` | `claude -p` | Pro / Max OAuth (pre-2026-06-15); Agent SDK Credit pool after | ✅ Live (13 `anthropic-ratelimit-unified-*` headers; opt-in via `quota_probe_enabled`) | D (re-eval post-2026-06-15) | Phase 1 |
+| `openai` | `codex exec --json` | ChatGPT Pro OAuth or API key | ❌ Not available (no public quota API) — audit-derived spend tracking only | D | Phase 2 |
+| `mistral` | `vibe --prompt --output json` | Le Chat Pro API key | ❌ Not implemented at v0.5.0 — no public quota endpoint accessible to Vibe / Le Chat member / La Plateforme API keys per D84 spike 2026-05-26. Mistral's [Admin API](https://docs.mistral.ai/admin/security-access/admin-api) does expose billing / usage queries but requires an org-admin scope (out of scope for OLP family-tier deployment). Audit-derived spend tracking only at v0.5.0. | D | Phase 3 |
+| `grok` | `grok -p --output-format streaming-json` | xAI Build `xai-...` API key | TBD (Phase 8+) | C | Phase 8+ |
+| `kimi` | `kimi -p --output-format stream-json` | Moonshot Kimi API key | TBD (Phase 8+) | C | Phase 8+ |
+| `minimax` | TBD | MiniMax Token Plan (¥29+/mo) | TBD (Phase 8+) | B | Phase 8+ |
+| `glm` | TBD | Zhipu Coding Plan ($10+/mo) | TBD (Phase 8+) | B | Phase 8+ |
+| `qwen` | TBD | Alibaba Coding Plan ($50/mo) | TBD (Phase 8+) | B | Phase 8+ |
 
 **Risk tier guide.** D = permissive / safe (eligible for default-enabled); C = tightening signal, no enforcement history (opt-in); B = service-level key revocation risk (opt-in + consent); A = excluded by default (cannot be opt-in enabled). Tier B providers prompt for explicit consent on first enable and record consent in `~/.olp/config.json`. See [`ALIGNMENT.md` § Risk Tier Framework](./ALIGNMENT.md#risk-tier-framework).
 
@@ -278,6 +279,59 @@ See [ADR 0004 (Fallback Engine)](./docs/adr/0004-fallback-engine.md), [ADR 0007 
 
 ---
 
+## Plan Usage (live quota probe)
+
+OLP v0.5.0+ surfaces live subscription quota for Anthropic Pro/Max subscribers on the owner-only `/dashboard`. Per-provider rows show 5-hour and 7-day utilization bars with reset countdowns, status badges, representative-claim hints, and a manual refresh button. The panel auto-refreshes every 60 seconds and pauses when the tab is hidden.
+
+![OLP v0.5.0 dashboard — Plan Usage panel with live anthropic quota](./docs/img/dashboard-v0.5.0.png)
+
+### How it works
+
+The probe issues a minimal `POST /v1/messages` to `api.anthropic.com` (max_tokens: 1) using the same OAuth token Claude Code uses for `claude -p`. The body is discarded; only the 13 `anthropic-ratelimit-unified-*` response headers are parsed (5h/7d utilization + reset, status, representative-claim, fallback-percentage, overage status + disabled reason). Results cache for 5 minutes; refresh failures fall back to the previous cache marked `stale: true` while exponential backoff (60s → 3600s) protects against hammering the API.
+
+See [ADR 0002 § Amendment 8](./docs/adr/0002-plugin-architecture.md), [ADR 0012 (Phase 5 charter)](./docs/adr/0012-phase-5-charter-quota-probes-dashboard.md), [ADR 0013 (OAuth READ-ONLY consumption + schema-drift mitigation)](./docs/adr/0013-oauth-read-only-consumption-and-schema-drift.md), and the schema pin at `~/.cc-rules/memory/learnings/anthropic_plan_usage_probe_schema_2026_05_26.md`.
+
+### Enabling the probe
+
+The probe is **opt-in** (default off) per ADR 0013 Rule 4 — a fresh OLP install on a machine without OAuth credentials should not bombard `api.anthropic.com` with 401-bound probes. To enable, add to `~/.olp/config.json`:
+
+```json
+{
+  "providers": {
+    "anthropic": {
+      "enabled": true,
+      "quota_probe_enabled": true
+    }
+  }
+}
+```
+
+The probe reads the OAuth token from (in order): `CLAUDE_CODE_OAUTH_TOKEN` env var, `~/.claude/.credentials.json`, macOS Keychain entry `"Claude Code-credentials"`. Make sure Claude Code is logged in (`claude setup-token` or equivalent) before opting in.
+
+`olp doctor` adds a `anthropic.quota_probe_reachable` check when the probe is enabled. The check has `category: 'provider'`, so any failure (401/403 token-expiry, 429 rate-limit, network error) discriminates to `kind: fix_provider`. The `human_steps` recovery recipe inside the check distinguishes the underlying cause (re-login via `claude setup-token` for auth failures vs wait-and-retry for rate-limit) — the discriminator is uniformly `fix_provider` but the actionable text is auth-aware. Successful probes return `status: ok` with the parsed 5h / 7d utilization in the message body; stale-cache returns `status: warn`. Routing an auth-class failure to `kind: fix_oauth` (the other discriminator the framework supports) would require splitting this check across the `provider` / `auth` boundary — deferred to v1.x if `olp doctor` consumers report the ambiguity.
+
+### Provider coverage
+
+| Provider | Live quota probe | Path |
+|---|---|---|
+| `anthropic` | ✅ Live — 13 fields via `anthropic-ratelimit-unified-*` headers | This section |
+| `openai` (codex) | ❌ Not available — `openai/codex` CLI has no public quota API | Falls back to audit-derived request counts |
+| `mistral` | ❌ Not implemented at v0.5.0 — no public quota endpoint accessible to Vibe / Le Chat member / La Plateforme API keys. Mistral's Admin API does expose billing / usage queries but is gated to org-admin scope and out of scope for OLP family-tier deployment. | Falls back to audit-derived request counts |
+
+If Mistral ever publishes a usage endpoint, `lib/providers/mistral.mjs` DL-7 marks the re-entry point.
+
+### Schema-drift protection
+
+Claude Code v2.1.x is distributed as a compiled native binary (Mach-O on macOS, ELF on Linux) — the OCP-era "grep `cli.js`" verification no longer applies. OLP's replacement protocol (ADR 0013 § Rule 5):
+
+1. `strings` over the platform-specific claude-code binary captures all hardcoded header names the binary expects.
+2. A live `POST /v1/messages` against `api.anthropic.com` with valid OAuth captures what the server actually emits today.
+3. Diff path 1 vs path 2 → the actionable schema delta.
+
+This is re-run at every major `claude --version` bump (next trigger: v2.x → v3.x), at the Annual Alignment Audit (14 May), and whenever `olp doctor anthropic.quota_probe_reachable` returns an unexpected status code. The current pinned schema (13 fields, `2026-05-26`) lives in `models-registry.json` under `quota_probe.schema_version`.
+
+---
+
 ## API Endpoints
 
 | Endpoint | Method | Phase | Status | Description |
@@ -285,9 +339,9 @@ See [ADR 0004 (Fallback Engine)](./docs/adr/0004-fallback-engine.md), [ADR 0007 
 | `/v1/chat/completions` | POST | 1 | ✅ Shipped | OpenAI-compatible Chat Completions entry. Internally normalized to IR, dispatched to a provider plugin, response shape converted back. |
 | `/v1/models` | GET | 1 | ✅ Shipped | Lists models from `models-registry.json`. |
 | `/health` | GET | 1 | ✅ Shipped | Per-provider health snapshot. Phase 2 owner-only-trim: full per-provider details to owner identity; trimmed `{ ok, version }` to guest / anonymous. Gate via `auth.owner_only_endpoints` config. **Optional `anonymousKey` field (D69 / Phase 4, v0.4.0)** appears in both trimmed and full payloads when `auth.advertise_anonymous_key: true` AND `auth.allow_anonymous: true` AND at least one non-revoked guest-tier key has `plaintext_advertise: true` (see [ADR 0011](./docs/adr/0011-anonymous-key-deployment-context.md) for the trusted-LAN-only invariant). Default off — field absent when prereqs unmet. |
-| `/dashboard` | GET | 3 | ✅ Shipped (D50 + D51) | Owner-only multi-provider dashboard HTML (4 panels: quota / 24h request stats / 30d spend trend / top fallback chains; 30s poll with visibilitychange pause). Owner-only_block; non-owner identities receive 401. Localhost-bound by default. |
-| `/v0/management/dashboard-data` | GET | 3 | ✅ Shipped (D50) | JSON aggregate consumed by the dashboard 30s poll: `{ generated_at, window_24h, cache_hit_24h, quota, spend_trend_30d, top_fallback_chains_24h, cache_stats }`. Owner-only_block. |
-| `/v0/management/quota` | GET | 3 | ✅ Shipped (D50) | Per-provider quota snapshot via `provider.quotaStatus()` (subset of dashboard-data; useful for scripted monitoring). Owner-only_block. |
+| `/dashboard` | GET | 3 + 5 | ✅ Shipped (D50 + D51 + D82) | Owner-only multi-provider dashboard HTML. Phase 5 D82 adds a Claude.ai-style Plan Usage section at the top (per-provider utilization bars + reset countdowns + 60s auto-refresh + manual refresh button) on top of the existing four panels (24h request stats / 30d spend trend / top fallback chains / legacy quota fallback). Owner-only_block; non-owner identities receive 401. Localhost-bound by default. |
+| `/v0/management/dashboard-data` | GET | 3 + 5 | ✅ Shipped (D50 + D81) | JSON aggregate consumed by the dashboard polls. Shape `{ generated_at, window_24h, cache_hit_24h, quota, quota_v2, spend_trend_30d, top_fallback_chains_24h, cache_stats }`. The new `quota_v2` field (D81) is the normalized per-provider shape consumed by the Plan Usage UI; the legacy `quota` field stays alongside for backwards compatibility until v1.0.0. Owner-only_block. |
+| `/v0/management/quota` | GET | 3 + 5 | ✅ Shipped (D50 + D81) | Per-provider quota snapshot via `provider.quotaStatus()`. Includes both legacy `quota` and new `quota_v2` shape (mirrors `dashboard-data` for scripted monitoring). Owner-only_block. |
 | `/cache/stats` | GET | 3 | ✅ Shipped (D50) | Live in-memory `cacheStore.stats()` (`{ hits, misses, size, inflightCount }` + `generated_at`). Owner-only_block. |
 
 ---

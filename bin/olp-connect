@@ -29,7 +29,21 @@
 
 set -euo pipefail
 
-OLP_CONNECT_VERSION="0.4.0-phase4"
+# D78 (G13): derive version from package.json instead of hardcoding (was
+# stuck at "0.4.0-phase4" through v0.4.1/v0.4.2/v0.4.3 because no one
+# updated it). Look up package.json next to the script if available;
+# fall back to "unknown" when running curl-piped (no on-disk package.json).
+_resolve_version() {
+  local script_dir pkg
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+  pkg="${script_dir%/bin}/package.json"
+  if [[ -f "$pkg" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 -c "import json,sys;print(json.load(open('$pkg')).get('version','unknown'))" 2>/dev/null || echo "unknown"
+  else
+    echo "unknown"
+  fi
+}
+OLP_CONNECT_VERSION="$(_resolve_version)"
 
 show_version() {
   echo "olp-connect $OLP_CONNECT_VERSION"
@@ -246,17 +260,28 @@ detect_aider() {
   fi
 }
 
-# Detect OpenClaw. Per Phase 4 D71-D73 (NOT in this PR), olp will ship
-# olp-plugin/ for OpenClaw with full Telegram/Discord /olp slash commands.
-# Until that ships, we just announce detection and link.
+# Detect OpenClaw. Phase 4 D71-D73 shipped olp-plugin/ as the OpenClaw
+# gateway plugin for /olp Telegram + Discord slash commands. Point users
+# at the install path.
 detect_openclaw() {
   if command -v openclaw &>/dev/null || [[ -f "$HOME/.openclaw/openclaw.json" ]]; then
     log_info ""
     log_info "Detected: OpenClaw"
-    log_info "  The OpenClaw OLP plugin (D71-D73) is NOT YET SHIPPED."
-    log_info "  When it ships, install with: openclaw plugin install olp"
-    log_info "  For now, you can manually point OpenClaw at OLP via the OPENAI_BASE_URL"
-    log_info "  env var (already written to your shell rc above)."
+    log_info "  OLP ships an OpenClaw gateway plugin for /olp Telegram + Discord"
+    log_info "  slash commands (status / usage / cache / models / providers /"
+    log_info "  chain show / health / doctor). Read-only by design — no chat-side"
+    log_info "  mutations."
+    log_info ""
+    log_info "  Install the plugin (one-time, on the host running OpenClaw):"
+    log_info "    git clone https://github.com/dtzp555-max/olp.git /tmp/olp-repo"
+    log_info "    openclaw plugins install /tmp/olp-repo/olp-plugin"
+    log_info "    # OR symlink: ln -sf /tmp/olp-repo/olp-plugin ~/.openclaw/extensions/olp"
+    log_info ""
+    log_info "  Then edit ~/.openclaw/openclaw.json to set the plugin apiKey to a"
+    log_info "  dedicated OLP key (NOT your owner key — create one via olp-keys"
+    log_info "  keygen --name <bot-name>). Restart OpenClaw gateway."
+    log_info ""
+    log_info "  See docs/integrations/openclaw.md for full instructions."
   fi
 }
 

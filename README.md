@@ -193,6 +193,10 @@ To let other devices on your home network use the same OLP server, you need TWO 
 2. **Onboard each family member's device** from THEIR machine:
 
    ```bash
+   # Pinned to a known-good release (recommended — survives GitHub raw CDN cache hiccups):
+   bash <(curl -fsSL https://raw.githubusercontent.com/dtzp555-max/olp/v0.4.4/bin/olp-connect) <olp-host-ip>
+
+   # OR latest from main (use after v0.4.4 + once you trust head):
    bash <(curl -fsSL https://raw.githubusercontent.com/dtzp555-max/olp/main/bin/olp-connect) <olp-host-ip>
    ```
 

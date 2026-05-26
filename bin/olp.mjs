@@ -251,9 +251,15 @@ async function cmdStatus(flags, io) {
   }
   io.log(`  total reqs:  ${body.stats?.total_requests ?? 0}`);
   io.log(`  active reqs: ${body.stats?.active_requests ?? 0}`);
+  // D75 F4 fix: server payload nests cache stats under stats.cache (per
+  // server.mjs handleManagementStatus, ~line 2092). The CacheStore.stats()
+  // contract returns { hits, misses, size, inflightCount } per
+  // lib/cache/store.mjs — there is no `entries` field. Pre-D75 cmdStatus read
+  // `body.stats.cache.entries` (OCP-era) which was always undefined → output
+  // showed "entries=?". Same pattern as D74 P2-3 applied to cmdCache/cmdUsage.
   if (body.stats?.cache) {
     const c = body.stats.cache;
-    io.log(`  cache:       hits=${c.hits ?? 0} misses=${c.misses ?? 0} entries=${c.entries ?? '?'}`);
+    io.log(`  cache:       hits=${c.hits ?? 0} misses=${c.misses ?? 0} entries=${c.size ?? 0}${typeof c.inflightCount === 'number' ? ` inflight=${c.inflightCount}` : ''}`);
   }
   if (Array.isArray(body.recent_errors) && body.recent_errors.length > 0) {
     io.log(`  recent errors: ${body.recent_errors.length}`);

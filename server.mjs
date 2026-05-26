@@ -1224,13 +1224,25 @@ async function handleChatCompletions(req, res) {
       }
 
       const chunks = [];
-      // try/finally: releaseSpawn MUST fire on every exit path — success
-      // (return at end), spawn throw (caught and re-thrown below), or the
-      // D16 truncation-salvage return. The finally is the only mechanism
-      // that guarantees release across all three.
+      // D75 (v0.4.2) F7 — per-hop model override.
+      // The chain config (routing.chains[<requested-model>][<hop>].model) is the
+      // model name to pass to THIS hop's provider plugin — NOT the model the
+      // user originally requested. Pre-D75, executeHopFn used hopModel for the
+      // cache key + audit ctx but passed the ORIGINAL irReq (with irReq.model
+      // still set to the user's request) into hopProviderPlugin.spawn(). Result:
+      // a 2-hop chain like [{anthropic, claude-sonnet-4-6}, {openai, gpt-5.5}]
+      // would spawn codex with --model claude-sonnet-4-6 on hop 1 — openai rejects
+      // the unknown model and the chain dies. This broke the core OLP value prop
+      // (cross-provider fallback with provider-appropriate model substitution).
+      //
+      // Fix: build a per-hop IR variant with the hop's model substituted. Skip
+      // the clone when hopModel === irReq.model (single-provider chains and
+      // chain hops whose model matches the request). Authority: ADR 0004 §
+      // Chain advancement step 1 (per-hop config supplies provider AND model).
+      const hopIrReq = irReq.model === hopModel ? irReq : { ...irReq, model: hopModel };
       try {
         try {
-          for await (const irChunk of hopProviderPlugin.spawn(irReq, authContext)) {
+          for await (const irChunk of hopProviderPlugin.spawn(hopIrReq, authContext)) {
             // D16: check error chunks BEFORE pushing — preserves the invariant that
             // chunks array contains only delta/stop chunks. Without this, the catch
             // block's `chunks.length > 0` would mistake a single error chunk for
@@ -1422,9 +1434,16 @@ async function handleChatCompletions(req, res) {
       // releaseSpawn fires exactly once in finally — regardless of normal
       // exhaustion, mid-stream throw, or iterator.return() from cache-layer
       // sourceAbortController propagation (§9).
+      //
+      // D75 (v0.4.2) F7 — per-hop model override (streaming path).
+      // Mirror the buffered-path fix: pass the hop's configured model (streamModel)
+      // into streamPlugin.spawn(), not the user's original ir.model. Skip the
+      // clone when ir.model === streamModel. See executeHopFn() above for the
+      // full F7 rationale + authority citation.
+      const streamIr = ir.model === streamModel ? ir : { ...ir, model: streamModel };
       return (async function* sourceWithRelease() {
         try {
-          for await (const irChunk of streamPlugin.spawn(ir, authContext)) {
+          for await (const irChunk of streamPlugin.spawn(streamIr, authContext)) {
             yield irChunk;
           }
         } finally {

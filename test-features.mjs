@@ -14983,4 +14983,382 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
     assert.ok(!/Phase 2 in progress/.test(serverSrc));
     assert.ok(!/Phase 3 in progress/.test(serverSrc));
   });
+
+  // ── D75 (v0.4.2) extension — real-machine E2E findings F1, F2, F3, F4, F7 ──
+  // Bugs caught on PI231 + Mac mini 2026-05-26 E2E session. Pre-v0.4.0 reviewers
+  // and the post-v0.4.0 maintainer review all missed these because they reviewed
+  // against spec text, not against real provider CLIs running on a remote machine.
+
+  it('36i (F1) — codex readAuthArtifact() recognises v0.133.0 nested tokens.access_token', () => {
+    // Real codex CLI v0.133.0 auth.json shape: { auth_mode, OPENAI_API_KEY,
+    //   tokens: { id_token, access_token, refresh_token, account_id }, last_refresh }
+    // Pre-D75 readAuthArtifact read only top-level access_token → returned null →
+    // OLP falsely reported "auth artifact missing" for fully-logged-in users.
+    const tmpDir = _mkdtempSyncS36(_joinS36(_tmpdirS36(), 'olp-d75-f1-nested-'));
+    const authPath = _joinS36(tmpDir, 'auth.json');
+    _writeFileSyncS36(authPath, JSON.stringify({
+      auth_mode: 'chatgpt',
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: 'header.body.sig',
+        access_token: 'eyJ-real-nested-access-token-d75-36i',
+        refresh_token: 'refresh-opaque',
+        account_id: '00000000-0000-0000-0000-000000000000',
+      },
+      last_refresh: '2026-05-26T00:00:00Z',
+    }));
+    const savedPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = authPath;
+    try {
+      const result = codexReadAuthArtifact();
+      assert.ok(result, 'must return non-null for v0.133 nested-shape auth.json');
+      assert.equal(result.accessToken, 'eyJ-real-nested-access-token-d75-36i',
+        'must extract token from tokens.access_token (v0.133.0 nested shape)');
+    } finally {
+      if (savedPath !== undefined) process.env.OPENAI_CODEX_AUTH_PATH = savedPath;
+      else delete process.env.OPENAI_CODEX_AUTH_PATH;
+      _rmSyncS36(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('36j (F1) — codex readAuthArtifact() still reads legacy top-level access_token', () => {
+    // Backwards compat: older codex CLI versions (pre-v0.133) wrote the token
+    // at top level. D75 fix preserves that fallback so upgrades don't regress.
+    const tmpDir = _mkdtempSyncS36(_joinS36(_tmpdirS36(), 'olp-d75-f1-legacy-'));
+    const authPath = _joinS36(tmpDir, 'auth.json');
+    _writeFileSyncS36(authPath, JSON.stringify({
+      access_token: 'legacy-top-level-token-d75-36j',
+    }));
+    const savedPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    process.env.OPENAI_CODEX_AUTH_PATH = authPath;
+    try {
+      const result = codexReadAuthArtifact();
+      assert.ok(result, 'must return non-null for legacy top-level shape');
+      assert.equal(result.accessToken, 'legacy-top-level-token-d75-36j',
+        'must fall back to top-level access_token when tokens.access_token absent');
+    } finally {
+      if (savedPath !== undefined) process.env.OPENAI_CODEX_AUTH_PATH = savedPath;
+      else delete process.env.OPENAI_CODEX_AUTH_PATH;
+      _rmSyncS36(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('36k (F1) — codex readAuthArtifact() returns null for malformed auth.json', () => {
+    // Malformed JSON / missing token / wrong structure → null (not throw).
+    const tmpDir = _mkdtempSyncS36(_joinS36(_tmpdirS36(), 'olp-d75-f1-malformed-'));
+    const savedPath = process.env.OPENAI_CODEX_AUTH_PATH;
+    try {
+      // Case A: unparseable JSON
+      const badJsonPath = _joinS36(tmpDir, 'bad.json');
+      _writeFileSyncS36(badJsonPath, 'not-json-at-all{{{');
+      process.env.OPENAI_CODEX_AUTH_PATH = badJsonPath;
+      assert.equal(codexReadAuthArtifact(), null, 'unparseable JSON → null');
+
+      // Case B: valid JSON but no token field anywhere
+      const noTokenPath = _joinS36(tmpDir, 'no-token.json');
+      _writeFileSyncS36(noTokenPath, JSON.stringify({ auth_mode: 'chatgpt', tokens: {} }));
+      process.env.OPENAI_CODEX_AUTH_PATH = noTokenPath;
+      assert.equal(codexReadAuthArtifact(), null, 'no token in tokens.access_token or top-level → null');
+
+      // Case C: tokens field present but access_token wrong type
+      const wrongTypePath = _joinS36(tmpDir, 'wrong-type.json');
+      _writeFileSyncS36(wrongTypePath, JSON.stringify({
+        tokens: { access_token: 42 },
+      }));
+      process.env.OPENAI_CODEX_AUTH_PATH = wrongTypePath;
+      assert.equal(codexReadAuthArtifact(), null, 'non-string access_token → null');
+    } finally {
+      if (savedPath !== undefined) process.env.OPENAI_CODEX_AUTH_PATH = savedPath;
+      else delete process.env.OPENAI_CODEX_AUTH_PATH;
+      _rmSyncS36(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('36l (F2) — irToCodex() includes --skip-git-repo-check before --model', () => {
+    // codex CLI v0.133.0 sandboxes non-git-repo CWDs by default with:
+    //   "Not inside a trusted directory and --skip-git-repo-check was not specified."
+    // OLP servers typically deploy outside a git repo on the operator host. The
+    // --skip-git-repo-check flag must be in args, before --model, so the spawn
+    // succeeds without depending on the install-time CWD.
+    const { args } = irToCodex({
+      irVersion: IR_VERSION,
+      model: 'gpt-5.5',
+      stream: false,
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+    assert.ok(args.includes('--skip-git-repo-check'),
+      'irToCodex().args must include --skip-git-repo-check (F2 fix)');
+    const skipIdx = args.indexOf('--skip-git-repo-check');
+    const modelIdx = args.indexOf('--model');
+    assert.ok(skipIdx > 0 && modelIdx > 0, 'both flags must be present');
+    assert.ok(skipIdx < modelIdx,
+      '--skip-git-repo-check must come before --model (cleaner readability + matches codex v0.133 docs ordering)');
+    // Confirm exec is still first and --json still adjacent
+    assert.equal(args[0], 'exec');
+    assert.equal(args[1], '--json');
+    assert.equal(args[2], '--skip-git-repo-check');
+    assert.equal(args[3], '--model');
+    assert.equal(args[4], 'gpt-5.5');
+  });
+
+  it('36m (F3) — codexChunkToIR recognises v0.133.0 item.completed agent_message', () => {
+    // Real codex v0.133.0 emits the assistant text as one item.completed event:
+    //   {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello world"}}
+    // Pre-D75 codexChunkToIR returned null for this shape → response body had
+    // content: null because the chunk was silently dropped.
+    const result = codexChunkToIR(JSON.stringify({
+      type: 'item.completed',
+      item: { id: 'item_0', type: 'agent_message', text: 'hello world from codex' },
+    }));
+    assert.deepEqual(result, { type: 'delta', content: 'hello world from codex' });
+  });
+
+  it('36n (F3) — codexChunkToIR recognises v0.133.0 turn.completed → stop', () => {
+    // turn.completed marks the end of a codex turn. Map to IR stop.
+    const result = codexChunkToIR(JSON.stringify({
+      type: 'turn.completed',
+      usage: { input_tokens: 12, output_tokens: 7 },
+    }));
+    assert.deepEqual(result, { type: 'stop', finish_reason: 'stop' });
+  });
+
+  it('36o (F3) — codexChunkToIR recognises v0.133.0 turn.failed → error', () => {
+    // turn.failed: { type: 'turn.failed', error: { message: 'X' } }
+    const result1 = codexChunkToIR(JSON.stringify({
+      type: 'turn.failed',
+      error: { message: 'rate limit exceeded' },
+    }));
+    assert.equal(result1?.type, 'error');
+    assert.equal(result1.error, 'rate limit exceeded');
+    // turn.failed with string error
+    const result2 = codexChunkToIR(JSON.stringify({
+      type: 'turn.failed',
+      error: 'simple string error',
+    }));
+    assert.equal(result2?.type, 'error');
+    assert.equal(result2.error, 'simple string error');
+    // turn.failed with no error payload → falls back to default message
+    const result3 = codexChunkToIR(JSON.stringify({ type: 'turn.failed' }));
+    assert.equal(result3?.type, 'error');
+    assert.match(result3.error, /turn\.failed/);
+  });
+
+  it('36p (F4) — cmdStatus reads body.stats.cache.size (not OCP-era body.cache.entries)', () => {
+    // Server payload (server.mjs handleManagementStatus ~line 2092):
+    //   { ok, version, ..., stats: { total_requests, active_requests, cache: { hits, misses, size, inflightCount } } }
+    // Pre-D75 cmdStatus formatter read `body.cache.entries` (OCP-era) → always
+    // undefined → output showed "entries=?". Pin the wire contract by grepping
+    // the CLI source so a future server-side rename can't silently re-break.
+    const cliSrc = _readFileSyncS36(_joinS36(import.meta.dirname ?? process.cwd(), 'bin/olp.mjs'), 'utf8');
+    // Must contain the cmdStatus block that reads body.stats.cache (not body.cache directly)
+    assert.ok(/cmdStatus\b/.test(cliSrc), 'cmdStatus function must exist');
+    // The status block must read body.stats?.cache (the actual server payload nesting)
+    assert.ok(/body\.stats\?\.cache/.test(cliSrc) || /body\.stats\.cache/.test(cliSrc),
+      'cmdStatus must read body.stats.cache for status display');
+    // Specifically, the "entries=" output must derive from c.size (matches CacheStore.stats() shape)
+    // Find the status cache line and verify it uses c.size
+    const statusBlock = cliSrc.match(/cmdStatus[\s\S]+?(?=async function cmd|^\}\s*$)/m);
+    assert.ok(statusBlock, 'cmdStatus block extractable');
+    assert.ok(/c\.size/.test(statusBlock[0]),
+      'cmdStatus cache line must use c.size (matches CacheStore.stats() shape)');
+    // And must NOT use the OCP-era c.entries
+    assert.ok(!/c\.entries/.test(statusBlock[0]),
+      'cmdStatus cache line must NOT read c.entries (OCP-era field that does not exist in CacheStore.stats())');
+    // Also pin the CacheStore.stats() shape contract (re-affirms 36e but for status path)
+    const cs = new CacheStore();
+    const stats = cs.stats();
+    assert.ok('size' in stats, 'CacheStore.stats() exposes size');
+    assert.ok(!('entries' in stats), 'CacheStore.stats() does NOT expose entries');
+  });
+
+  it('36q (F7) — per-hop chain `model` field overrides IR model on fallback hop', async () => {
+    // Pre-D75: executeHopFn(provider, model, irReq) used `model` for cache key
+    // + audit but passed irReq UNCHANGED to provider.spawn() → the chain
+    //   [{anthropic, claude-X}, {openai, gpt-5.5}]
+    // would spawn codex with --model claude-X (the user's original request)
+    // instead of gpt-5.5 (the chain's per-hop config). This broke cross-provider
+    // fallback wherever the chain assigned different models per provider.
+    //
+    // Strategy: inject a mock openai provider that captures the IR it receives.
+    // Force the anthropic hop to fail with SPAWN_FAILED so the chain advances
+    // to openai. Assert the mock saw model === hop's configured model.
+
+    const { __setAuthConfig: setAC36q, __resetAuthConfig: resetAC36q,
+            __setFallbackConfig: setFC36q, __resetFallbackConfig: resetFC36q,
+            createOlpServer, loadedProviders } = await import('./server.mjs');
+
+    setAC36q({ allow_anonymous: true });
+
+    // Capture for mock openai provider
+    let capturedIR = null;
+    const mockOpenAI = {
+      name: 'openai',
+      displayName: 'Mock OpenAI for F7',
+      contractVersion: '1.0',
+      models: ['gpt-5.5'],
+      auth: { type: 'oauth', storage: 'file', path: '/tmp/fake', refresh: 'auto' },
+      async * spawn(ir, _authContext) {
+        // Snapshot the model field as received
+        capturedIR = { model: ir.model };
+        yield { type: 'delta', role: 'assistant', content: 'mock-openai-response' };
+        yield { type: 'stop', finish_reason: 'stop' };
+      },
+      estimateCost: () => null,
+      quotaStatus: async () => null,
+      healthCheck: async () => ({ ok: true, latencyMs: 0 }),
+      hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, cacheable: true },
+    };
+
+    // Mock anthropic provider that always fails immediately with SPAWN_FAILED
+    const mockAnthropic = {
+      name: 'anthropic',
+      displayName: 'Mock Anthropic for F7',
+      contractVersion: '1.0',
+      models: ['claude-sonnet-4-6'],
+      auth: { type: 'oauth', storage: 'file', path: '/tmp/fake', refresh: 'auto' },
+      async * spawn(_ir, _authContext) {
+        throw new ProviderError('mock anthropic always fails (F7 test)', 'SPAWN_FAILED');
+        // eslint-disable-next-line no-unreachable
+        yield { type: 'stop' };
+      },
+      estimateCost: () => null,
+      quotaStatus: async () => null,
+      healthCheck: async () => ({ ok: true, latencyMs: 0 }),
+      hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, cacheable: true },
+    };
+
+    // Save + clear loadedProviders, install the mocks
+    const savedProviders = new Map(loadedProviders);
+    loadedProviders.clear();
+    loadedProviders.set('anthropic', mockAnthropic);
+    loadedProviders.set('openai', mockOpenAI);
+
+    // 2-hop chain with DIFFERENT models per hop — the bug only manifests when
+    // hopModel !== requested model on the hop that actually serves.
+    setFC36q({
+      chains: {
+        'claude-sonnet-4-6': [
+          { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+          { provider: 'openai',    model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    const srv = createOlpServer();
+    let port = 28400 + Math.floor(Math.random() * 100);
+    await new Promise((resolve, reject) => {
+      srv.listen(port, '127.0.0.1', resolve);
+      srv.once('error', e => {
+        if (e.code === 'EADDRINUSE') { port++; srv.listen(port, '127.0.0.1', resolve); srv.once('error', reject); }
+        else reject(e);
+      });
+    });
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'F7 test' }],
+        },
+      });
+      assert.equal(r.status, 200, `expected 200, got ${r.status}: ${r.body.slice(0, 300)}`);
+      assert.equal(r.headers['x-olp-provider-used'], 'openai',
+        'openai must be the serving hop (anthropic failed)');
+      // The F7 assertion: the openai hop received the chain's configured model,
+      // NOT the user's original request model.
+      assert.ok(capturedIR, 'mock openai must have been invoked');
+      assert.equal(capturedIR.model, 'gpt-5.5',
+        `F7: openai hop must receive its chain-configured model 'gpt-5.5', got '${capturedIR.model}'`);
+    } finally {
+      await new Promise(r => srv.close(r));
+      resetFC36q();
+      // Restore original providers
+      loadedProviders.clear();
+      for (const [k, v] of savedProviders) loadedProviders.set(k, v);
+      resetAC36q();
+    }
+  });
+
+  it('36r (F7) — per-hop model override preserved on streaming single-hop path', async () => {
+    // The streaming path (server.mjs ~line 1390-1434) has its own spawn call site
+    // inside sourceFactory that previously also passed `ir` unchanged. F7 fix
+    // wraps it with the same { ...ir, model: streamModel } substitution. This
+    // test exercises a single-hop streaming request and asserts the mock saw
+    // the chain's configured model.
+
+    const { __setAuthConfig: setAC36r, __resetAuthConfig: resetAC36r,
+            __setFallbackConfig: setFC36r, __resetFallbackConfig: resetFC36r,
+            createOlpServer, loadedProviders } = await import('./server.mjs');
+
+    setAC36r({ allow_anonymous: true });
+
+    let capturedModel = null;
+    const mockOpenAIStream = {
+      name: 'openai',
+      displayName: 'Mock Codex for F7 streaming',
+      contractVersion: '1.0',
+      models: ['gpt-5.5'],
+      auth: { type: 'oauth', storage: 'file', path: '/tmp/fake', refresh: 'auto' },
+      async * spawn(ir, _authContext) {
+        capturedModel = ir.model;
+        yield { type: 'delta', role: 'assistant', content: 'streamed-content' };
+        yield { type: 'stop', finish_reason: 'stop' };
+      },
+      estimateCost: () => null,
+      quotaStatus: async () => null,
+      healthCheck: async () => ({ ok: true, latencyMs: 0 }),
+      hints: { requiresTTY: false, concurrentSpawnSafe: true, maxConcurrent: 4, cacheable: true },
+    };
+
+    const savedProviders = new Map(loadedProviders);
+    loadedProviders.clear();
+    loadedProviders.set('openai', mockOpenAIStream);
+
+    // Single-hop chain with a DIFFERENT model than the request — the bug is
+    // visible only when the user requests one model name and the chain remaps it.
+    setFC36r({
+      chains: {
+        'gpt-aliased': [
+          { provider: 'openai', model: 'gpt-5.5' },
+        ],
+      },
+      soft_triggers: {},
+    });
+
+    const srv = createOlpServer();
+    let port = 28500 + Math.floor(Math.random() * 100);
+    await new Promise((resolve, reject) => {
+      srv.listen(port, '127.0.0.1', resolve);
+      srv.once('error', e => {
+        if (e.code === 'EADDRINUSE') { port++; srv.listen(port, '127.0.0.1', resolve); srv.once('error', reject); }
+        else reject(e);
+      });
+    });
+
+    try {
+      const r = await fetch({
+        port,
+        method: 'POST',
+        path: '/v1/chat/completions',
+        body: {
+          model: 'gpt-aliased',
+          stream: true,
+          messages: [{ role: 'user', content: 'F7 streaming test' }],
+        },
+      });
+      assert.equal(r.status, 200, `expected 200, got ${r.status}: ${r.body.slice(0, 200)}`);
+      assert.equal(capturedModel, 'gpt-5.5',
+        `F7 streaming: openai must receive chain-configured model 'gpt-5.5', got '${capturedModel}'`);
+    } finally {
+      await new Promise(r => srv.close(r));
+      resetFC36r();
+      loadedProviders.clear();
+      for (const [k, v] of savedProviders) loadedProviders.set(k, v);
+      resetAC36r();
+    }
+  });
 });

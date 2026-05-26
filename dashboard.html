@@ -495,7 +495,7 @@
         bottomBar.appendChild(el('span', { class: 'rep-claim-badge', title: 'Binding window: ' + entry.representative_claim }, claimLabel));
       }
 
-      if (entry.overage) {
+      if (entry.overage && entry.overage.status) {
         const ov = entry.overage;
         const ovStatus = (ov.status || 'unknown').toLowerCase();
         const isAllowed = ovStatus === 'allowed' || ovStatus === 'active';

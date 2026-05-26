@@ -15616,7 +15616,7 @@ import {
   quotaStatus as quotaStatus38,
   doctorChecks as doctorChecks38,
 } from './lib/providers/anthropic.mjs';
-import { writeFileSync as _writeFileSync38, mkdtempSync as _mkdtempSync38, rmSync as _rmSync38, mkdirSync as _mkdirSync38 } from 'node:fs';
+import { writeFileSync as _writeFileSync38, mkdtempSync as _mkdtempSync38, rmSync as _rmSync38, mkdirSync as _mkdirSync38, readFileSync as _readFileSync38 } from 'node:fs';
 import { join as _pathJoin38 } from 'node:path';
 import { tmpdir as _tmpdir38 } from 'node:os';
 
@@ -16011,9 +16011,9 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
     }
   });
 
-  // ── 38j: 401 → token refresh + retry ─────────────────────────────────────
+  // ── 38j: 401 with no refreshToken → null (idempotent-failure) ─────────────
 
-  it('38j — mock 401 → token refresh attempted; refresh succeeds → retry probe succeeds', async () => {
+  it('38j — 401 with no refreshToken → null (idempotent-failure, no refresh attempt)', async () => {
     _saveEnv38();
     const TMP = _mkdtempSync38(_pathJoin38(_tmpdir38(), 'olp-38j-'));
     let apiCallCount = 0;
@@ -16022,25 +16022,81 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
     try {
       _writeProbeConfig(TMP);
       process.env.OLP_HOME = TMP;
-      // Use a creds object with both access + refresh token
-      // The env token acts as accessToken; we set a refreshToken via CLAUDE_CODE_OAUTH_TOKEN
-      // (anthropic.mjs readAuthArtifact returns { accessToken: env }) — but we also
-      // need refreshToken. The env path doesn't provide it. So we test at the
-      // _probeOnce level: the 401 handler tries single refresh → success on second call.
+      // Env-path creds return { accessToken } only (no refreshToken). Per
+      // anthropic.mjs:452 _probeOnce, the 401 → refresh-and-retry only fires
+      // when refreshToken is present. This test pins the no-refreshToken
+      // idempotent-failure branch (returns null, no OAuth call).
       process.env.CLAUDE_CODE_OAUTH_TOKEN = 'expired-token-38j';
       mock = await _startMockServer((req, res) => {
         if (req.url.includes('/oauth/token')) {
-          // OAuth refresh endpoint: return success
           oauthCallCount++;
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ access_token: 'fresh-token-38j' }));
         } else {
-          // API endpoint: return 401 on first call, 200 with headers on second
+          apiCallCount++;
+          res.writeHead(401, {});
+          res.end('{"error":"unauthorized"}');
+        }
+      });
+      setQuotaUrls38(`${mock.url}/v1/messages`, `${mock.url}/v1/oauth/token`);
+      resetQuotaStateOnly38();
+
+      const result = await quotaStatus38();
+      assert.equal(result, null, '38j: 401 with no refreshToken → null (idempotent-failure per ADR 0002 Amendment 8)');
+      assert.equal(apiCallCount, 1, '38j: only one API call made (no retry without refreshToken)');
+      assert.equal(oauthCallCount, 0, '38j: no OAuth refresh call without refreshToken');
+    } finally {
+      if (mock) await mock.close();
+      resetQuotaProbe38();
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      _restoreEnv38();
+      _rmSync38(TMP, { recursive: true, force: true });
+    }
+  });
+
+  // ── 38j2: 401 WITH refreshToken → refresh succeeds → retry returns 200 ────
+
+  it('38j2 — 401 with refreshToken → refresh succeeds → retry probe returns 200 with 13 fields', async () => {
+    _saveEnv38();
+    const TMP = _mkdtempSync38(_pathJoin38(_tmpdir38(), 'olp-38j2-'));
+    let apiCallCount = 0;
+    let oauthCallCount = 0;
+    let oauthBodyRefreshToken = null;
+    let mock;
+    try {
+      _writeProbeConfig(TMP);
+      process.env.OLP_HOME = TMP;
+      // Inject creds with BOTH accessToken AND refreshToken via the test seam.
+      // The 401 → refresh-and-retry branch at anthropic.mjs:452 fires only when
+      // refreshToken is present, exercising the positive-path control flow
+      // documented in ADR 0013 § Rule 1 (credential reuse + refresh).
+      setQuotaAuthFn38(() => ({
+        accessToken: 'expired-token-38j2',
+        refreshToken: 'valid-refresh-token-38j2',
+        expiresAt: null, // skip pre-emptive refresh at line 402
+      }));
+      mock = await _startMockServer((req, res) => {
+        if (req.url.includes('/oauth/token')) {
+          // Capture the refresh_token sent in the OAuth body to verify routing
+          oauthCallCount++;
+          let body = '';
+          req.on('data', (chunk) => { body += chunk.toString(); });
+          req.on('end', () => {
+            try {
+              const parsed = JSON.parse(body);
+              oauthBodyRefreshToken = parsed?.refresh_token ?? null;
+            } catch { /* ignore */ }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ access_token: 'fresh-token-38j2' }));
+          });
+        } else {
           apiCallCount++;
           if (apiCallCount === 1) {
+            // First API call (with expired token) → 401 to trigger refresh
             res.writeHead(401, {});
-            res.end('{"error":"unauthorized"}');
+            res.end('{"error":"token_expired"}');
           } else {
+            // Second API call (after refresh) → 200 with all 13 headers
             res.writeHead(200, _ALL_13_HEADERS);
             res.end('{}');
           }
@@ -16049,21 +16105,21 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
       setQuotaUrls38(`${mock.url}/v1/messages`, `${mock.url}/v1/oauth/token`);
       resetQuotaStateOnly38();
 
-      // Seed a fake credentials object with refreshToken to exercise the refresh path.
-      // Since readAuthArtifact() from env only returns { accessToken }, we inject
-      // a refreshToken by temporarily writing a .credentials.json in a fake HOME.
-      // Simpler: the 401 path in _probeOnce only retries if refreshToken is present.
-      // The env-path creds have no refreshToken, so the 401 returns null → no retry.
-      // This test verifies: 401 with no refreshToken → null (idempotent-failure).
       const result = await quotaStatus38();
-      // With no refreshToken in the env creds, 401 → null (expected per the spec)
-      assert.equal(result, null, '38j: 401 with no refreshToken → null (idempotent-failure per ADR 0002 Amendment 8)');
-      assert.equal(apiCallCount, 1, '38j: only one API call made (no retry without refreshToken)');
-      assert.equal(oauthCallCount, 0, '38j: no OAuth refresh call without refreshToken');
+      assert.ok(result !== null, '38j2: refresh-retry path should return non-null');
+      assert.equal(result.stale, false, '38j2: returned data is fresh (not stale)');
+      assert.equal(apiCallCount, 2, '38j2: exactly 2 API calls (401 then retry 200)');
+      assert.equal(oauthCallCount, 1, '38j2: exactly 1 OAuth refresh call between API calls');
+      assert.equal(oauthBodyRefreshToken, 'valid-refresh-token-38j2',
+        '38j2: OAuth refresh sent the injected refreshToken (Rule 1 credential reuse)');
+      // Verify the 13 fields landed (refresh succeeded → retry parsed full shape)
+      assert.equal(typeof result.fields?.utilization_5h, 'number',
+        '38j2: retry parsed utilization_5h from second-attempt response headers');
+      assert.equal(typeof result.fields?.utilization_7d, 'number',
+        '38j2: retry parsed utilization_7d');
     } finally {
       if (mock) await mock.close();
       resetQuotaProbe38();
-      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
       _restoreEnv38();
       _rmSync38(TMP, { recursive: true, force: true });
     }
@@ -16277,24 +16333,22 @@ describe('Suite 38 — D83 quota-probe unit tests (Phase 5, ADR 0012 D83 + ADR 0
       // The returned schemaVersion must be a non-empty string (from registry or constant)
       assert.ok(typeof result.schemaVersion === 'string' && result.schemaVersion.length > 0,
         '38o: schemaVersion must be a non-empty string from registry or constant fallback');
-      // Confirm it matches what the registry says (ties to Suite 37g regression)
+      // Confirm it matches what the registry says (ties to Suite 37g regression).
+      // ESM has no `require`; read the registry directly via node:fs.
       const registryPath = _pathJoin38(import.meta.dirname ?? process.cwd(), 'models-registry.json');
-      const registry = JSON.parse(require_no_throw(registryPath));
+      let registry = {};
+      try { registry = JSON.parse(_readFileSync38(registryPath, 'utf8')); } catch { /* ignore */ }
       const expected = registry?.quota_probe?.schema_version;
-      if (expected) {
-        assert.equal(result.schemaVersion, expected,
-          '38o: schemaVersion should match models-registry.json quota_probe.schema_version');
-      }
+      assert.ok(expected,
+        '38o: models-registry.json must define quota_probe.schema_version (ADR 0013 Rule 5)');
+      assert.equal(result.schemaVersion, expected,
+        '38o: schemaVersion should match models-registry.json quota_probe.schema_version');
     } finally {
       if (mock) await mock.close();
       resetQuotaProbe38();
       delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
       _restoreEnv38();
       _rmSync38(TMP, { recursive: true, force: true });
-    }
-
-    function require_no_throw(p) {
-      try { return require('fs').readFileSync(p, 'utf8'); } catch { return '{}'; }
     }
   });
 

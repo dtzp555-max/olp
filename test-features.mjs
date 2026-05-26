@@ -14002,12 +14002,19 @@ describe('Suite 33 — D65 lib/doctor.mjs framework (ADR 0010 § Phase 4 D64-D67
   });
 
   it('33j — anthropic plugin doctorChecks() returns the documented probe set', () => {
-    // Plugin contract: ADR 0002 Amendment 7. anthropic.mjs ships
-    // anthropic.cli_available + anthropic.oauth_token_present.
+    // Plugin contract: ADR 0002 Amendment 7 (D67) + D80 (quota probe check).
+    // anthropic.mjs ships:
+    //   anthropic.cli_available (D67)
+    //   anthropic.oauth_token_present (D67)
+    //   anthropic.quota_probe_reachable (D80 — Phase 5, ADR 0013 Rule 6)
     const checks = anthropic.doctorChecks();
     assert.ok(Array.isArray(checks));
     const ids = checks.map(c => c.id).sort();
-    assert.deepEqual(ids, ['anthropic.cli_available', 'anthropic.oauth_token_present']);
+    assert.deepEqual(ids, [
+      'anthropic.cli_available',
+      'anthropic.oauth_token_present',
+      'anthropic.quota_probe_reachable',
+    ]);
     assert.ok(checks.every(c => c.category === 'provider'));
     assert.ok(checks.every(c => typeof c.run === 'function'));
   });

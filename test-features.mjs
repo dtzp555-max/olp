@@ -10997,6 +10997,7 @@ import {
   topFallbackChains,
   spendTrendDaily,
   cacheHitRateWindow,
+  aggregateProviderQuota,
 } from './lib/audit-query.mjs';
 import { mkdirSync, writeFileSync as fsWriteFileSyncForS23 } from 'node:fs';
 
@@ -15445,5 +15446,147 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
       'README must include a release-tag-pinned olp-connect URL (e.g., /v0.4.4/bin/olp-connect)');
     assert.ok(/Pinned to a known-good release/.test(readmeSrc),
       'README must explain why the tag-pinned form is the primary recommendation');
+  });
+});
+
+// ── Suite 37: D81 aggregateProviderQuota() smoke tests (Phase 5, ADR 0008 Amendment) ──
+//
+// Smoke tests for aggregateProviderQuota() per D81 prompt "add 1-2 smoke tests
+// so the implementation is testable in isolation." Comprehensive tests follow in
+// D83 (Suite 38/39). These cover: live shape normalization, stale shape, null
+// (unavailable) return, and error/throw path.
+//
+// Authority: ADR 0008 Amendment (D81) + ADR 0012 D81 + ADR 0013 Rule 5.
+
+describe('Suite 37 — D81 aggregateProviderQuota() smoke tests (Phase 5, ADR 0008 Amendment)', () => {
+  // Synthetic quotaStatus return shape matching the D80 anthropic plugin contract.
+  function makeSyntheticQuotaShape(overrides = {}) {
+    return {
+      probedAt: Date.now(),
+      source: 'anthropic-ratelimit-unified-headers',
+      schemaVersion: '2026-05-26',
+      stale: false,
+      fields: {
+        status: 'active',
+        representative_claim: 'five_hour',
+        reset: 1748300000,
+        fallback_percentage: 0.5,
+        status_5h: 'active',
+        utilization_5h: 0.49,
+        reset_5h: 1748290000,
+        status_7d: 'active',
+        utilization_7d: 0.31,
+        reset_7d: 1748500000,
+        overage_status: 'rejected',
+        overage_disabled_reason: 'org_level_disabled_until',
+        overage_reset: null,
+      },
+      raw: { 'anthropic-ratelimit-unified-status': 'active' },
+      ...overrides,
+    };
+  }
+
+  it('37a — live shape: non-null quotaStatus() returns normalized entry with status=live', async () => {
+    const synth = makeSyntheticQuotaShape();
+    const mockProviders = new Map([
+      ['anthropic', { quotaStatus: async () => synth }],
+    ]);
+    const result = await aggregateProviderQuota({ providers: mockProviders });
+    assert.equal(result.length, 1, '37a: should return one entry');
+    const entry = result[0];
+    assert.equal(entry.provider, 'anthropic', '37a: provider name should be anthropic');
+    assert.equal(entry.status, 'live', '37a: status should be live for non-stale result');
+    assert.equal(entry.schema_version, '2026-05-26', '37a: schema_version should be forwarded');
+    assert.ok(typeof entry.last_fresh_at === 'number', '37a: last_fresh_at should be a number');
+    assert.ok(entry.utilization !== null, '37a: utilization should not be null');
+    assert.equal(entry.utilization['5h'], 0.49, '37a: utilization 5h should be 0.49');
+    assert.equal(entry.utilization['7d'], 0.31, '37a: utilization 7d should be 0.31');
+    assert.ok(entry.reset !== null, '37a: reset should not be null');
+    assert.equal(entry.reset.overall, 1748300000, '37a: reset.overall should match fields.reset');
+    assert.equal(entry.representative_claim, 'five_hour', '37a: representative_claim should match');
+    assert.equal(entry.fallback_percentage, 0.5, '37a: fallback_percentage should match');
+    assert.ok(entry.overage !== null, '37a: overage should not be null');
+    assert.equal(entry.overage.status, 'rejected', '37a: overage.status should match');
+    assert.equal(entry.raw_available, true, '37a: raw_available should be true when raw is present');
+  });
+
+  it('37b — stale shape: stale:true quotaStatus() returns entry with status=stale', async () => {
+    const synth = makeSyntheticQuotaShape({ stale: true, last_fresh_at: Date.now() - 30000 });
+    const mockProviders = new Map([
+      ['anthropic', { quotaStatus: async () => synth }],
+    ]);
+    const result = await aggregateProviderQuota({ providers: mockProviders });
+    assert.equal(result.length, 1, '37b: should return one entry');
+    assert.equal(result[0].status, 'stale', '37b: status should be stale when stale:true');
+  });
+
+  it('37c — null return: null quotaStatus() produces unavailable entry', async () => {
+    const mockProviders = new Map([
+      ['codex', { quotaStatus: async () => null }],
+      ['mistral', { quotaStatus: async () => null }],
+    ]);
+    const result = await aggregateProviderQuota({ providers: mockProviders });
+    assert.equal(result.length, 2, '37c: should return two entries');
+    for (const entry of result) {
+      assert.equal(entry.status, 'unavailable', `37c: ${entry.provider} should be unavailable`);
+      assert.ok(entry.reason, `37c: ${entry.provider} should have a reason`);
+      assert.equal(entry.utilization, null, `37c: ${entry.provider} utilization should be null`);
+    }
+  });
+
+  it('37d — throw: quotaStatus() that throws produces unavailable entry with reason', async () => {
+    const mockProviders = new Map([
+      ['anthropic', { quotaStatus: async () => { throw new Error('network timeout'); } }],
+    ]);
+    const result = await aggregateProviderQuota({ providers: mockProviders });
+    assert.equal(result.length, 1, '37d: should return one entry');
+    assert.equal(result[0].status, 'unavailable', '37d: status should be unavailable on throw');
+    assert.ok(result[0].reason.includes('network timeout'), '37d: reason should include the error message');
+  });
+
+  it('37e — mixed providers: live + unavailable in same call', async () => {
+    const synth = makeSyntheticQuotaShape();
+    const mockProviders = new Map([
+      ['anthropic', { quotaStatus: async () => synth }],
+      ['codex', { quotaStatus: async () => null }],
+    ]);
+    const result = await aggregateProviderQuota({ providers: mockProviders });
+    assert.equal(result.length, 2, '37e: should return two entries');
+    const anthropicEntry = result.find(e => e.provider === 'anthropic');
+    const codexEntry = result.find(e => e.provider === 'codex');
+    assert.ok(anthropicEntry, '37e: anthropic entry should be present');
+    assert.ok(codexEntry, '37e: codex entry should be present');
+    assert.equal(anthropicEntry.status, 'live', '37e: anthropic should be live');
+    assert.equal(codexEntry.status, 'unavailable', '37e: codex should be unavailable');
+  });
+
+  it('37f — getQuotaStatus injection: custom getter is used when provided', async () => {
+    // Test the getQuotaStatus injection point for full testability (D81 prompt §F).
+    const synth = makeSyntheticQuotaShape();
+    const mockProviders = new Map([['anthropic', {}]]); // plugin has no quotaStatus
+    const calls = [];
+    const result = await aggregateProviderQuota({
+      providers: mockProviders,
+      getQuotaStatus: (name) => { calls.push(name); return Promise.resolve(synth); },
+    });
+    assert.equal(calls.length, 1, '37f: getQuotaStatus should be called once');
+    assert.equal(calls[0], 'anthropic', '37f: called with provider name');
+    assert.equal(result[0].status, 'live', '37f: result should use injected quota shape');
+  });
+
+  it('37g — models-registry.json has quota_probe.schema_version', () => {
+    // D81 / ADR 0013 Rule 5 mandate: schema_version must be in models-registry.json.
+    // Uses _readFileSyncS36 + _joinS36 (already module-level imports from Suite 36).
+    const registryPath = _joinS36(import.meta.dirname ?? process.cwd(), 'models-registry.json');
+    const registry = JSON.parse(_readFileSyncS36(registryPath, 'utf8'));
+    assert.ok(registry.quota_probe, '37g: models-registry.json must have quota_probe key');
+    assert.ok(typeof registry.quota_probe.schema_version === 'string',
+      '37g: quota_probe.schema_version must be a string');
+    assert.ok(registry.quota_probe.schema_version.length > 0,
+      '37g: quota_probe.schema_version must not be empty');
+    assert.ok(Array.isArray(registry.quota_probe.anthropic?.fields_pinned),
+      '37g: quota_probe.anthropic.fields_pinned must be an array');
+    assert.equal(registry.quota_probe.anthropic.fields_pinned.length, 13,
+      '37g: quota_probe.anthropic.fields_pinned must have exactly 13 entries (all parsed fields)');
   });
 });

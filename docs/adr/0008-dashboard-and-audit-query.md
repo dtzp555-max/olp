@@ -2,6 +2,93 @@
 
 - **Date:** 2026-05-25
 - **Status:** Accepted (D48, design-only — implementation D-days D49–D54 follow; Phase 3 close = v0.3.0)
+
+## Amendments
+
+### Amendment 1 — 2026-05-26: D81 Phase 5 quota_v2 shape + aggregateProviderQuota()
+
+**Scope:** D81 (Phase 5 / ADR 0012 D81) extends the audit-query layer and dashboard-data endpoint to surface the new per-provider quota shape introduced by D80 (`lib/providers/anthropic.mjs:quotaStatus()`). This amendment documents the three new interfaces.
+
+#### 1. `models-registry.json` — new `quota_probe` top-level key
+
+D81 adds a `quota_probe` key at the root of `models-registry.json` per ADR 0013 Rule 5 (schema_version in registry so downstream consumers can detect schema drift):
+
+```json
+{
+  "quota_probe": {
+    "schema_version": "2026-05-26",
+    "anthropic": {
+      "source": "anthropic-ratelimit-unified-headers",
+      "endpoint": "https://api.anthropic.com/v1/messages",
+      "fields_pinned": [ ...13 field names... ]
+    }
+  }
+}
+```
+
+`fields_pinned` is load-bearing: if Anthropic adds/renames a header in a future CLI version, dashboard consumers comparing field-presence against this list can flag "schema drift detected" per the ADR 0013 Rule 5 drift-detection runbook. This field must be updated alongside the parser whenever a drift event occurs.
+
+`lib/providers/anthropic.mjs` reads `quota_probe.schema_version` from the registry at call time (via `_resolveSchemaVersion()`) with the module-level `QUOTA_SCHEMA_VERSION` constant as fallback. No hard dependency on the registry — the constant is the safety net.
+
+#### 2. `lib/audit-query.mjs` — new `aggregateProviderQuota()` export
+
+```js
+export async function aggregateProviderQuota({
+  providers,           // Map<name, plugin> or plain object
+  getQuotaStatus,      // optional injectable getter (name) => Promise<shape|null>
+}): Promise<Array<ProviderQuotaEntry>>
+```
+
+For each provider, calls `quotaStatus()` (already cached at the plugin layer per ADR 0013 Rule 3) and normalizes to the `ProviderQuotaEntry` shape:
+
+```js
+{
+  provider: string,
+  status: 'live' | 'stale' | 'unavailable',
+  reason?: string,              // only when status === 'unavailable'
+  schema_version: string|null,
+  last_fresh_at: number|null,   // epoch-ms of last successful probe
+  utilization: { '5h': number|null, '7d': number|null } | null,
+  reset: {
+    '5h': number|null, '7d': number|null,
+    overall: number|null, overage: number|null,
+  } | null,
+  representative_claim: string|null,
+  fallback_percentage: number|null,
+  overage: { status: string|null, disabled_reason: string|null } | null,
+  raw_available: boolean,
+}
+```
+
+Providers returning `null` from `quotaStatus()` (codex, mistral — no public quota API; or probe disabled) produce `{ status: 'unavailable', reason: 'no public quota api or probe disabled', ...null fields }`.
+
+Providers whose `quotaStatus()` throws produce `{ status: 'unavailable', reason: <error.message>, ...null fields }`.
+
+This function does NOT scan ndjson files; it calls live provider plugins. It is audit-query-adjacent (normalized query shape for the dashboard layer) but not audit-derived. Query model remains Lane 2 = A (in-memory, no SQLite).
+
+#### 3. `/v0/management/dashboard-data` and `/v0/management/quota` — new `quota_v2` field
+
+Both endpoints now return TWO quota keys:
+
+- **`quota`** (legacy, unchanged): `Array<{ provider, ...rawQuotaStatus, available }>`. Kept for backwards compatibility with the existing `dashboard.html` (D82 will switch consumers to `quota_v2`).
+- **`quota_v2`** (D81 new): `Array<ProviderQuotaEntry>` — the normalized shape from `aggregateProviderQuota()` above. This is what D82's enriched dashboard UI will consume.
+
+Both fields are computed from the same underlying `quotaStatus()` call. The legacy `quota` key calls `quotaStatus()` independently from `quota_v2`; since the probe is cached at the plugin layer (ADR 0013 Rule 3), the double call incurs no extra API requests.
+
+**Deprecation timeline:** the legacy `quota` key is deprecated as of D81. Target removal: v1.0.0 or when D82 completes the dashboard migration (whichever comes first). Removal requires a separate PR with a CHANGELOG entry.
+
+#### 4. Failure handling
+
+`aggregateProviderQuota()` never throws to the dashboard endpoint. Per-provider failures are absorbed as `{ status: 'unavailable', reason: <error> }` entries. If `aggregateProviderQuota()` itself throws (implementation bug), `handleManagementDashboardData` and `handleManagementQuota` catch the error, log `dashboard_data_quota_v2_failed` / `management_quota_v2_failed`, and return `quota_v2: []` so the rest of the payload is unaffected.
+
+#### 5. Authority citations for this amendment
+
+- **ADR 0012 D81** — the D-day this amendment documents.
+- **ADR 0013 Rule 5** — mandate for `quota_probe.schema_version` in `models-registry.json`.
+- **D80 PR #52 commit 82d2e1c** — the producer of the `quotaStatus()` shape this amendment normalizes.
+- **ADR 0008 Lane 2 = A** — query model unchanged; `aggregateProviderQuota()` does not scan ndjson.
+
+---
 - **Authors:** project maintainer (with AI drafting assistance)
 - **Related:**
   - OLP v0.1 spec § 4.6 (Dashboard requirements — port from OCP with multi-provider support) and § 4.7 (observability endpoints)

@@ -15398,4 +15398,45 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
     assert.ok(/anonymous_key_advertised_with_lan_bind/.test(adrSrc),
       'amendment must cite the startup-warn event name');
   });
+
+  // ── D78 v0.4.4: G12 stale openclaw text + G13 self-version derived ──────
+  it('36v (G12) — olp-connect openclaw detection no longer claims plugin not shipped', () => {
+    // D71-D73 shipped olp-plugin/. Pre-D78 the script said "NOT YET SHIPPED"
+    // which misled MacBook client testing on 2026-05-26. Pin the corrected text.
+    const ocSrc = _readFileSyncS36(_joinS36(import.meta.dirname ?? process.cwd(), 'bin/olp-connect'), 'utf8');
+    assert.ok(!/NOT YET SHIPPED/.test(ocSrc),
+      'olp-connect must NOT claim openclaw plugin is unshipped (D71-D73 shipped it at v0.4.0)');
+    assert.ok(/openclaw plugins install/.test(ocSrc) || /\.openclaw\/extensions\/olp/.test(ocSrc),
+      'olp-connect openclaw detection must give a real install path');
+    assert.ok(/docs\/integrations\/openclaw\.md/.test(ocSrc),
+      'olp-connect must point at the openclaw integration doc');
+  });
+
+  it('36w (G13) — olp-connect self-version derived from package.json (not hardcoded)', () => {
+    // Pre-D78 OLP_CONNECT_VERSION was a hardcoded literal "0.4.0-phase4" that
+    // nobody updated across v0.4.1/v0.4.2/v0.4.3. D78 derives at runtime
+    // from sibling package.json so the literal stays in sync automatically.
+    const ocSrc = _readFileSyncS36(_joinS36(import.meta.dirname ?? process.cwd(), 'bin/olp-connect'), 'utf8');
+    // The old hardcoded literal must be gone
+    assert.ok(!/OLP_CONNECT_VERSION="0\.4\.0-phase4"/.test(ocSrc),
+      'hardcoded "0.4.0-phase4" version literal must be gone');
+    // The new derivation logic must reference package.json
+    assert.ok(/package\.json/.test(ocSrc) && /OLP_CONNECT_VERSION=/.test(ocSrc),
+      'OLP_CONNECT_VERSION must derive from package.json');
+  });
+
+  it('36x (D78) — README pins primary olp-connect curl URL to a release tag (CDN-cache-safe)', () => {
+    // G11 root cause: README's `bash <(curl ... /main/bin/olp-connect)` got
+    // bitten by GitHub raw CDN's negative-cache TTL when the repo flipped
+    // private->public. Tag-pinned URLs (.../<tag>/bin/...) bypass that
+    // negative cache because the tag ref was never queried while private.
+    // D78: README presents the tag-pinned URL as the primary recommendation,
+    // with /main/ as an alternative for trusted-head users.
+    const readmePath = _joinS36(import.meta.dirname ?? process.cwd(), 'README.md');
+    const readmeSrc = _readFileSyncS36(readmePath, 'utf8');
+    assert.ok(/raw\.githubusercontent\.com\/dtzp555-max\/olp\/v\d+\.\d+\.\d+\/bin\/olp-connect/.test(readmeSrc),
+      'README must include a release-tag-pinned olp-connect URL (e.g., /v0.4.4/bin/olp-connect)');
+    assert.ok(/Pinned to a known-good release/.test(readmeSrc),
+      'README must explain why the tag-pinned form is the primary recommendation');
+  });
 });

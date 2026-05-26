@@ -6,6 +6,33 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 (empty — Phase 5 entries land here once Phase 5 opens)
 
+## v0.4.4 — 2026-05-26
+
+### D78 — `bin/olp-connect` stale-strings cleanup + README CDN-safe URL + repo-visibility flip
+
+Patch release on top of v0.4.3. Three small issues caught when running `olp-connect` for real on MacBook (D77 client-install verification):
+
+- **G11 fix (repo visibility).** Repo `dtzp555-max/olp` flipped from PRIVATE → PUBLIC during this session, closing the original G11 finding (`bash <(curl -fsSL .../main/bin/olp-connect)` returned 404 because anonymous curl can't fetch from private repos). README's `/main/` URL works going forward; GitHub's raw CDN may serve a stale 404 for `/main/` for ~5-15min after the visibility flip due to negative caching. D78 defends against this by adding a **tag-pinned URL (`/v0.4.4/bin/olp-connect`) as the primary recommendation in README**, with `/main/` listed as an alternative for trusted-head users. Tag-pinned URLs bypass the negative-cache because the tag ref was never queried while the repo was private.
+- **G12 fix (`detect_openclaw` claimed plugin not shipped).** `bin/olp-connect`'s OpenClaw detection block said `"The OpenClaw OLP plugin (D71-D73) is NOT YET SHIPPED"` — but D71-D73 shipped `olp-plugin/` at v0.4.0. D78 replaces the stale text with real install instructions: `git clone` + `openclaw plugins install ./olp-plugin/` (or symlink), edit `~/.openclaw/openclaw.json` with a dedicated bot apiKey, restart gateway. Points at `docs/integrations/openclaw.md` for the full setup.
+- **G13 fix (`olp-connect` self-version hardcoded literal).** Pre-D78 the script declared `OLP_CONNECT_VERSION="0.4.0-phase4"` as a hardcoded literal that nobody updated through v0.4.1 / v0.4.2 / v0.4.3 (the maintain-the-literal-per-release pattern is reliably forgotten). D78 derives the version at runtime from the sibling `package.json` via python3 — when the script is invoked from a checked-out repo, version resolves to the actual `package.json` value; when invoked via `curl … | bash` with no on-disk package.json next to it, falls back to `unknown`. Now `bash bin/olp-connect --version` prints `olp-connect 0.4.4` automatically with no manual touch needed at the next release.
+
+**Pre-publish audit.** Per `~/.cc-rules/docs/guides/pre-publish-audit.md` checklist (2026-05-26 session, before the visibility flip):
+- Identity scrub: 0 hits (no personal names / hostnames / home paths / personal emails leaked into the working tree)
+- Credential scrub: 0 real tokens — all `olp_` matches are placeholder (`olp_XXXX...`) or test fixtures (`olp_not-a-real-key-...`); gitleaks: "no leaks found"
+- Git-history author emails: 78 commits, two emails (`dtzp555@gmail.com` local + `taodeng1977@gmail.com` GitHub-account squash-merges). Maintainer chose Option A (accept) — the GitHub-account email was already verified-public on the maintainer's GitHub profile, so the visibility flip exposes nothing new.
+
+**Test count:** 717 (v0.4.3) → 720 (v0.4.4). +3 D78 regression tests in Suite 36:
+- 36v — pins absence of `NOT YET SHIPPED` text + presence of real install path
+- 36w — pins runtime version derivation from package.json (hardcoded literal gone)
+- 36x — pins README's tag-pinned-URL recommendation
+
+**Authority:** D77 MacBook client-install verification session (2026-05-26); `~/.cc-rules/docs/guides/pre-publish-audit.md`. Process learning: every README that includes a `curl <raw-URL> | bash` install pattern should pin to a release tag (not `/main/`) for CDN-cache resilience. The /main/ form is correct for the long-tail (when no negative cache exists) but the tag-pinned form survives the visibility-flip transient + survives any future force-push to main.
+
+**Out of D78 scope:**
+- F6 (doctor client-side vs server-side check separation) — Phase 5 ADR amendment.
+- D75 reviewer P2-1 (ADR 0004 per-hop schema amendment) + P2-2 (defensive `typeof hopModel === 'string'` invariant) — both genuine follow-ups, neither blocking.
+- `scripts/migrate-from-ocp.mjs` — Phase 7.
+
 ## v0.4.3 — 2026-05-26
 
 ### D76 — README install-path overhaul + `OLP_BIND` env + AI-driven install prompt + ADR 0011 amendment

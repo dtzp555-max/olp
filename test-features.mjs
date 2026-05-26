@@ -15361,4 +15361,41 @@ describe('Suite 36 — D74 v0.4.1 hotfix regression (maintainer review findings)
       resetAC36r();
     }
   });
+
+  // ── F5 (D76 v0.4.3): OLP_BIND env honored + safety warn ──────────────────
+  it('36s (F5) — server.mjs reads OLP_BIND with safe default 127.0.0.1', () => {
+    // F5 fix: previously bind was hard-coded `server.listen(PORT, '127.0.0.1', ...)`.
+    // D76 adds `const BIND = process.env.OLP_BIND ?? '127.0.0.1'` and the listen
+    // call uses BIND. Pin via source grep so a future refactor that re-introduces
+    // a hardcoded literal in the listen call fails this test.
+    const serverSrc = _readFileSyncS36(_joinS36(import.meta.dirname ?? process.cwd(), 'server.mjs'), 'utf8');
+    assert.ok(/process\.env\.OLP_BIND\s*\?\?\s*['"]127\.0\.0\.1['"]/.test(serverSrc),
+      'server.mjs must read OLP_BIND env with 127.0.0.1 default');
+    assert.ok(/server\.listen\(PORT,\s*BIND\b/.test(serverSrc),
+      'server.mjs server.listen must use the BIND variable (not a hardcoded address)');
+    assert.ok(!/server\.listen\(PORT,\s*['"]127\.0\.0\.1['"]/.test(serverSrc),
+      'server.mjs must NOT pass a hardcoded 127.0.0.1 literal to server.listen anymore');
+  });
+
+  it('36t (F5) — anonymous_key_advertised_with_lan_bind startup warn wiring', () => {
+    // Per ADR 0011 Deployment configurations amendment: when OLP_BIND is
+    // non-loopback AND advertise_anonymous_key is true, server emits a startup
+    // warn so the operator sees the trust-context overlap. Pin the wiring.
+    const serverSrc = _readFileSyncS36(_joinS36(import.meta.dirname ?? process.cwd(), 'server.mjs'), 'utf8');
+    assert.ok(/anonymous_key_advertised_with_lan_bind/.test(serverSrc),
+      'startup warn event name must be present');
+    // Loopback check must compare BIND against ALL three loopback forms
+    assert.ok(/BIND\s*!==\s*['"]127\.0\.0\.1['"][\s\S]{0,200}BIND\s*!==\s*['"]localhost['"][\s\S]{0,200}BIND\s*!==\s*['"]::1['"]/.test(serverSrc),
+      'startup warn must check BIND against all three loopback forms (127.0.0.1 / localhost / ::1)');
+  });
+
+  it('36u (F5) — ADR 0011 Deployment configurations amendment present', () => {
+    const adrPath = _joinS36(import.meta.dirname ?? process.cwd(), 'docs/adr/0011-anonymous-key-deployment-context.md');
+    const adrSrc = _readFileSyncS36(adrPath, 'utf8');
+    assert.ok(/Deployment configurations \(D76 amendment/.test(adrSrc),
+      'ADR 0011 must carry the D76 amendment heading');
+    assert.ok(/OLP_BIND/.test(adrSrc), 'amendment must document OLP_BIND');
+    assert.ok(/anonymous_key_advertised_with_lan_bind/.test(adrSrc),
+      'amendment must cite the startup-warn event name');
+  });
 });

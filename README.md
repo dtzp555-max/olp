@@ -1,55 +1,204 @@
 # OLP — Open LLM Proxy
 
-A personal- and family-scale multi-provider LLM proxy. One HTTP endpoint, many subscriptions behind it, automatic routing, automatic fallback, content-addressed caching — so your IDEs and family clients keep working as long as *any* of your subscriptions has quota left.
+A personal- and family-scale multi-provider LLM proxy. One HTTP endpoint, many subscriptions behind it, automatic routing + fallback + content-addressed caching. Your IDEs and family clients keep working as long as **any** of your subscriptions has quota left.
 
-> **Status:** v0.4.0 shipped (2026-05-26) — Phase 1 multi-provider proxy core (v0.1.0 + v0.1.1) + Phase 2 multi-key auth + audit + owner gating + keygen CLI (v0.2.0) + Phase 3 Dashboard + audit query layer + daily audit rotation (v0.3.0) + Phase 4 Operator + Client UX (v0.4.0): SSE heartbeat / `olp` Node CLI + `olp doctor` framework / `olp-connect` zero-config LAN setup / `/health.anonymousKey` opt-in / `/olp` Telegram-Discord plugin / 6-IDE integration docs. Phase 5 scope is open — candidates per ADR 0010 § Out-of-Phase-4-scope: `/v1/messages` (gated on ADR 0009 P0 outcome + named family CC user), context-window-exceeded fallback trigger, per-(provider, model) live stats. Sections marked _placeholder_ land alongside the relevant phase of work (see [phase plan](#phase-plan)).
-
----
-
-## Why OLP
-
-On 2026-05-14, Anthropic announced (effective 2026-06-15) that `claude -p`, the Agent SDK, and third-party agent traffic move out of the Pro/Max subscription pool into a separate fixed monthly Agent SDK Credit pool. [OCP](https://github.com/dtzp555-max/ocp), OLP's predecessor, was a proxy around a single CLI — its core assumption was *"subscription = unlimited within rate limits"*. That assumption breaks for Anthropic on the effective date.
-
-The structural response is to stop relying on one provider's subscription terms remaining favourable. OLP spreads risk across multiple providers whose subscriptions still include CLI/programmatic use, routes intelligently between them, and caches aggressively so every request that does spawn a CLI counts.
-
-OLP is **not**: a commercial multi-tenant SaaS; an enterprise gateway competing with LiteLLM / OpenCode / CLIProxyAPI on breadth; a model-capability router ("route to the smartest model" — you pick the model); a conversation-state store (your client handles that).
-
-See [`ALIGNMENT.md`](./ALIGNMENT.md) for OLP's constitution and [`docs/adr/`](./docs/adr/) for the founding ADRs.
+> **Status:** v0.4.3 shipped, 714+ tests. Phase 4 (Operator + Client UX) closed; Phase 5 scope is open. Coming from [OCP](https://github.com/dtzp555-max/ocp)? See [§ Migration from OCP](#migration-from-ocp).
 
 ---
 
-## Quick Start
+## What you get
 
-_placeholder — lands with Phase 1._
+- **OpenAI-compatible** `/v1/chat/completions` endpoint — any IDE that speaks OpenAI (Cline / Continue.dev / Cursor / Aider) plugs in
+- **Multi-provider chain** — primary fails / quota dies → automatically falls back to the next provider (anthropic ↔ codex ↔ mistral by default; risk-tier framework guards which ones get enabled)
+- **Content-addressed cache** — repeat requests don't re-spawn the CLI; streaming requests dedup via singleflight tee
+- **Multi-key auth** — owner key with full visibility, family-member keys with per-key audit log + per-provider scoping
+- **Telegram / Discord** `/olp` slash commands (read-only — for "is OLP up?" checks from anywhere)
+- **AI-driven self-repair** — `olp doctor --json` emits machine-readable `next_action.ai_executable[]` so a Claude Code / Cursor / Copilot session can fix install issues for you (see [§ Install with your AI](#install-with-your-ai-the-fast-path))
+- **Observability** — owner-only `/dashboard` (quota / 24h stats / 30d spend trend / top fallback chains)
 
-Anticipated shape:
+---
 
-```bash
-# install
-npm install -g @dtzp555-max/olp
+## Install with your AI (the fast path)
 
-# run setup (writes ~/.olp/config.json, asks which providers to enable)
-olp setup
+If the manual steps feel like a lot, paste this verbatim into your AI coding assistant (Claude Code / Cursor / Copilot / Aider). It walks you through everything:
 
-# start the proxy (default port 4567 since v0.4.0 — moved off OCP's 3456 so
-# OLP and OCP can co-host on the same machine. Set OLP_PORT=3456 if you have
-# no OCP on the machine and want the old default.)
-olp start
+```
+I want to install OLP (Open LLM Proxy) on this machine. The repo is at
+https://github.com/dtzp555-max/olp and ships these tools that you can use:
 
-# point your IDE at http://localhost:4567/v1/chat/completions with the OLP API key from `olp keys list`.
+1. `git clone` the repo to ~/olp
+2. README.md § "Manual install" has the sequenced steps. Follow them in order.
+3. After EACH step, run `node ~/olp/bin/olp.mjs doctor --json` (NOT `npx olp`
+   — the package isn't on npm). Parse the JSON. The `kind` field tells you
+   the state: noop / fresh_install / fix_server / fix_oauth / fix_provider /
+   fix_config.
+4. If `kind != noop`, run the commands listed in `next_action.ai_executable[]`
+   verbatim. Then re-run doctor to verify.
+5. STOP and ask me only when `next_action.human_required[]` is non-empty.
+   That's where I need to do a browser OAuth flow you can't do for me.
+
+The provider CLIs OLP spawns (claude / codex / vibe) need their own one-time
+OAuth — those are the only steps I personally have to do (Claude.ai login,
+ChatGPT login, Mistral API key). Everything else (clone, npm install of the
+provider CLIs, owner-key generation, config.json bootstrap, server start) is
+in your `ai_executable[]` and you should run it without asking.
+
+Begin.
 ```
 
-**Family-on-LAN onboarding (D68-D70).** For other devices on the same network, run on the client device:
+Then sit back and respond when it asks for OAuth confirmation. This pattern works because `olp doctor` is purpose-built for AI consumption — every failure mode has a shell-executable repair command AND a human-required step listed separately.
+
+---
+
+## Manual install (5-10 min)
+
+### 0. Prerequisites
+
+- **Node.js ≥ 18.** Verify: `node --version`
+- **The provider CLIs you want OLP to spawn.** Install whichever you'll actually use:
+
+  | Provider | Install | Subscription |
+  |---|---|---|
+  | `anthropic` (`claude -p`) | `npm install -g @anthropic-ai/claude-code` | Claude Pro/Max (OAuth) |
+  | `openai` (`codex exec`) | `npm install -g @openai/codex` | ChatGPT Plus/Pro (OAuth) or OpenAI API key |
+  | `mistral` (`vibe --prompt`) | follow the `vibe` install docs | Le Chat Pro API key |
+
+  You only need to install the ones you'll route to. Single-provider OLP works fine.
+
+### 1. Clone and verify the test suite
 
 ```bash
-# Detects Cline / Continue.dev / Cursor / Aider / OpenClaw installed locally
-# and writes per-tool config pointing at the OLP host. Requires `python3`.
-olp-connect <olp-host-ip>
+git clone https://github.com/dtzp555-max/olp.git ~/olp
+cd ~/olp
+npm test    # 714+ tests, ~5s, no external deps
 ```
 
-If the OLP host has `auth.advertise_anonymous_key: true` AND a key was created with `olp-keys keygen --anonymous --advertise`, `olp-connect` picks up the token from `/health.anonymousKey` — zero out-of-band token paste required. See [ADR 0011](./docs/adr/0011-anonymous-key-deployment-context.md) for the trusted-LAN-only invariant.
+(If `npm test` fails here, stop — that means your Node version or the repo state is broken. Don't proceed to step 2.)
 
-Per-IDE setup details: [`docs/integrations/`](./docs/integrations/README.md).
+### 2. Bootstrap the owner key
+
+The owner key is what you (and `olp-connect`) use to authenticate to OLP. Default config has `auth.allow_anonymous: false`, so you need a key BEFORE the server starts accepting requests.
+
+```bash
+node ~/olp/bin/olp-keys.mjs keygen --owner --name=$(whoami)-laptop
+# Prints the plaintext token ONCE. Copy it now — you can't recover it later.
+# Example: olp_l23-PN46tDljmPATV94-KfOgOBO0Ed8theVjTdAgQoY
+```
+
+Export it so the CLI subcommands can use it:
+
+```bash
+export OLP_API_KEY=olp_l23-PN46...   # paste your real token
+```
+
+(Add to `~/.bashrc` / `~/.zshrc` to persist.)
+
+### 3. Authenticate the providers (one-time OAuth)
+
+Run each provider's own login flow. OLP's anthropic / openai / mistral plugins spawn these CLIs and reuse their cached credentials — OLP itself never touches the OAuth dance.
+
+```bash
+# Anthropic (Claude Pro/Max subscription)
+claude setup-token
+# Opens a TUI / prints a URL. Authorize in browser. Paste the returned code.
+# Result: ~/.claude/.credentials.json
+
+# OpenAI (ChatGPT subscription)
+codex login --device-auth
+# Prints a https://auth.openai.com/codex/device URL + 10-char code.
+# Open URL in browser, enter code, authorize.
+# Result: ~/.codex/auth.json
+
+# Mistral (Le Chat API key)
+export MISTRAL_API_KEY=sk-...   # add to ~/.bashrc to persist
+```
+
+### 4. Write a minimum config
+
+`~/.olp/config.json`:
+
+```json
+{
+  "auth": {
+    "allow_anonymous": false,
+    "owner_only_endpoints": [
+      "/health",
+      "/v0/management/dashboard-data",
+      "/v0/management/quota",
+      "/v0/management/status",
+      "/cache/stats",
+      "/dashboard"
+    ],
+    "fallback_detail_header_policy": "owner_only"
+  },
+  "providers": {
+    "enabled": { "anthropic": true, "openai": true }
+  },
+  "routing": {
+    "chains": {
+      "claude-sonnet-4-6": [
+        { "provider": "anthropic", "model": "claude-sonnet-4-6" },
+        { "provider": "openai", "model": "gpt-5.5" }
+      ],
+      "gpt-5.5": [{ "provider": "openai", "model": "gpt-5.5" }]
+    }
+  },
+  "streaming": { "heartbeat_interval_ms": 15000 }
+}
+```
+
+(Enable only the providers you actually authenticated in step 3. Chains map `<your-IDE's-requested-model>` → ordered list of `{provider, model}` hops; the chain's per-hop `model` is what gets passed to that provider's CLI.)
+
+### 5. Start the server
+
+```bash
+cd ~/olp
+npm start
+# OLP v0.4.3 listening on :4567 (2 providers enabled)
+```
+
+### 6. Smoke-test
+
+```bash
+curl -H "Authorization: Bearer $OLP_API_KEY" http://localhost:4567/health | jq
+# Expect: {ok: true, providers: {enabled: 2, status: {anthropic: {ok: true...}, openai: {ok: true...}}}}
+
+node ~/olp/bin/olp.mjs doctor
+# Expect: "9 of 9 checks passed", kind=noop
+```
+
+### 7. Point your IDE at OLP
+
+```
+OPENAI_BASE_URL=http://localhost:4567/v1
+OPENAI_API_KEY=$OLP_API_KEY
+```
+
+Per-IDE configuration details: [`docs/integrations/`](./docs/integrations/README.md).
+
+---
+
+## Family / LAN setup
+
+To let other devices on your home network use the same OLP server, you need TWO things:
+
+1. **Bind to the LAN interface** (not just loopback). On the SERVER:
+
+   ```bash
+   OLP_BIND=0.0.0.0 npm start   # or your specific LAN IP, e.g. 192.168.1.10
+   ```
+
+   Default is `127.0.0.1` (loopback only). See [ADR 0011 § Deployment configurations](./docs/adr/0011-anonymous-key-deployment-context.md#deployment-configurations-d76-amendment-2026-05-26) for the trust-context table — **never set `OLP_BIND=0.0.0.0` on a public-internet-facing host** (use a tunnel like Tailscale instead).
+
+2. **Onboard each family member's device** from THEIR machine:
+
+   ```bash
+   bash <(curl -fsSL https://raw.githubusercontent.com/dtzp555-max/olp/main/bin/olp-connect) <olp-host-ip>
+   ```
+
+   Detects Cline / Continue.dev / Cursor / Aider / OpenClaw locally and writes per-tool config pointing at your OLP host. Requires `python3` on the client. Prompts for the OLP API key — OR, if the server has `auth.advertise_anonymous_key: true` AND a key was created with `olp-keys keygen --anonymous --advertise`, picks the token up from `/health.anonymousKey` (zero out-of-band paste). See [ADR 0011](./docs/adr/0011-anonymous-key-deployment-context.md) for the trusted-LAN-only invariant.
+
+Per-IDE setup details: [`docs/integrations/`](./docs/integrations/README.md). Telegram / Discord `/olp` slash command setup: [§ Telegram / Discord Usage](#telegram--discord-usage).
 
 ---
 
@@ -80,12 +229,19 @@ OLP distinguishes **Candidate Providers** (declared as intended, not yet pinned)
 
 ## Configuration
 
-_placeholder — full configuration reference lands with Phase 4 (fallback engine)._
-
-OLP reads its config from `~/.olp/config.json`. The minimum useful shape:
+OLP reads `~/.olp/config.json` at startup. § "[Manual install § Step 4](#4-write-a-minimum-config)" above has a working minimum example. The full schema:
 
 ```json
 {
+  "auth": {
+    "allow_anonymous": false,
+    "owner_only_endpoints": ["/health", "/dashboard", "/v0/management/..."],
+    "advertise_anonymous_key": false,
+    "fallback_detail_header_policy": "owner_only"
+  },
+  "providers": {
+    "enabled": { "<provider-key>": true }
+  },
   "routing": {
     "chains": {
       "<requested-model>": [
@@ -96,13 +252,25 @@ OLP reads its config from `~/.olp/config.json`. The minimum useful shape:
     "soft_triggers": {
       "<provider-key>": { "<trigger>": <threshold> }
     }
+  },
+  "streaming": {
+    "heartbeat_interval_ms": 0
   }
 }
 ```
 
-> **Note:** `routing.soft_triggers` thresholds are parsed and stored but have **no runtime effect at v0.1** — the quota polling path (`quotaStatus()` per hop) is deferred to v1.x per [ADR 0004 Amendment 2](./docs/adr/0004-fallback-engine.md#amendment-2--2026-05-24-soft-triggers-deferred-to-v1x-d22). The evaluation logic exists and is tested; only the production data ingestion path is deferred.
+Field guide:
 
-Trigger types, fallback safety, idempotency rules, and the full example config land here when Phase 4 ships. See [ADR 0004 (Fallback Engine Semantics & Safety)](./docs/adr/0004-fallback-engine.md) for the design.
+- **`auth.allow_anonymous`** — default `false`. When false, every request needs a Bearer token; when true, anonymous-tier requests succeed (ADR 0007 § 7). Production posture is `false`.
+- **`auth.owner_only_endpoints`** — list of endpoints that REQUIRE owner-tier auth (non-owner returns 401). The defaults above are minimum sane for production.
+- **`auth.advertise_anonymous_key`** — default `false`. When true (+ `allow_anonymous: true` + a key created with `olp-keys keygen --anonymous --advertise`), `/health.anonymousKey` exposes the plaintext token so `olp-connect <ip>` is zero-config. **Trusted-LAN only** — see [ADR 0011](./docs/adr/0011-anonymous-key-deployment-context.md).
+- **`auth.fallback_detail_header_policy`** — controls `X-OLP-Fallback-Detail` response header emission. `owner_only` (default) only shows tuples to owner identity; debug surface to LAN family without leaking to anonymous.
+- **`providers.enabled`** — flip a provider plugin on. Only enable providers whose CLI you've authenticated; OLP doesn't do its own OAuth.
+- **`routing.chains`** — keyed by the model name your IDE / client requests. Each entry is an ordered list of fallback hops; each hop's `model` is what gets passed to that provider's CLI. F7 fix (D75) — the hop-level `model` field finally overrides the IR's request model during cross-provider fallback.
+- **`routing.soft_triggers`** — parsed and stored but **inert at v0.4.x** — the `quotaStatus()` polling data path is deferred to v1.x per [ADR 0004 Amendment 2](./docs/adr/0004-fallback-engine.md#amendment-2--2026-05-24-soft-triggers-deferred-to-v1x-d22). Startup emits a warn if non-empty so the inert state is visible.
+- **`streaming.heartbeat_interval_ms`** — default `0` (disabled). Set > 0 (e.g. `15000`) to emit SSE keepalive frames during silent windows. Required behind reverse proxies (nginx / Cloudflare Tunnel / Tailscale Funnel) with 60s idle aborts.
+
+See [ADR 0004 (Fallback Engine)](./docs/adr/0004-fallback-engine.md), [ADR 0007 (Multi-key auth)](./docs/adr/0007-multi-key-auth.md), [ADR 0010 (Phase 4 charter)](./docs/adr/0010-phase-4-charter-operator-and-client-ux.md), [ADR 0011 (Anonymous-key deployment)](./docs/adr/0011-anonymous-key-deployment-context.md).
 
 ---
 
@@ -127,6 +295,10 @@ _placeholder — full table lands per-phase as variables are introduced._
 | Variable | Default | Description |
 |---|---|---|
 | `OLP_PORT` | `4567` | HTTP listener port. Moved off `3456` at D60 / v0.4.0 to co-host with OCP — set `OLP_PORT=3456` to restore the pre-D60 default. |
+| `OLP_BIND` | `127.0.0.1` | HTTP listener bind address. **Set to `0.0.0.0` or your LAN IP to accept LAN connections** (required for `olp-connect <ip>` to actually reach the server). Default loopback-only is the secure default. See [ADR 0011 § Deployment configurations](./docs/adr/0011-anonymous-key-deployment-context.md#deployment-configurations-d76-amendment-2026-05-26) for the trust-context table — never bind to a public-internet IP. |
+| `OLP_API_KEY` | (none) | Owner-tier OLP API key (the `olp_...` plaintext from `olp-keys keygen --owner`) used by `olp` CLI subcommands as the bearer for management endpoints. |
+| `OLP_OWNER_TOKEN` | (none) | Fallback used by `olp` CLI if `OLP_API_KEY` is absent. |
+| `OLP_PROXY_URL` | `http://127.0.0.1:$OLP_PORT` | Override target URL for `olp` CLI subcommands (so the same binary works against a remote OLP via SSH tunnel or direct LAN). |
 | `OLP_CLAUDE_BIN` | `claude` (from PATH) | Override path to the `claude` binary (Anthropic provider). Useful when multiple `claude` installs are present. |
 | `OLP_CODEX_BIN` | `codex` (from PATH) | Override path to the `codex` binary (OpenAI provider). |
 | `OLP_VIBE_BIN` | `vibe` (from PATH) | Override path to the `vibe` binary (Mistral provider). |
@@ -353,16 +525,22 @@ Full spec (decision rationale, open questions, risks): `~/.cc-rules/memory/proje
 
 ## Migration from OCP
 
+OLP is OCP's successor. The trigger was Anthropic's 2026-05-14 announcement (effective 2026-06-15) splitting `claude -p` / Agent SDK / third-party agent traffic out of the Pro/Max subscription pool into a separate fixed $100/month Agent SDK credit pool — invalidating OCP's foundational assumption (*"subscription = unlimited within rate limits"*) for its only provider. OLP's structural response is to spread risk across multiple subscriptions whose CLI/programmatic use remains in their main subscription pool, with intelligent fallback when one runs out.
+
+Beyond the billing trigger, OLP is intentionally NOT a commercial multi-tenant SaaS (LiteLLM / OpenRouter / Portkey already serve that market with funding + SOC2), NOT an enterprise gateway competing on provider breadth, NOT a model-capability router ("route to the smartest model" — you pick the model in `routing.chains`), and NOT a conversation-state store (your client manages its own context). See [ADR 0001](./docs/adr/0001-project-founding.md) for the founding decision and [`ALIGNMENT.md`](./ALIGNMENT.md) for the constitution that governs every plugin / IR / entry-surface change.
+
+### Migrating an existing OCP install
+
 _placeholder — `scripts/migrate-from-ocp.mjs` lands with Phase 7 (📋 planned, not yet authored)._
 
 Anticipated user-facing flow (target: <5 minutes):
 
 1. Stop OCP (`launchctl bootout` the OCP service or `ocp stop`).
-2. Install OLP.
-3. Run `olp migrate-from-ocp` — copies `~/.ocp/keys/` to `~/.olp/keys/` and points provider plugins at OCP's existing auth artifacts where applicable.
-4. Start OLP. Clients pointing at port 4567 (or 3456 with `OLP_PORT=3456`) keep working; their existing OLP API keys remain valid. **Note (v0.4.0+):** default port moved from 3456 → 4567 so OCP and OLP can co-host during migration; set `OLP_PORT=3456` if you want the pre-D60 default.
+2. Install OLP (per [§ Manual install](#manual-install-5-10-min) above).
+3. Run `olp migrate-from-ocp` — will copy `~/.ocp/keys/` to `~/.olp/keys/` and point provider plugins at OCP's existing auth artifacts where applicable.
+4. Start OLP. Clients pointing at port 4567 (or 3456 with `OLP_PORT=3456`) keep working; their existing OLP API keys remain valid.
 
-OCP's cache directory is *not* migrated: OLP's cache key format includes provider+model and warms cold naturally. OCP enters maintenance mode (stability fixes only) when OLP v0.1 ships; new development happens in OLP.
+**Default port moved 3456 → 4567 at v0.4.0** so OCP and OLP can co-host on the same machine during the migration window — set `OLP_PORT=3456` if you want the pre-D60 default. OCP's cache directory is *not* migrated: OLP's cache key format includes provider+model and warms cold naturally. OCP enters maintenance mode (stability fixes only) when OLP v0.1 ships; new development happens in OLP.
 
 ---
 

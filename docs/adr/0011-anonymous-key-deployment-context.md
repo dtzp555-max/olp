@@ -214,6 +214,24 @@ alongside the "using server-advertised key" notice.
 
 ---
 
+## Deployment configurations (D76 amendment, 2026-05-26)
+
+Original ADR 0011 referenced a `BIND_ADDRESS` concept that did not exist in the v0.4.0–v0.4.2 codebase — the server was hard-coded to `server.listen(PORT, '127.0.0.1', ...)`. D76 closes this gap by adding the `OLP_BIND` env var (default `127.0.0.1`), making the deployment-context discussion below operational rather than aspirational.
+
+Three deployment configurations are supported:
+
+| `OLP_BIND` value | Reachability | Anonymous-key publication |
+|---|---|---|
+| `127.0.0.1` (default) | Loopback only | Safe with any auth posture (no LAN exposure at all) |
+| RFC1918 IP / tailnet IP / `0.0.0.0` on a trusted LAN | LAN clients only | Safe when `advertise_anonymous_key: true` — the documented "trusted-LAN" zero-config family onboarding flow |
+| Public IP / `0.0.0.0` on a public-facing host | Public internet | **Incompatible with `advertise_anonymous_key: true`.** Operator MUST keep `advertise_anonymous_key: false` (default). |
+
+The server emits a startup warn event `anonymous_key_advertised_with_lan_bind` when `OLP_BIND` is non-loopback AND `advertise_anonymous_key: true` (per the `lib/keys.mjs` + `server.mjs` checks). The warn is a **checkpoint, not a hard gate** — the server cannot tell from the bind address alone whether the operator is on a trusted LAN (RFC1918 / tailnet) or has accidentally exposed a public IP. The Re-evaluation trigger #1 below escalates to a hard gate when OLP gains a public-internet deployment mode.
+
+`olp-connect <ip>` consumes `/health.anonymousKey` over the network — therefore requires `OLP_BIND` to include the LAN interface on the server side. Without setting `OLP_BIND=<lan-ip>` (or `0.0.0.0`), `olp-connect <ip>` will fail with `connect ECONNREFUSED` because the server only accepts loopback connections.
+
+---
+
 ## Re-evaluation triggers
 
 Re-open this ADR when ANY of the following fires:

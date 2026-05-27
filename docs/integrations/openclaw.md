@@ -15,8 +15,8 @@ The OpenClaw config differs significantly depending on whether OpenClaw runs on 
 |---|---|---|
 | OpenClaw runs on | the OLP server host (loopback) | a different machine (Mac mini, laptop, etc.) |
 | OLP server runs on | localhost (same host) | a remote host (e.g. PI231) |
-| `claude-local` baseUrl | `http://127.0.0.1:4567/v1` | `http://<server-ip>:4567/v1` |
-| Auth | `authHeader: false` (loopback trusted), OR anonymous-key if `auth.allow_anonymous: true` | **must** explicitly inject `Authorization: Bearer olp_…` via the `headers` field (NOT `apiKey` — see § Gotchas below) |
+| `olp-claude` baseUrl | `http://127.0.0.1:4567/v1` | `http://<server-ip>:4567/v1` |
+| Auth | `authHeader: false` (loopback trusted), OR anonymous-key if `auth.allow_anonymous: true` | `apiKey: "${OLP_OPENCLAW_BOT_TOKEN}"` env-var reference (NOT raw string, NOT `OPENAI_API_KEY` — see § Gotchas) |
 | `/olp` slash plugin proxyUrl | `http://127.0.0.1:4567` | `http://<server-ip>:4567` |
 
 ## `/olp` slash commands you get
@@ -87,13 +87,13 @@ Edit `~/.openclaw/openclaw.json`:
 }
 ```
 
-For LLM routing through OLP, add (or update) the `claude-local` provider so the bot's default agent goes through OLP-spawned `claude -p`:
+For LLM routing through OLP, add (or update) the `olp-claude` provider so the bot's default agent goes through OLP-spawned `claude -p`:
 
 ```json
 {
   "models": {
     "providers": {
-      "claude-local": {
+      "olp-claude": {
         "baseUrl": "http://127.0.0.1:4567/v1",
         "api": "openai-completions",
         "authHeader": false,
@@ -145,7 +145,31 @@ node bin/olp-keys.mjs keygen --owner --name=openclaw-<hostname>-bot
 
 Capture the plaintext — shown exactly once. **This token will live in `~/.openclaw/openclaw.json` on your OpenClaw host**; pick a name that makes it independently revocable if that host is lost/compromised.
 
-### B3. Configure (remote recipe)
+### B3. Set the bot-token env var (`OLP_OPENCLAW_BOT_TOKEN`)
+
+OpenClaw's canonical pattern for custom-provider auth is `apiKey: "${VAR_NAME}"` — an env-var reference, NOT a raw token. Choose a **custom** variable name (NOT `OPENAI_API_KEY` — OpenClaw service-manages that one and clobbers it with its own ChatGPT key on every restart). Convention: `OLP_OPENCLAW_BOT_TOKEN`.
+
+**macOS (gateway under launchd)**:
+
+```bash
+launchctl setenv OLP_OPENCLAW_BOT_TOKEN olp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+Add the same `export` to `~/.zshrc` so it survives reboot:
+
+```bash
+export OLP_OPENCLAW_BOT_TOKEN=olp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+**Linux (gateway under systemd-user)**: drop a file at `~/.config/environment.d/openclaw-olp.conf`:
+
+```
+OLP_OPENCLAW_BOT_TOKEN=olp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+Restart the gateway service so it picks up the new env.
+
+### B4. Configure `~/.openclaw/openclaw.json`
 
 Edit `~/.openclaw/openclaw.json` on the OpenClaw host:
 
@@ -165,12 +189,10 @@ Edit `~/.openclaw/openclaw.json` on the OpenClaw host:
   },
   "models": {
     "providers": {
-      "claude-local": {
+      "olp-claude": {
         "baseUrl": "http://<olp-server-ip>:4567/v1",
         "api": "openai-completions",
-        "headers": {
-          "Authorization": "Bearer olp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-        },
+        "apiKey": "${OLP_OPENCLAW_BOT_TOKEN}",
         "models": [
           { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (via OLP)", "input": ["text"],
             "contextWindow": 200000, "maxTokens": 16384, "api": "openai-completions",
@@ -188,14 +210,14 @@ Edit `~/.openclaw/openclaw.json` on the OpenClaw host:
 }
 ```
 
-⚠️ **Use `headers.Authorization`, NOT `apiKey`** — see § Gotchas: OPENAI_API_KEY clobber.
+Note: the `plugins.entries.olp.config.apiKey` field (line 11) IS allowed to be a raw token — it's a separate code path that doesn't suffer the service-managed-env clobber problem. Only the `models.providers.<id>.apiKey` field needs the `${VAR}` env-var-reference workaround.
 
-### B4. Confirm the default agent model is on `claude-local`
+### B5. Confirm the default agent model is on `olp-claude`
 
 Check `agents.defaults.model.primary` in `openclaw.json`. It should be something like:
 
 ```json
-{ "agents": { "defaults": { "model": { "primary": "claude-local/claude-sonnet-4-6" } } } }
+{ "agents": { "defaults": { "model": { "primary": "olp-claude/claude-sonnet-4-6" } } } }
 ```
 
 If it's pointing at one of OpenClaw's stock providers (`openai/...`, `anthropic/...`, `github-copilot/...`), free-text chat will **bypass OLP entirely** and hit your direct API account. You'll see no traffic in OLP's `/dashboard` and `/olp usage` will show no recent activity.
@@ -219,18 +241,16 @@ If you see "Something went wrong" — see § Troubleshooting below.
 
 ## Using codex / OpenAI models through OLP
 
-By default the `claude-local` provider only knows about Claude models. To route OpenAI / codex models through OLP (so bot calls to `gpt-5.5` etc. spawn `codex exec --json` on the OLP server and benefit from per-key audit + quota tracking), add a second provider:
+By default the `olp-claude` provider only knows about Claude models. To route OpenAI / codex models through OLP (so bot calls to `gpt-5.5` etc. spawn `codex exec --json` on the OLP server and benefit from per-key audit + quota tracking), add a second provider:
 
 ```json
 {
   "models": {
     "providers": {
-      "olp-openai": {
+      "olp-codex": {
         "baseUrl": "http://<olp-server-ip>:4567/v1",
         "api": "openai-completions",
-        "headers": {
-          "Authorization": "Bearer olp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-        },
+        "apiKey": "${OLP_OPENCLAW_BOT_TOKEN}",
         "models": [
           { "id": "gpt-5.5", "name": "GPT 5.5 (via OLP→codex)", "input": ["text"],
             "contextWindow": 200000, "maxTokens": 16384, "api": "openai-completions",
@@ -248,49 +268,52 @@ By default the `claude-local` provider only knows about Claude models. To route 
   "agents": {
     "defaults": {
       "models": {
-        "olp-openai/gpt-5.5": { "alias": "OLP GPT 5.5" },
-        "olp-openai/gpt-5.4-mini": { "alias": "OLP GPT 5.4 mini" },
-        "olp-openai/gpt-5.3-codex": { "alias": "OLP Codex" }
+        "olp-codex/gpt-5.5": { "alias": "OLP GPT 5.5" },
+        "olp-codex/gpt-5.4-mini": { "alias": "OLP GPT 5.4 mini" },
+        "olp-codex/gpt-5.3-codex": { "alias": "OLP Codex" }
       }
     }
   }
 }
 ```
 
-After restart, `/models olp-openai/gpt-5.5` in Telegram switches the session to GPT 5.5 spawned via OLP. The available IDs are the ones OLP's `/v1/models` returns — typically `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`. Query your OLP server to see the live list:
+After restart, type `/models` in Telegram and pick `olp-codex/gpt-5.5` from the menu that appears. **`/models` is menu-driven — it does not accept inline model names**; typing `/models olp-codex/gpt-5.5` won't directly switch you. The available IDs are the ones OLP's `/v1/models` returns — typically `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`. Query your OLP server to see the live list:
 
 ```bash
 curl -s -H "Authorization: Bearer olp_…" http://<olp-server-ip>:4567/v1/models | jq '.data[].id'
 ```
 
-**Why not use OpenClaw's stock `openai` provider?** OpenClaw's built-in `openai-codex` provider uses the local ChatGPT account (via the `sk-proj-…` API key OpenClaw stores) and bypasses your OLP server entirely. You'd lose per-key audit + per-key quota visibility. `olp-openai` keeps everything routed through your central OLP for observability.
+**Why not use OpenClaw's stock `openai` provider?** OpenClaw's built-in `openai-codex` provider uses the local ChatGPT account (via the `sk-proj-…` API key OpenClaw stores) and bypasses your OLP server entirely. You'd lose per-key audit + per-key quota visibility. `olp-codex` keeps everything routed through your central OLP for observability.
 
 ---
 
 ## Gotchas
 
-### OpenClaw service-managed env clobbers `OPENAI_API_KEY`
+### Auth must use `apiKey: "${VAR}"` env-var reference — three failure modes to avoid
 
-If you set the OLP-routing provider with `authHeader: true` + `apiKey: "olp_…"` instead of `headers.Authorization`, OpenClaw will SOMETIMES route OK on loopback (`authHeader: false`) but in client-mode you may hit `401: OLP API key is invalid or has been revoked` even though your token is fresh.
+Custom OpenAI-compatible providers in OpenClaw have a fragile auth path. Three patterns that **don't work** + the one that **does**:
 
-**Root cause**: OpenClaw declares `OPENCLAW_SERVICE_MANAGED_ENV_KEYS=DEEPSEEK_API_KEY,OPENAI_API_KEY` in its gateway-process env. The service-manager strongly owns `OPENAI_API_KEY` and overwrites whatever your `launchctl setenv` set, with whatever ChatGPT key you've authed OpenClaw against. When the `openai-completions` provider implementation builds the request's `Authorization` header, it can fall back to `process.env.OPENAI_API_KEY` — which is now your ChatGPT key, not the OLP token. OLP rejects with 401.
+**❌ `apiKey: "olp_<raw-token>"`** — raw string. Silently bypassed in some routing paths because OpenClaw treats `OPENAI_API_KEY` as service-managed (`OPENCLAW_SERVICE_MANAGED_ENV_KEYS=DEEPSEEK_API_KEY,OPENAI_API_KEY`), and certain model id patterns (notably `gpt-*`) fall back to that env var instead of using your explicit `apiKey`. Symptom: OLP audit shows the request as `__anonymous__` instead of your owner key. Confirmed via [openclaw#41157](https://github.com/openclaw/openclaw/issues/41157) (Gemini openai-completions Authorization not sent) and [#1669](https://github.com/openclaw/openclaw/issues/1669) (Ollama provider ignores apiKey, hardcodes Bearer). Both unresolved upstream as of OpenClaw v2026.5.
 
-**The fix is `headers.Authorization`** — the per-provider `headers` map is applied at request-construction time and beats whatever env-var fallback would compute. From OpenClaw source:
+**❌ `headers: { "Authorization": "Bearer olp_<raw-token>" }`** — works for SOME provider/model combinations (e.g., model id `claude-sonnet-4-6`) but breaks for openai-shape model ids (`gpt-5.5` etc.) which take a different code path that ignores the `headers` field. Mixed behavior is worse than no behavior.
 
-```javascript
-const providerHeaders = sanitizeModelHeaders(providerConfig.headers, { stripSecretRefMarkers: true });
-// providerHeaders merged into outgoing request — explicit override wins
-```
+**❌ Setting `OPENAI_API_KEY=olp_…`** in the gateway env. OpenClaw service-manages that variable and overwrites your value with the user's ChatGPT key on every gateway start.
 
-If you want to stick with `apiKey` for stylistic reasons, you'd need to remove `OPENAI_API_KEY` from the OpenClaw service-managed list — not recommended; that key is load-bearing for OpenClaw's own model providers.
+**✅ `apiKey: "${OLP_OPENCLAW_BOT_TOKEN}"`** — env-var reference with a **custom** variable name (NOT `OPENAI_API_KEY`). OpenClaw resolves the reference at request-construction time, before any service-managed-env logic runs. Both `olp-claude/*` (Claude models) and `olp-codex/*` (OpenAI models) auth correctly with this pattern. Verified end-to-end 2026-05-27: OLP audit shows requests attributed to the correct bot key for both provider blocks.
+
+OpenClaw docs call out this as the canonical pattern: see [docs.openclaw.ai/concepts/model-providers](https://docs.openclaw.ai/concepts/model-providers) "API key or SecretRef/env reference".
 
 ### Default agent model still points at a removed provider
 
 If you've removed a provider (e.g., torn down a co-located OCP server) but the bot's default agent model still references that provider, free-text messages will fail with "Something went wrong while processing your request." Check `agents.defaults.model.primary` and update it to a provider that exists.
 
-### `/new` does not reset model selection
+### `/new` does not reset model selection — use `/reset`
 
-OpenClaw's `/new` resets the **conversation context** but **preserves** the session's `/models` selection. If a session has been switched to a model that no longer works (revoked / removed), `/new` won't help — use `/reset` (resets both context and model selection) or `/models <working-model>`.
+OpenClaw's `/new` resets the **conversation context** but **preserves** the session's `/models` selection. If a session has been switched to a model that no longer works (revoked / removed), `/new` won't help — use `/reset` (resets both context and model selection).
+
+### `/models` is menu-only — does not accept inline model names
+
+The OpenClaw `/models` command in Telegram is **menu-driven**: typing `/models` pops a model-picker menu where you tap the model name. Typing `/models olp-codex/gpt-5.5` does NOT switch — it'll open the picker. The bot's own success-message after a pick may say *"Use `/model olp-codex/gpt-5.5 --runtime <runtime>` to switch harnesses."* — **that command form is not actually accepted by the bot**; ignore that line.
 
 ### OpenClaw v2026.5+ requires `openclaw.extensions` in `package.json`
 
@@ -334,9 +357,11 @@ If you run the OpenClaw gateway under launchd or systemd with custom env vars, s
 | `/olp status` returns 401 | bot key revoked / wrong / missing | Mint new key on OLP host; update `plugins.entries.olp.config.apiKey`; restart gateway |
 | `/olp status` returns 403 | bot key is guest-tier, not owner-tier | Generate owner-tier key (`olp-keys keygen --owner --name=...`); update config |
 | `OLP error: fetch failed` | `proxyUrl` unreachable from the gateway host | `curl http://<proxyUrl>/health` from the gateway host to confirm reachability; check firewall / OLP server `OLP_BIND=0.0.0.0` for LAN access |
-| Bot free-text chat returns "Something went wrong" but `/olp ...` works | Default agent model points at a broken provider (e.g., a removed OCP install) | Check `agents.defaults.model.primary` in `openclaw.json`; update to `claude-local/claude-sonnet-4-6` or another working provider |
-| Free-text returns `HTTP 401: OLP API key is invalid` despite fresh key | `apiKey` field is being shadowed by OpenClaw's service-managed `OPENAI_API_KEY` env var | Switch to `headers.Authorization: "Bearer olp_…"` in the provider config (see § Gotchas) |
-| Bot routes to ChatGPT account directly, not through OLP | Provider config uses OpenClaw stock `openai-codex` instead of a custom OLP-pointing provider | Add `olp-openai` provider per § Using codex / OpenAI models through OLP |
+| Bot free-text chat returns "Something went wrong" but `/olp ...` works | Default agent model points at a broken provider (e.g., a removed OCP install) | Check `agents.defaults.model.primary` in `openclaw.json`; update to `olp-claude/claude-sonnet-4-6` or another working provider |
+| Free-text returns `HTTP 401: OLP API key is invalid` despite fresh key | Raw-string `apiKey: "olp_..."` shadowed by service-managed env clobber; or `headers.Authorization` bypassed for `gpt-*` model ids | Switch `models.providers.<id>.apiKey` to env-var reference: `"${OLP_OPENCLAW_BOT_TOKEN}"` (see § Gotchas: Auth) |
+| OLP audit shows `key_id=__anonymous__` for traffic that should be owner-attributed | Same root cause as 401 — raw-string apiKey or headers bypassed in some routing paths | Switch to env-var-reference `apiKey: "${VAR}"` pattern + verify `launchctl getenv OLP_OPENCLAW_BOT_TOKEN` returns the expected token |
+| Bot routes to ChatGPT account directly, not through OLP | Provider config uses OpenClaw stock `openai-codex` instead of a custom OLP-pointing provider | Add `olp-codex` provider per § Using codex / OpenAI models through OLP |
+| `/models olp-codex/gpt-5.5` typed inline doesn't work | OpenClaw `/models` is menu-only, doesn't accept inline names | Type `/models`, tap the model from the picker menu that appears |
 
 ## Cross-references
 

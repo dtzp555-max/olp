@@ -544,7 +544,7 @@ except: print('')" 2>/dev/null || echo "")
       # D74 P1-2: validate server-advertised token shape before consuming.
       # A hostile or misconfigured server could otherwise inject arbitrary
       # strings into the user's rc file via the `anonymousKey` field.
-      if ! validate_olp_token "$anon_key" "/health.anonymousKey from $remote_host"; then
+      if ! validate_olp_token "$anon_key" "/health.anonymousKey from ${host}:${port}"; then
         log_err "Refusing to consume malformed advertised key. Use --key explicitly or contact the OLP operator."
         exit 2
       fi

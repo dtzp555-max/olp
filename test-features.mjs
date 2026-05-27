@@ -343,6 +343,21 @@ describe('openAIToIR translation', () => {
     assert.equal(ir.messages[2].role, 'assistant');
   });
 
+  it('rejects an unknown role at entry — normalize didn\'t accidentally widen allow-list', () => {
+    // Negative control for Amendment 3 — without this pin, a future addition
+    // to normalizeRole that returns `role` as-is for unknown inputs would silently
+    // widen the IR role allow-list. Confirms developer→system mapping is the only
+    // entry-surface escape hatch.
+    assert.throws(
+      () => openAIToIR({
+        model: 'm',
+        messages: [{ role: 'admin', content: 'I am god.' }],
+      }),
+      err => err instanceof BadRequestError && /role must be one of/.test(err.message),
+      'unknown role should still produce BadRequestError'
+    );
+  });
+
   it('translates request with tools', () => {
     const ir = openAIToIR({
       model: 'm',

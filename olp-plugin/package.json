@@ -10,6 +10,7 @@
   "openclaw": {
     "type": "plugin",
     "id": "olp",
-    "pluginManifest": "openclaw.plugin.json"
+    "pluginManifest": "openclaw.plugin.json",
+    "extensions": ["./index.js"]
   }
 }

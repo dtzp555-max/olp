@@ -60,14 +60,20 @@ Capture the printed plaintext token — it is shown exactly once.
 
 ### 3. Configure
 
-Edit `~/.openclaw/openclaw.json`:
+Edit `~/.openclaw/openclaw.json` — register the plugin in both `plugins.allow` and `plugins.entries` (the modern OpenClaw schema; older revisions of this doc only listed `plugins.olp`, which is not picked up):
 
 ```json
 {
   "plugins": {
-    "olp": {
-      "proxyUrl": "http://127.0.0.1:4567",
-      "apiKey": "olp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    "allow": ["...", "olp"],
+    "entries": {
+      "olp": {
+        "enabled": true,
+        "config": {
+          "proxyUrl": "http://127.0.0.1:4567",
+          "apiKey": "olp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+        }
+      }
     }
   }
 }
@@ -86,6 +92,8 @@ The plugin is now active. Try `/olp help` in your bot's chat.
 - **`openclaw gateway restart` is required after install.** OpenClaw caches
   plugin discovery at gateway start. `openclaw plugins reload` does not
   guarantee a fresh import of the plugin module.
+
+- **OpenClaw v2026.5+ requires `openclaw.extensions` in `package.json`.** OpenClaw versions ≥ 2026.5.22 enforce a stricter plugin-manifest validation at `openclaw plugins install` time. If `Option A` fails with `package.json missing openclaw.extensions` despite recent OLP releases, your local `olp-plugin/package.json` may predate the v0.5.x fix that adds `"extensions": ["./index.js"]` to the `openclaw` block. Pull latest OLP main (`git pull` in your OLP clone) and retry, or fall through to `Option B` symlink which works against any plugin shape. (Original drift event: 2026-05-27, see commit history of `olp-plugin/package.json`.)
 
 - **Owner key revocation kicks the plugin out immediately.** If you revoke
   the bot's owner key (`npx olp-keys revoke --id=<id>`), the next `/olp

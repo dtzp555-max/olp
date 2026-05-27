@@ -8,7 +8,7 @@
 3. **Where** does the work live in the tree today (file + anchor).
 4. **When** does it need to land (trigger: load profile, security event, governance amendment).
 
-**Reading order for a v1.x sprint kickoff.** As of 2026-05-26, #1 (streaming SF, D57+D58), #2 (multi-key auth, Phase 2), #4 and #7 (closed in D56), and #8 (dashboard enrichment, D82 Phase 5) are CLOSED. Remaining v1.x scope: #3 (soft trigger reactivation), #5 (provider cacheKeyFields mask), #6 (streaming SPAWN_FAILED salvage — unbundled from #1 at #1 close). All three remaining items have explicit "trigger to start" gates that have not fired.
+**Reading order for a v1.x sprint kickoff.** As of 2026-05-27, #1 (streaming SF, D57+D58), #2 (multi-key auth, Phase 2), #4, #7, and #8 are CLOSED. Remaining v1.x scope: #3 (soft trigger reactivation), #5 (provider cacheKeyFields mask), #6 (streaming SPAWN_FAILED salvage — unbundled from #1 at #1 close). All three remaining items have explicit "trigger to start" gates that have not fired.
 
 ---
 
@@ -107,8 +107,9 @@
   - `lib/audit-query.mjs` — current `aggregateRequests` is wall-clock-window; needs session-window variant
 - **Trigger to start.** ANY of: (a) Anthropic publishes a documented `claude usage` CLI or `api.anthropic.com/v1/usage` endpoint, (b) maintainer hits real "I want to see quota right now" pain often enough to design without per-provider truth (audit-derived only), (c) Phase 5 multi-tenant adds per-key spend limits and the dashboard needs to surface those.
 
-## #7 — AUTH_MISSING tuple path test coverage (D40 follow-up)
+## #7 — AUTH_MISSING tuple path test coverage (D40 follow-up) — ✅ **CLOSED (D56, 2026-05-27)**
 
+- **Status.** Closed. Test shipped at D56 (PR `f4-cli-plugin-quota-v2-plus-auth-missing-test`, 2026-05-27). Test: `test-features.mjs` line 6255 — `'engine: AUTH_MISSING terminates chain, fallbackDetail tuple records trigger_type:"auth_missing" (D56, v1.x roadmap #7)'`. Asserts: `result.fallbackDetail[0].code === 'AUTH_MISSING'`, `result.fallbackDetail[0].trigger_type === 'auth_missing'`, `result.fallbackHops === 0` (no advance). The test was already present in the file before this PR closed the roadmap entry.
 - **What.** Dedicated test in `test-features.mjs` Suite D40 that asserts the `fallbackDetail` tuple records the AUTH_MISSING path with `trigger_type: 'auth_missing'`. D40 reviewer flagged this as the last gap in the engine-path matrix; code is structurally correct, just lacks an explicit pin.
 - **Why deferred.** Low priority — the AUTH_MISSING early-return branch has the tuple push BEFORE it (verified in D40 reviewer pass), so coverage is implicit via the other engine-path tests. A 3-line dedicated test would make the pin explicit.
 - **Design.** No ADR needed. ~5-line test addition.

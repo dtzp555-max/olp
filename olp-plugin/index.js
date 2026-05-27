@@ -169,26 +169,101 @@ export function fmtHealth(body) {
   return out;
 }
 
+/**
+ * formatResetCountdown(epochSeconds) → human-readable reset countdown.
+ *
+ * Mirrors bin/olp.mjs + dashboard.html versions. Five ranges:
+ *   past / < 1h / < 24h / < 7d / ≥ 7d
+ *
+ * Authority: ADR 0008 Amendment 2 (quota_v2 shape), ported from dashboard.html (D82).
+ * No external deps. Duplicated here intentionally (olp-plugin ships separately).
+ */
+export function pluginFormatResetCountdown(epochSeconds) {
+  if (epochSeconds == null) return "—";
+  const nowMs = Date.now();
+  const targetMs = epochSeconds * 1000;
+  const diffMs = targetMs - nowMs;
+  if (diffMs <= 0) return "resetting now";
+  const diffMin = Math.floor(diffMs / 60000);
+  const diffHr  = Math.floor(diffMin / 60);
+  const diffDay = Math.floor(diffHr  / 24);
+  if (diffMin < 60) return `resets in ${diffMin}m`;
+  if (diffHr < 24) {
+    const remMin = diffMin - diffHr * 60;
+    if (remMin === 0) return `resets in ${diffHr}h`;
+    return `resets in ${diffHr}h ${remMin}m`;
+  }
+  const target = new Date(targetMs);
+  const timeStr = target.toLocaleString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
+  if (diffDay < 7) {
+    const dayStr = target.toLocaleString("en-US", { weekday: "short" });
+    return `resets ${dayStr} ${timeStr}`;
+  }
+  const dateStr = target.toLocaleString("en-US", { month: "short", day: "numeric" });
+  return `resets ${dateStr} ${timeStr}`;
+}
+
 export function fmtUsage(body) {
   let out = "OLP usage (24h)\n";
   out += "─────────────────────────────\n";
   const w = body.window_24h ?? body.usage_24h ?? {};
-  if (w.requests !== undefined) {
+  if (w.request_count !== undefined) {
+    out += `Requests:  ${w.request_count}\n`;
+    const c = body.cache_hit_24h ?? {};
+    if (typeof c.hit_rate === "number") {
+      out += `Cache hit: ${(c.hit_rate * 100).toFixed(1)}%\n`;
+    }
+  } else if (w.requests !== undefined) {
     out += `Requests:  ${w.requests}\n`;
     out += `Cache hit: ${w.cache_hit_rate != null ? `${(w.cache_hit_rate * 100).toFixed(1)}%` : "?"}\n`;
     out += `Fallbacks: ${w.fallbacks ?? "?"}\n`;
   } else if (typeof body.cache_hit_24h === "number") {
-    // Dashboard-data shape: cache_hit_24h is a rate ∈ [0,1]
+    // Legacy: cache_hit_24h as a bare number
     out += `Cache hit (24h): ${(body.cache_hit_24h * 100).toFixed(1)}%\n`;
   }
-  if (Array.isArray(body.quota) && body.quota.length > 0) {
+
+  // F4: prefer quota_v2 when present (server v0.5.0+), fall back to legacy quota.
+  // Authority: ADR 0008 Amendment 2 (quota_v2 shape).
+  if (Array.isArray(body.quota_v2) && body.quota_v2.length > 0) {
+    out += `\nPer-provider quota (live):\n`;
+    for (const p of body.quota_v2) {
+      const name = String(p.provider ?? "?").toUpperCase().padEnd(10);
+      const status = p.status ?? "unavailable";
+      if (status === "unavailable") {
+        out += `  ${name} unavailable  ${p.reason ?? "no public quota api"}\n`;
+      } else if (status === "unreachable") {
+        const fk = p.failure?.kind ?? "unknown";
+        out += `  ${name} no cached data — failure: ${fk}\n`;
+      } else {
+        // live or stale
+        const util = p.utilization ?? {};
+        const reset = p.reset ?? {};
+        const parts = [];
+        for (const window of ["5h", "7d"]) {
+          const frac = util[window];
+          const resetEpoch = reset[window];
+          if (frac != null) {
+            const pct = `${Math.round(frac * 100)}%`;
+            const rst = pluginFormatResetCountdown(resetEpoch);
+            parts.push(`${window}: ${pct} (${rst})`);
+          }
+        }
+        const staleNote = status === "stale"
+          ? `  ⚠ stale (${p.failure?.kind ?? "unknown"})`
+          : "";
+        out += `  ${name} ${status.padEnd(6)}  ${parts.join("   ")}${staleNote}\n`;
+      }
+    }
+  } else if (Array.isArray(body.quota) && body.quota.length > 0) {
+    // Legacy fallback for pre-v0.5.0 servers
     out += `\nPer-provider quota:\n`;
     for (const q of body.quota) {
       const pct = typeof q.percent_used === "number" ? q.percent_used : null;
       const bar0 = pct != null ? ` ${bar(pct / 100, 12)} ${pct.toFixed(0)}%` : " no quota api";
-      out += `  ${String(q.name ?? "?").padEnd(10)}${bar0}\n`;
+      out += `  ${String(q.provider ?? q.name ?? "?").padEnd(10)}${bar0}\n`;
     }
   }
+
   if (Array.isArray(body.top_fallback_chains_24h) && body.top_fallback_chains_24h.length > 0) {
     out += `\nTop fallback chains (24h):\n`;
     for (const f of body.top_fallback_chains_24h.slice(0, 5)) {

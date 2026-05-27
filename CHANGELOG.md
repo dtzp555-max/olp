@@ -4,7 +4,26 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-(empty — Phase 6 entries land here once Phase 6 opens)
+### F4 — `bin/olp.mjs` + `olp-plugin/index.js` migration to `quota_v2` shape
+
+**Codex post-v0.5.0 review Q4.** Both CLI surfaces (`olp usage` and `/olp usage`) previously fell through to "no quota api" for every provider because they read the legacy `body.quota` shape, which never carries `percent_used` or meaningful `available` data. Now that the server (v0.5.0+) emits `body.quota_v2` per ADR 0008 Amendment 2, both surfaces prefer `quota_v2` and fall back to legacy `quota` on older servers.
+
+- **`bin/olp.mjs cmdUsage`**: when `body.quota_v2` is present (non-empty array), renders per-provider rows with status (`live` / `stale` / `unreachable` / `unavailable`), 5h and 7d utilization percentages with color-coding (green < 50% / yellow 50–80% / red ≥ 80%), reset countdowns, binding claim, and ⚠ stale / ❌ unreachable annotations. Legacy `body.quota` path preserved as fallback for pre-v0.5.0 servers. `formatResetCountdown(epochSeconds)` added — 5-range formatter (past / <1h / <24h / <7d / ≥7d), ported from `dashboard.html` D82, kept in-file (no shared lib).
+
+- **`olp-plugin/index.js fmtUsage()`**: same migration — `quota_v2` rows render as one-line plain text per provider (no ANSI; Telegram/Discord safe). `pluginFormatResetCountdown(epochSeconds)` added; intentionally duplicated (plugin ships as a separate package). Legacy `body.quota` fallback preserved.
+
+### v1.x roadmap #7 — AUTH_MISSING tuple path test coverage — ✅ CLOSED
+
+The dedicated AUTH_MISSING engine test (asserting `fallbackDetail[0].trigger_type === 'auth_missing'`) was already shipped at D56 (`test-features.mjs` line 6255). This item closes the roadmap entry with a date stamp and PR reference per the tracker convention. No code changes — documentation only.
+
+### Tests
+
+- Suite 40 (9 new tests): `40a`–`40i` covering `cmdUsage` quota_v2 live/stale/unreachable/unavailable parse, legacy fallback, `pluginFormatResetCountdown` and `formatResetCountdown` 5-range coverage, olp-plugin `fmtUsage` quota_v2 + legacy paths. 759 → 768 tests, 0 fail.
+
+### Authority
+
+- F4: codex post-v0.5.0 review Q4 (PR #58 review); ADR 0008 Amendment 2 (quota_v2 shape).
+- #7: `docs/v1x-roadmap.md` § "#7 — AUTH_MISSING tuple path test coverage (D40 follow-up)".
 
 ## v0.5.1 — 2026-05-27
 

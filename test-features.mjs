@@ -16900,3 +16900,366 @@ describe('Suite 39 — D83 dashboard rendering smoke tests (Phase 5, ADR 0012 D8
       '39h: dashboard HTML must contain legacy quota fallback path (graceful-degradation proof)');
   });
 });
+
+// ── Suite 40: F4 CLI/plugin quota_v2 migration + v1.x #7 AUTH_MISSING test pin ─
+//
+// Codex post-v0.5.0 review Q4: bin/olp.mjs cmdUsage and olp-plugin/index.js
+// fmtUsage both read legacy body.quota (never has percent_used or available data),
+// so the display always fell through to "no quota api" even when anthropic's live
+// quota was visible on the dashboard. F4 adds consumption of body.quota_v2 (server
+// v0.5.0+ shape per ADR 0008 Amendment 2) with graceful fallback to body.quota on
+// older servers.
+//
+// v1.x roadmap #7 was already closed at D56 (test at line 6255); this suite
+// references that test by description. The roadmap entry closure (marking ✅ CLOSED)
+// happens in docs/v1x-roadmap.md (committed alongside these tests).
+//
+// Tests:
+//   40a — cmdUsage renders quota_v2 live rows (mock server)
+//   40b — cmdUsage falls back to legacy body.quota when quota_v2 absent
+//   40c — olp-plugin fmtUsage parses quota_v2 live row
+//   40d — olp-plugin fmtUsage falls back to legacy body.quota when quota_v2 absent
+//   40e — formatResetCountdown past / <1h / <24h / <7d / ≥7d ranges
+//   40f — olp-plugin pluginFormatResetCountdown parallel coverage
+//   40g — cmdUsage renders quota_v2 stale row with ⚠ stale note
+//   40h — cmdUsage renders quota_v2 unreachable row with ❌ indicator
+//   40i — cmdUsage renders quota_v2 unavailable row with reason
+
+import { runCli as runOlpCli40, formatResetCountdown as olpFormatResetCountdown } from './bin/olp.mjs';
+import { fmtUsage as plugFmtUsage40, pluginFormatResetCountdown } from './olp-plugin/index.js';
+
+// ── Helper: tiny HTTP server that responds to one request with a static JSON body ──
+import { createServer as createHttpServerS40 } from 'node:http';
+
+function makeJsonServer40(responseBody) {
+  return new Promise((resolve, reject) => {
+    const srv = createHttpServerS40((req, res) => {
+      const body = typeof responseBody === 'function' ? responseBody(req) : responseBody;
+      const raw = JSON.stringify(body);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(raw) });
+      res.end(raw);
+    });
+    srv.listen(0, '127.0.0.1', () => {
+      const port = srv.address().port;
+      resolve({
+        port,
+        url: `http://127.0.0.1:${port}`,
+        close: () => new Promise(r => srv.close(r)),
+      });
+    });
+    srv.once('error', reject);
+  });
+}
+
+// ── quota_v2 fixture shapes ──
+const QUOTA_V2_LIVE = [
+  {
+    provider: 'anthropic',
+    status: 'live',
+    schema_version: '2026-05-26',
+    last_fresh_at: Date.now() - 60000,
+    utilization: { '5h': 0.36, '7d': 0.34 },
+    reset: { '5h': Math.floor((Date.now() + 2 * 3600 * 1000) / 1000), '7d': Math.floor((Date.now() + 5 * 24 * 3600 * 1000) / 1000) },
+    representative_claim: 'five_hour',
+    fallback_percentage: 0.02,
+    raw_available: null,
+  },
+  {
+    provider: 'openai',
+    status: 'unavailable',
+    reason: 'no public quota api',
+  },
+  {
+    provider: 'mistral',
+    status: 'unavailable',
+    reason: 'no public quota api',
+  },
+];
+
+const QUOTA_V2_STALE = [
+  {
+    provider: 'anthropic',
+    status: 'stale',
+    last_fresh_at: Date.now() - 6 * 60000,
+    utilization: { '5h': 0.60, '7d': 0.20 },
+    reset: { '5h': Math.floor((Date.now() + 3600 * 1000) / 1000), '7d': Math.floor((Date.now() + 4 * 24 * 3600 * 1000) / 1000) },
+    representative_claim: 'five_hour',
+    failure: { kind: 'rate_limited', message: 'too many requests' },
+  },
+];
+
+const QUOTA_V2_UNREACHABLE = [
+  {
+    provider: 'anthropic',
+    status: 'unreachable',
+    failure: { kind: 'auth_failed', message: 're-run `claude setup-token`' },
+  },
+];
+
+const LEGACY_QUOTA_BODY = {
+  window_24h: {},
+  cache_hit_24h: {},
+  quota: [
+    { provider: 'anthropic', available: null },
+    { provider: 'openai', available: null },
+  ],
+};
+
+describe('Suite 40 — F4 CLI/plugin quota_v2 migration + v1.x #7 AUTH_MISSING test pin', () => {
+
+  // ── 40a — cmdUsage renders quota_v2 live rows ────────────────────────────
+
+  it('40a — cmdUsage parses quota_v2 live rows (mock server → asserts key strings present)', async () => {
+    const dashData = {
+      window_24h: { request_count: 12, status_2xx: 12, status_4xx: 0, status_5xx: 0 },
+      cache_hit_24h: { hit_rate: 0.5, hit: 6, miss: 6 },
+      quota: [],
+      quota_v2: QUOTA_V2_LIVE,
+      top_fallback_chains_24h: [],
+      cache_stats: { hits: 6, misses: 6, size: 4, inflightCount: 0 },
+    };
+    const srv = await makeJsonServer40(dashData);
+    try {
+      // Clear auth env so resolveBearerToken returns null (anonymous allowed)
+      const savedKey = process.env.OLP_API_KEY;
+      const savedOwner = process.env.OLP_OWNER_TOKEN;
+      delete process.env.OLP_API_KEY;
+      delete process.env.OLP_OWNER_TOKEN;
+      let out = '', err = '';
+      try {
+        const code = await runOlpCli40(
+          ['usage', `--proxy-url=${srv.url}`],
+          { out: s => { out += s; }, err: s => { err += s; }, useColor: false },
+        );
+        assert.equal(code, 0, `cmdUsage exit non-zero; stderr=${err}`);
+      } finally {
+        if (savedKey === undefined) delete process.env.OLP_API_KEY; else process.env.OLP_API_KEY = savedKey;
+        if (savedOwner === undefined) delete process.env.OLP_OWNER_TOKEN; else process.env.OLP_OWNER_TOKEN = savedOwner;
+      }
+      // Must display quota_v2 section heading
+      assert.match(out, /Per-provider quota.*live/i, '40a: header must mention live quota');
+      // Must show anthropic provider name
+      assert.match(out, /ANTHROPIC/, '40a: ANTHROPIC row must appear');
+      // Must show percentage data (36% or 34% from utilization shape)
+      assert.match(out, /36%|34%/, '40a: live utilization must appear');
+      // Must show reset countdown strings
+      assert.match(out, /resets in|resets /i, '40a: reset countdown must appear');
+      // Legacy "no quota api" fallthrough must NOT appear
+      assert.ok(!out.includes('no quota api'), '40a: "no quota api" must not appear when quota_v2 is present');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // ── 40b — cmdUsage falls back to legacy body.quota when quota_v2 absent ──
+
+  it('40b — cmdUsage falls back to legacy body.quota when quota_v2 absent (older server)', async () => {
+    const srv = await makeJsonServer40(LEGACY_QUOTA_BODY);
+    try {
+      const savedKey = process.env.OLP_API_KEY;
+      const savedOwner = process.env.OLP_OWNER_TOKEN;
+      delete process.env.OLP_API_KEY;
+      delete process.env.OLP_OWNER_TOKEN;
+      let out = '', err = '';
+      try {
+        const code = await runOlpCli40(
+          ['usage', `--proxy-url=${srv.url}`],
+          { out: s => { out += s; }, err: s => { err += s; }, useColor: false },
+        );
+        assert.equal(code, 0, `cmdUsage fallback exit non-zero; stderr=${err}`);
+      } finally {
+        if (savedKey === undefined) delete process.env.OLP_API_KEY; else process.env.OLP_API_KEY = savedKey;
+        if (savedOwner === undefined) delete process.env.OLP_OWNER_TOKEN; else process.env.OLP_OWNER_TOKEN = savedOwner;
+      }
+      // Legacy path shows "no quota api" for providers with null available
+      assert.match(out, /no quota api/, '40b: legacy path must show "no quota api" fallthrough');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // ── 40c — olp-plugin fmtUsage parses quota_v2 live row ──────────────────
+
+  it('40c — olp-plugin fmtUsage parses quota_v2 live row (mock body)', () => {
+    const body = {
+      window_24h: { request_count: 5 },
+      cache_hit_24h: { hit_rate: 0.4 },
+      quota: [],
+      quota_v2: QUOTA_V2_LIVE,
+      top_fallback_chains_24h: [],
+    };
+    const out = plugFmtUsage40(body);
+    // Section heading
+    assert.match(out, /Per-provider quota.*live/i, '40c: section heading must indicate live quota');
+    // Anthropic row present
+    assert.match(out, /ANTHROPIC/, '40c: ANTHROPIC row must appear');
+    // live status
+    assert.match(out, /live/, '40c: status "live" must appear for anthropic');
+    // Utilization percentage
+    assert.match(out, /36%/, '40c: 5h utilization 36% must appear');
+    // Reset countdown present
+    assert.match(out, /resets in|resets /i, '40c: reset countdown must appear');
+    // openai/mistral show unavailable
+    assert.match(out, /OPENAI.*unavailable|OPENAI\s+unavailable/, '40c: OPENAI must show unavailable');
+    // Legacy bar() fallthrough must NOT fire
+    assert.ok(!out.includes('█'), '40c: legacy bar() must not appear when quota_v2 present');
+  });
+
+  // ── 40d — olp-plugin fmtUsage falls back to legacy body.quota ────────────
+
+  it('40d — olp-plugin fmtUsage falls back to legacy body.quota when quota_v2 absent', () => {
+    const body = {
+      quota: [
+        { provider: 'anthropic', percent_used: 45 },
+        { provider: 'openai', percent_used: null },
+      ],
+    };
+    const out = plugFmtUsage40(body);
+    assert.match(out, /Per-provider quota/, '40d: section heading must appear');
+    // Legacy bar() fires for percent_used=45
+    assert.match(out, /anthropic.*45%|45%.*anthropic/i, '40d: anthropic 45% must appear');
+    assert.match(out, /no quota api/, '40d: "no quota api" must appear for provider with null percent_used');
+  });
+
+  // ── 40e — formatResetCountdown ranges ────────────────────────────────────
+
+  it('40e — formatResetCountdown covers all 5 time ranges', () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    // Past: diffMs <= 0
+    assert.equal(olpFormatResetCountdown(nowSec - 5), 'resetting now', '40e: past → resetting now');
+    // < 1h: exactly 30 minutes ahead by feeding epoch seconds directly (no ms conversion drift)
+    const t30m = nowSec + 30 * 60;
+    const r30m = olpFormatResetCountdown(t30m);
+    assert.match(r30m, /resets in \d+m/, '40e: ~30min → resets in Xm format');
+    assert.ok(r30m.includes('resets in'), '40e: 30min must use < 1h branch');
+    // < 24h: 3 hours + 15 minutes from now (uses hours+minutes branch)
+    const t3h15m = nowSec + (3 * 60 + 15) * 60;
+    const r3h15m = olpFormatResetCountdown(t3h15m);
+    assert.match(r3h15m, /resets in \d+h/, '40e: 3h15m → resets in Xh format');
+    // < 7d: 2 days from now → weekday format
+    const t2d = nowSec + 2 * 24 * 3600;
+    const r2d = olpFormatResetCountdown(t2d);
+    assert.match(r2d, /resets (Mon|Tue|Wed|Thu|Fri|Sat|Sun)/, '40e: 2 days → weekday format');
+    // >= 7d: 10 days from now → month+day format
+    const t10d = nowSec + 10 * 24 * 3600;
+    const r10d = olpFormatResetCountdown(t10d);
+    assert.match(r10d, /resets (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/, '40e: 10 days → month format');
+    // null input
+    assert.equal(olpFormatResetCountdown(null), '—', '40e: null → —');
+  });
+
+  // ── 40f — plugin formatResetCountdown parallel coverage ─────────────────
+
+  it('40f — olp-plugin pluginFormatResetCountdown covers past / <1h / <24h / <7d / ≥7d', () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    assert.equal(pluginFormatResetCountdown(nowSec - 1), 'resetting now', '40f: past → resetting now');
+    // ~45 minutes ahead → < 1h branch
+    const t45m = nowSec + 45 * 60;
+    const r45m = pluginFormatResetCountdown(t45m);
+    assert.match(r45m, /resets in \d+m/, '40f: ~45min → resets in Xm format');
+    // ~2h ahead (well within <24h range — may read as 1h 59m due to sub-second drift)
+    const t2h = nowSec + 2 * 3600;
+    const r2h = pluginFormatResetCountdown(t2h);
+    assert.match(r2h, /resets in \d+h/, '40f: ~2h → resets in Xh format');
+    assert.equal(pluginFormatResetCountdown(null), '—', '40f: null → —');
+  });
+
+  // ── 40g — cmdUsage renders quota_v2 stale row ────────────────────────────
+
+  it('40g — cmdUsage renders quota_v2 stale row with ⚠ stale note', async () => {
+    const dashData = {
+      window_24h: {},
+      cache_hit_24h: {},
+      quota: [],
+      quota_v2: QUOTA_V2_STALE,
+      top_fallback_chains_24h: [],
+    };
+    const srv = await makeJsonServer40(dashData);
+    try {
+      const savedKey = process.env.OLP_API_KEY;
+      const savedOwner = process.env.OLP_OWNER_TOKEN;
+      delete process.env.OLP_API_KEY;
+      delete process.env.OLP_OWNER_TOKEN;
+      let out = '', err = '';
+      try {
+        await runOlpCli40(
+          ['usage', `--proxy-url=${srv.url}`],
+          { out: s => { out += s; }, err: s => { err += s; }, useColor: false },
+        );
+      } finally {
+        if (savedKey === undefined) delete process.env.OLP_API_KEY; else process.env.OLP_API_KEY = savedKey;
+        if (savedOwner === undefined) delete process.env.OLP_OWNER_TOKEN; else process.env.OLP_OWNER_TOKEN = savedOwner;
+      }
+      assert.match(out, /stale/, '40g: stale status must appear in output');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // ── 40h — cmdUsage renders quota_v2 unreachable row ─────────────────────
+
+  it('40h — cmdUsage renders quota_v2 unreachable row with ❌ indicator', async () => {
+    const dashData = {
+      window_24h: {},
+      cache_hit_24h: {},
+      quota: [],
+      quota_v2: QUOTA_V2_UNREACHABLE,
+      top_fallback_chains_24h: [],
+    };
+    const srv = await makeJsonServer40(dashData);
+    try {
+      const savedKey = process.env.OLP_API_KEY;
+      const savedOwner = process.env.OLP_OWNER_TOKEN;
+      delete process.env.OLP_API_KEY;
+      delete process.env.OLP_OWNER_TOKEN;
+      let out = '', err = '';
+      try {
+        await runOlpCli40(
+          ['usage', `--proxy-url=${srv.url}`],
+          { out: s => { out += s; }, err: s => { err += s; }, useColor: false },
+        );
+      } finally {
+        if (savedKey === undefined) delete process.env.OLP_API_KEY; else process.env.OLP_API_KEY = savedKey;
+        if (savedOwner === undefined) delete process.env.OLP_OWNER_TOKEN; else process.env.OLP_OWNER_TOKEN = savedOwner;
+      }
+      assert.match(out, /❌|no cached data/, '40h: unreachable row must show ❌ or "no cached data"');
+      assert.match(out, /auth_failed/, '40h: failure kind must appear in output');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // ── 40i — cmdUsage renders quota_v2 unavailable row ─────────────────────
+
+  it('40i — cmdUsage renders quota_v2 unavailable rows (openai / mistral) correctly', async () => {
+    const dashData = {
+      window_24h: {},
+      cache_hit_24h: {},
+      quota: [],
+      quota_v2: QUOTA_V2_LIVE, // includes openai + mistral as unavailable
+      top_fallback_chains_24h: [],
+    };
+    const srv = await makeJsonServer40(dashData);
+    try {
+      const savedKey = process.env.OLP_API_KEY;
+      const savedOwner = process.env.OLP_OWNER_TOKEN;
+      delete process.env.OLP_API_KEY;
+      delete process.env.OLP_OWNER_TOKEN;
+      let out = '', err = '';
+      try {
+        await runOlpCli40(
+          ['usage', `--proxy-url=${srv.url}`],
+          { out: s => { out += s; }, err: s => { err += s; }, useColor: false },
+        );
+      } finally {
+        if (savedKey === undefined) delete process.env.OLP_API_KEY; else process.env.OLP_API_KEY = savedKey;
+        if (savedOwner === undefined) delete process.env.OLP_OWNER_TOKEN; else process.env.OLP_OWNER_TOKEN = savedOwner;
+      }
+      // openai + mistral are unavailable in the fixture
+      assert.match(out, /OPENAI/, '40i: OPENAI row must appear');
+      assert.match(out, /unavailable/, '40i: "unavailable" must appear for providers with no quota api');
+    } finally {
+      await srv.close();
+    }
+  });
+});

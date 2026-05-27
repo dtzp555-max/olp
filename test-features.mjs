@@ -17587,10 +17587,51 @@ describe('Suite 41 — ADR 0009 Amendment 1: stream-json transport (Phase 6)', (
     assert.equal(chunk, null, 'rate_limit_event must return null (future audit/dashboard work)');
   });
 
-  it('41e-7: anthropicStreamJsonEventToIR — assistant (aggregate) → null', () => {
+  it('41e-7: anthropicStreamJsonEventToIR — assistant (aggregate) when deltas already streamed → null', () => {
     const event = { type: 'assistant', message: { content: [{ type: 'text', text: 'OK' }] } };
-    const chunk = anthropicStreamJsonEventToIR(event, false);
-    assert.equal(chunk, null, 'assistant aggregate event must return null (deltas already streamed)');
+    const chunk = anthropicStreamJsonEventToIR(event, /* isFirstDelta */ false);
+    assert.equal(chunk, null, 'assistant aggregate event must return null when deltas already streamed (duplicate)');
+  });
+
+  it('41e-7b: anthropicStreamJsonEventToIR — assistant (aggregate) with no prior delta → fallback yields delta', () => {
+    // Fold-in: when claude runs without -p (and without --include-partial-messages),
+    // it does NOT emit content_block_delta events — only the aggregate `assistant`.
+    // Verified empirically on PI231 v2.1.104 2026-05-27 live transcripts.
+    // If isFirstDelta=true (no prior delta yielded), fall back to extracting the
+    // aggregate content as a single delta chunk so the response body is non-empty.
+    const event = {
+      type: 'assistant',
+      message: { model: 'claude-sonnet-4-6', content: [{ type: 'text', text: 'DIAG-PROOF' }] },
+    };
+    const chunk = anthropicStreamJsonEventToIR(event, /* isFirstDelta */ true);
+    assert.equal(chunk?.type, 'delta', 'assistant with no prior delta should yield delta chunk');
+    assert.equal(chunk?.content, 'DIAG-PROOF', 'delta content must equal the aggregate text');
+    assert.equal(chunk?.role, 'assistant', 'role on first-delta');
+    assert.equal(chunk?.model, 'claude-sonnet-4-6', 'model on first-delta from message.model');
+  });
+
+  it('41e-7c: anthropicStreamJsonEventToIR — assistant with multi-block content concatenates', () => {
+    const event = {
+      type: 'assistant',
+      message: { content: [
+        { type: 'text', text: 'Part 1. ' },
+        { type: 'text', text: 'Part 2.' },
+      ]},
+    };
+    const chunk = anthropicStreamJsonEventToIR(event, /* isFirstDelta */ true);
+    assert.equal(chunk?.content, 'Part 1. Part 2.', 'multi text blocks concatenate in order');
+  });
+
+  it('41e-7d: anthropicStreamJsonEventToIR — assistant with non-text blocks filtered (e.g. thinking)', () => {
+    const event = {
+      type: 'assistant',
+      message: { content: [
+        { type: 'thinking', thinking: 'internal reasoning' },
+        { type: 'text', text: 'visible answer' },
+      ]},
+    };
+    const chunk = anthropicStreamJsonEventToIR(event, /* isFirstDelta */ true);
+    assert.equal(chunk?.content, 'visible answer', 'non-text blocks (thinking) filtered out');
   });
 
   it('41e-8: anthropicStreamJsonEventToIR — parse_error event → null (already logged)', () => {

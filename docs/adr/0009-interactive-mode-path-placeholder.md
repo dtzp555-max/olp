@@ -1,7 +1,7 @@
 # ADR 0009 — Anthropic Interactive-Mode Path (Placeholder)
 
-- **Date:** 2026-05-25
-- **Status:** Draft (Placeholder — blocked on OCP ADR 0007 P0 experiment outcome; no implementation D-day scheduled until P0 lands)
+- **Date:** 2026-05-25 (Placeholder); 2026-05-27 Amendment 1 (Accepted)
+- **Status:** **Accepted** (post-Amendment 1 — OLP self-spike supersedes OCP-wait; implementation D-day scheduled this Phase 6)
 - **Authors:** project maintainer (with AI advisory drafting)
 - **Related:**
   - **OCP ADR 0007** (Interactive-Mode Execution Pool, stream-json) — at `~/ocp/docs/adr/0007-interactive-mode-pool.md` on the maintainer's workstation. Pin reference at the time of this writing: OCP ADR 0007 is Draft status pending the same P0 outcome.
@@ -193,5 +193,117 @@ If OCP P0 fails, **this ADR is shelved** and Phase 4 ordering is unchanged.
 ## Status transitions (recorded for clarity)
 
 - 2026-05-25 — Created as Draft (Placeholder). OCP ADR 0007 also Draft.
-- _(future)_ — If OCP ADR 0007 → Accepted with a confirmed transport: this ADR moves to "Pending Phase 4 implementation D-day", maintainer decides Option 1 / 2 / 3 + lane.
-- _(future)_ — If OCP ADR 0007 → Rejected: this ADR moves to "Shelved (upstream P0 failure)" with a note explaining the fallback (multi-provider routing already covers).
+- 2026-05-27 — Amendment 1 promotes to **Accepted**. OLP self-spike + empirical Transport-A confirmation on `claude` CLI v2.1.104 superseded wait-for-OCP. OCP is now in maintenance mode (per maintainer statement 2026-05-27 session) — OLP leads. Implementation lane: **Option 1 (parallel implementation, no warm pool, no PTY)**, scope reduced from "10-day warm pool with billing router" to "2-3-day stateless stream-json adapter".
+
+---
+
+## Amendment 1 — 2026-05-27: Self-spike supersedes wait-for-OCP; lock Option 1 with stream-json-no-`-p` transport
+
+### Trigger
+
+Two findings on 2026-05-27 changed the placeholder's premises:
+
+1. **OCP is no longer the lead project.** The maintainer stated in the 2026-05-27 session: "OCP 不会大改动…主力方向放到 OLP." The "wait-and-port" strategy implicitly assumed OCP would do the P0 first. With OCP in maintenance mode, OLP cannot wait — the 2026-06-15 Anthropic billing split is 19 days out from this amendment.
+
+2. **OLP self-spike confirmed Transport A (`--output-format stream-json --verbose` without `-p`) emits NDJSON on Claude Code v2.1.104.** The placeholder ADR § 1.3 cited OCP's "v2.1.150 only" observation as the binding caveat. Local empirical re-test on 2026-05-27 against PI231's deployed `claude` v2.1.104 produced the full NDJSON event stream (system/init + stream_event token deltas + message_stop + result + rate_limit_event) for invocations **without** `-p`. The `claude --help` text saying "(only works with --print)" is misleading — the flags accept invocation without `-p` and produce the documented NDJSON shape.
+
+### Additional spike findings (2026-05-27 billing classification)
+
+A separate web/GitHub research spike on the 2026-06-15 billing classification returned:
+
+- Anthropic's published policy is **intent-based, not mechanism-based**. The Agent SDK credit pool covers: Agent SDK Python/TypeScript packages, `claude -p`, GitHub Actions, **and "third-party apps that authenticate with your Claude subscription through the Agent SDK"**. Subscription pool covers "Claude Code in the terminal or your IDE in interactive mode."
+- The third-party-app clause is the load-bearing ambiguity. OLP qualifies as a third-party app regardless of which CLI mode it spawns. If Anthropic tightens that clause from "via Agent SDK" to "any third-party app," OLP is caught regardless of `-p` flag presence.
+- Behavioral fingerprinting (request cadence, OAuth-scope patterns, isTTY absence) is a separate detection vector Anthropic could deploy without policy-text changes.
+
+The spike's recommendation: "viable bridge for ~30-60 days post-2026-06-15, NOT durable solution."
+
+### Value re-anchoring
+
+The placeholder framed interactive-mode as "the durable answer to keep OLP anthropic subscription value past 2026-06-15." The 2026-05-27 spike re-anchors the value:
+
+| Value | Placeholder framing | 2026-05-27 framing |
+|---|---|---|
+| Keep subscription pool 6.15+ | **Primary value** | **Uncertain bridge** (30-60 day plausibility) |
+| Hallucination fix (env-block / cwd injection) | (Not addressed) | **Primary value** — empirically proven |
+| Cost reduction (drop default tool descriptions) | (Not addressed) | **Primary value** — ~30% input token / ~64% per-request cost reduction measured against `--system-prompt` override |
+| Observability (rate_limit / cache / usage per request) | (Not addressed) | **Primary value** — NDJSON events expose data the current `--output-format text` path discards |
+| Protocol foundation for future tool-call passthrough | (Not addressed) | **Secondary value** — same NDJSON parser is reusable for Phase 8+ tool passthrough work |
+
+**Net**: even if Anthropic immediately reclassifies third-party apps to Agent SDK pool on 2026-06-15 — making the bridge worthless — the implementation still earns its keep through the other four values.
+
+### Locked decision
+
+**Option 1 — Parallel implementation in OLP's `lib/providers/anthropic.mjs`.**
+
+Lane: stream-json output, no `-p` flag (Transport A confirmed), stateless per-request spawn (no warm pool, no PTY, no node-pty dependency).
+
+Rejected lanes and why:
+
+- **Option 2 (chain OCP)** — OCP is in maintenance mode; coupling OLP's anthropic provider to OCP's HTTP shim is the wrong direction.
+- **Option 3 (both)** — premature complexity; pick the simple lane first.
+- **Warm-process pool** — OLP is stateless per AGENTS.md § "No conversation state". Pool lifecycle, crash backoff, and permission auto-response from OCP ADR 0007 § 4 are unnecessary for OLP's per-request model.
+- **PTY (Transport B with node-pty)** — Transport A worked; engines-bump for a native addon is unjustified when the simpler transport produces the documented NDJSON.
+
+### Implementation scope (Option 1, this Phase 6)
+
+| Change | Surface | Authority |
+|---|---|---|
+| `buildCliArgs(model)` drop `-p` and `--output-format text`; add `--output-format stream-json`, `--verbose`, `--no-session-persistence`, `--model` | `lib/providers/anthropic.mjs` | `claude --help` (v2.1.104) § `--output-format` / § `--verbose` |
+| `buildCliArgs(model, systemPrompt)` accepts optional system prompt; spawns with `--system-prompt "<OLP wrapper text>"` | `lib/providers/anthropic.mjs` | `claude --help` (v2.1.104) § `--system-prompt` |
+| OLP-managed system prompt construction (extract client `role:system` IR messages, prepend OLP wrapper saying "you are accessed via HTTP proxy; no local env/fs/shell access; respond directly") | `lib/providers/anthropic.mjs` `irToAnthropic` | This ADR § "OLP system prompt wrapper" below |
+| New `anthropicStreamJsonChunkToIR` parser replacing/supplementing `anthropicChunkToIR` — handles NDJSON event types `system/init`, `stream_event/content_block_delta`, `assistant`, `result`, `rate_limit_event` | `lib/providers/anthropic.mjs` | This ADR § "NDJSON event handling" below |
+| New tests verifying NDJSON parsing, system-prompt construction, env-block absence | `test-features.mjs` | (test surface; no external authority) |
+| README troubleshooting / supported-providers § note about the bridge nature | `README.md` | (docs surface) |
+
+The `irToAnthropic` text serialization path is preserved for client messages (`role: user`, `role: assistant`); the `role: system` extraction goes to `--system-prompt`.
+
+### OLP system prompt wrapper
+
+The wrapper text injected via `--system-prompt`:
+
+```
+You are accessed via the OLP HTTP proxy. You do NOT have access to any local
+filesystem, working directory, shell, git status, or machine environment.
+Do not infer or invent such information from any context you observe.
+Respond only based on the conversation provided.
+```
+
+If the client IR request contains `role: system` messages, their concatenated `content` is appended after a blank line.
+
+### NDJSON event handling
+
+The parser must yield IR chunks based on the event stream:
+
+| NDJSON event | IR yield | Notes |
+|---|---|---|
+| `{type:"system", subtype:"init"}` | None (consumed for session_id tracking) | First event always; ignore |
+| `{type:"stream_event", event:{type:"content_block_delta", delta:{type:"text_delta", text:"..."}}}` | `{type: "delta", content: "<text>"}` | Token-by-token streaming |
+| `{type:"assistant"}` | None (already captured by per-token deltas) | Aggregate message; ignore (or use for verify, optional) |
+| `{type:"result", subtype:"success"}` | `{type:"stop", finish_reason:"stop"}` | Marks end |
+| `{type:"rate_limit_event"}` | None (consumed for audit/dashboard) | Forward to OLP audit/observability layer later (Phase 6+ enhancement) |
+| `{type:"control_request"}` | Log + ignore | Per Anthropic stream-json docs |
+
+The cache key composition (ADR 0005) is unchanged — same IR request hash; the on-the-wire format change is internal to the anthropic plugin.
+
+### Token cost measurement (binding evidence)
+
+Two requests against PI231 v2.1.104 on 2026-05-27 with identical user prompt `"reply: OK"`, model `claude-sonnet-4-6`:
+
+- Default invocation (no `--system-prompt`): `cache_creation_input_tokens=4785`, `cache_read_input_tokens=11816`, total input ≈ 16,601 tokens, `total_cost_usd=$0.0216`.
+- With `--system-prompt "You are a chat assistant. Respond directly."`: `cache_creation_input_tokens=1306`, `cache_read_input_tokens=9394`, total input ≈ 10,700 tokens, `total_cost_usd=$0.0078`.
+
+**Net**: ~30% input token reduction, ~64% per-request cost reduction. Replicable by anyone with `claude` v2.1.104 + OAuth on a similar setup.
+
+### Caveats binding the implementation
+
+1. **Bridge value uncertain.** The 30-60 day estimate is a spike judgment, not Anthropic-confirmed. Implementation must continue to function correctly if Anthropic re-routes this path to Agent SDK billing on 2026-06-15 — the only consequence is the bridge value disappears, but the other four values (hallucination / cost / observability / protocol foundation) remain.
+2. **No claim about durability.** This ADR amends only as far as "the bridge is worth the 2-3 day investment given the orthogonal values." A future ADR (likely Phase 7 sandbox-runtime + Phase 8 multi-provider robustness) will revisit the anthropic provider's strategic role once the post-2026-06-15 picture clarifies.
+3. **Sandbox-runtime still required for real multi-tenant deployment.** Per the 2026-05-27 session prior-art search, Anthropic's official multi-tenant answer is `@anthropic-ai/sandbox-runtime` (OS-level isolation). This ADR does NOT substitute for that work; sandbox-runtime remains Phase 7 scope and is a hard prerequisite before any cloud deployment per `docs/plans/cloud-deployment-family.md`.
+4. **CLI version pin guidance.** Stream-json without `-p` was confirmed on v2.1.104. Future versions may tighten this; the plugin's spawn should emit a warning to OLP server log if `claude --version` falls outside a `v2.1.100`–`v2.1.149` range. Hard failure on out-of-range version is NOT required; warning is sufficient for v0.6.x.
+
+### Updated authority citations (in addition to placeholder § Authority citations)
+
+- **OLP self-spike — 2026-05-27 session live transcripts** (PI231 ssh; `claude -p --output-format stream-json --verbose` and `claude` no-`-p` variants captured in session log; retained in cc-mem post-implementation).
+- **P0 billing classification spike — 2026-05-27** subagent transcript; sources include Anthropic published docs at `code.claude.com/docs/en/headless`, `support.claude.com/en/articles/15036540`, `support.claude.com/en/articles/11145838`.
+- **claude CLI v2.1.104 `--help`** (live capture on PI231) § `--output-format`, § `--verbose`, § `--system-prompt`, § `--no-session-persistence`.
+- **CLAUDE.md `release_kit.phase_rolling_mode.current_phase`** — Phase 6; this ADR consumes a Phase 6 D-day per the amendment, NOT a Phase 4 D-day (the placeholder's hypothetical scheduling).

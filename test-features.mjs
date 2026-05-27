@@ -89,6 +89,12 @@ import anthropic, {
   healthCheck as anthropicHealthCheck,
   __setSpawnImpl,
   __resetSpawnImpl,
+  // ADR 0009 Amendment 1 — stream-json transport
+  OLP_SYSTEM_PROMPT_WRAPPER,
+  extractSystemPrompt,
+  buildCliArgs,
+  parseStreamJsonLines,
+  anthropicStreamJsonEventToIR,
 } from './lib/providers/anthropic.mjs';
 import codex, {
   irToCodex,
@@ -809,6 +815,61 @@ function makeMockSpawn(stdoutChunks, exitCode = 0) {
   };
 }
 
+/**
+ * Creates a fake spawn that emits proper NDJSON stream-json events then exits.
+ * Used by Suite 6 (Anthropic plugin D4) and Suite 41 (ADR 0009 Amendment 1 tests).
+ *
+ * ADR 0009 Amendment 1: _spawnAndStream now parses NDJSON events from stdout.
+ * Raw text chunks (as in makeMockSpawn) produce parse_error events → no delta content.
+ * This helper emits content_block_delta stream_events so the assertion on content works.
+ *
+ * @param {string[]} textChunks — content strings to emit as content_block_delta events
+ * @param {number} [exitCode=0]
+ */
+function makeMockSpawnNDJSON(textChunks, exitCode = 0) {
+  return function mockSpawnNDJSONImpl(_bin, _args, _opts) {
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.stdin = {
+      write: () => {},
+      end: () => {
+        setImmediate(async () => {
+          // Emit system/init first (consumed, no yield)
+          const initEvent = JSON.stringify({ type: 'system', subtype: 'init', cwd: '/tmp', tools: [] });
+          proc.stdout.emit('data', Buffer.from(initEvent + '\n'));
+
+          // Emit each text chunk as a stream_event/content_block_delta
+          for (const chunk of textChunks) {
+            const deltaEvent = JSON.stringify({
+              type: 'stream_event',
+              event: { type: 'content_block_delta', delta: { type: 'text_delta', text: chunk } },
+            });
+            proc.stdout.emit('data', Buffer.from(deltaEvent + '\n'));
+          }
+
+          // Emit result/success as terminal event
+          const resultEvent = JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            result: textChunks.join(''),
+            total_cost_usd: 0.0001,
+          });
+          proc.stdout.emit('data', Buffer.from(resultEvent + '\n'));
+
+          proc.stdout.emit('end');
+          proc.stderr.emit('end');
+          proc.emit('close', exitCode, null);
+        });
+      },
+    };
+    proc.killed = false;
+    proc.kill = () => {};
+    return proc;
+  };
+}
+
 // ── Suite D17: Alias-aware getProviderForModel (Finding 12 + 13) ─────────────
 //
 // Tests that getProviderForModel resolves aliases from models-registry.json
@@ -1032,7 +1093,9 @@ describe('Anthropic plugin (D4)', () => {
     assert.ok(!prompt.includes('[Assistant]'));
   });
 
-  it('irToAnthropic: system + user → system annotation + user text', () => {
+  it('irToAnthropic: system + user → system message SKIPPED in stdin (ADR 0009 Amendment 1)', () => {
+    // ADR 0009 Amendment 1: role:system messages are extracted by extractSystemPrompt()
+    // and passed via --system-prompt flag. They must NOT appear in the stdin prompt.
     const ir = makeIR({
       model: 'claude-sonnet-4-6',
       messages: [
@@ -1041,7 +1104,10 @@ describe('Anthropic plugin (D4)', () => {
       ],
     });
     const prompt = irToAnthropic(ir);
-    assert.ok(prompt.includes('[System] You are a helper.'));
+    // system message must NOT appear in stdin prompt (goes via --system-prompt instead)
+    assert.ok(!prompt.includes('[System] You are a helper.'), 'system content must not leak to stdin');
+    assert.ok(!prompt.includes('You are a helper.'), 'system content must not leak to stdin in any form');
+    // user message must still be present
     assert.ok(prompt.includes('What is 2+2?'));
   });
 
@@ -1113,8 +1179,10 @@ describe('Anthropic plugin (D4)', () => {
   });
 
   // ── Test 7: mock spawn — AsyncIterator yields correct IR chunks ───────
-  it('spawn with mock: yields delta chunks then stop chunk', async () => {
-    const fakeSpawn = makeMockSpawn(['Hello', ' world']);
+  // ADR 0009 Amendment 1: spawn now uses NDJSON stream-json path.
+  // Tests updated to use makeMockSpawnNDJSON which emits proper stream_event NDJSON.
+  it('spawn with mock: yields delta chunks then stop chunk (NDJSON path)', async () => {
+    const fakeSpawn = makeMockSpawnNDJSON(['Hello', ' world']);
     __setSpawnImpl(fakeSpawn);
     try {
       const ir = makeIR({
@@ -1127,7 +1195,7 @@ describe('Anthropic plugin (D4)', () => {
       for await (const chunk of anthropic.spawn(ir, authCtx)) {
         chunks.push(chunk);
       }
-      // Should have 2 delta chunks + 1 stop chunk
+      // Should have 2 delta chunks + 1 stop chunk from result event
       const deltas = chunks.filter(c => c.type === 'delta');
       const stops = chunks.filter(c => c.type === 'stop');
       assert.ok(deltas.length >= 1, `Expected at least 1 delta, got ${deltas.length}`);
@@ -1139,8 +1207,8 @@ describe('Anthropic plugin (D4)', () => {
     }
   });
 
-  it('spawn with mock: first delta chunk has role=assistant', async () => {
-    const fakeSpawn = makeMockSpawn(['Test output']);
+  it('spawn with mock: first delta chunk has role=assistant (NDJSON path)', async () => {
+    const fakeSpawn = makeMockSpawnNDJSON(['Test output']);
     __setSpawnImpl(fakeSpawn);
     try {
       const ir = makeIR({
@@ -5377,9 +5445,9 @@ describe('Fallback engine — HTTP integration (D9)', () => {
       soft_triggers: {},
     });
 
-    // Anthropic mock: emits 2 raw text chunks then exits non-zero (cleanup error).
-    // The anthropic plugin processes raw stdout as text → IR delta chunks.
-    // exit code 1 after yielding content → Case B: SPAWN_FAILED with chunks.length>0.
+    // Anthropic mock: emits 2 NDJSON content_block_delta events then exits non-zero.
+    // ADR 0009 Amendment 1: stream-json path — content must be valid NDJSON to yield
+    // delta chunks. exit code 1 after yielding content → Case B: SPAWN_FAILED with chunks.length>0.
     __setSpawnImpl(function (_bin, _args, _opts) {
       const proc = new EventEmitter();
       proc.stdout = new EventEmitter();
@@ -5388,9 +5456,9 @@ describe('Fallback engine — HTTP integration (D9)', () => {
         write: () => {},
         end: () => {
           setImmediate(() => {
-            // Emit 2 content chunks as raw text (anthropic --output-format text)
-            proc.stdout.emit('data', Buffer.from('Hello '));
-            proc.stdout.emit('data', Buffer.from('world'));
+            // Emit 2 NDJSON content_block_delta stream_events (ADR 0009 Amendment 1)
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hello ' } } }) + '\n'));
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'world' } } }) + '\n'));
             proc.stdout.emit('end');
             proc.stderr.emit('end');
             // Non-zero exit AFTER emitting content → SPAWN_FAILED, chunks.length=2
@@ -5479,7 +5547,8 @@ describe('Fallback engine — HTTP integration (D9)', () => {
       soft_triggers: {},
     });
 
-    // Anthropic mock: emits 1 raw text chunk then exits non-zero
+    // Anthropic mock: emits 1 NDJSON content_block_delta event then exits non-zero
+    // ADR 0009 Amendment 1: stream-json path — content must be valid NDJSON.
     __setSpawnImpl(function (_bin, _args, _opts) {
       const proc = new EventEmitter();
       proc.stdout = new EventEmitter();
@@ -5488,7 +5557,7 @@ describe('Fallback engine — HTTP integration (D9)', () => {
         write: () => {},
         end: () => {
           setImmediate(() => {
-            proc.stdout.emit('data', Buffer.from('Partial answer'));
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Partial answer' } } }) + '\n'));
             proc.stdout.emit('end');
             proc.stderr.emit('end');
             proc.emit('close', 1, null); // exit 1 after content → Case B
@@ -5544,7 +5613,8 @@ describe('Fallback engine — HTTP integration (D9)', () => {
       soft_triggers: {},
     });
 
-    // Reuse the D16 Case-B single-hop mock: emit 1 raw text chunk, then exit-1.
+    // D39: emit 1 NDJSON content_block_delta event then exit-1 (Case B salvage path).
+    // ADR 0009 Amendment 1: stream-json path — content must be valid NDJSON.
     __setSpawnImpl(function (_bin, _args, _opts) {
       const proc = new EventEmitter();
       proc.stdout = new EventEmitter();
@@ -5553,7 +5623,7 @@ describe('Fallback engine — HTTP integration (D9)', () => {
         write: () => {},
         end: () => {
           setImmediate(() => {
-            proc.stdout.emit('data', Buffer.from('D39-evict-log-content'));
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'D39-evict-log-content' } } }) + '\n'));
             proc.stdout.emit('end');
             proc.stderr.emit('end');
             proc.emit('close', 1, null); // Case B salvage path
@@ -5646,8 +5716,9 @@ describe('Fallback engine — HTTP integration (D9)', () => {
         write: () => {},
         end: () => {
           setImmediate(() => {
-            // Case B: emit partial content then exit non-zero on every spawn.
-            proc.stdout.emit('data', Buffer.from('D39-sticky-content'));
+            // Case B: emit NDJSON partial content then exit non-zero on every spawn.
+            // ADR 0009 Amendment 1: stream-json path requires valid NDJSON.
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'D39-sticky-content' } } }) + '\n'));
             proc.stdout.emit('end');
             proc.stderr.emit('end');
             proc.emit('close', 1, null);
@@ -6611,8 +6682,9 @@ describe('Streaming cache-miss real-time (Suite 15)', () => {
   });
 
   it('15a: streaming cache-miss → res.write fires per chunk, not all-at-once', async () => {
-    // Mock: emits 3 deltas with a 20ms gap between each, then stop.
+    // Mock: emits 3 NDJSON deltas with a 20ms gap between each, then stop.
     // We verify by recording arrival timestamps on the client side.
+    // ADR 0009 Amendment 1: stream-json path — each chunk is a valid NDJSON stream_event.
     const DELTA_GAP_MS = 20;
 
     __setSpawnImpl(function (_bin, _args, _opts) {
@@ -6622,15 +6694,18 @@ describe('Streaming cache-miss real-time (Suite 15)', () => {
       proc.stdin = {
         write: () => {},
         end: () => {
-          // Emit 3 deltas with gaps
+          // Emit 3 NDJSON content_block_delta events with gaps
           let idx = 0;
           const texts = ['chunk1', 'chunk2', 'chunk3'];
           const emitNext = () => {
             if (idx < texts.length) {
-              proc.stdout.emit('data', Buffer.from(texts[idx]));
+              const event = JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: texts[idx] } } });
+              proc.stdout.emit('data', Buffer.from(event + '\n'));
               idx++;
               setTimeout(emitNext, DELTA_GAP_MS);
             } else {
+              // Emit result/success to close the stream
+              proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: texts.join('') }) + '\n'));
               proc.stdout.emit('end');
               proc.stderr.emit('end');
               proc.emit('close', 0, null);
@@ -6709,7 +6784,9 @@ describe('Streaming cache-miss real-time (Suite 15)', () => {
         write: () => {},
         end: () => {
           setImmediate(() => {
-            proc.stdout.emit('data', Buffer.from('cached-content'));
+            // ADR 0009 Amendment 1: emit NDJSON stream_event + result event
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'cached-content' } } }) + '\n'));
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'cached-content' }) + '\n'));
             proc.stdout.emit('end');
             proc.stderr.emit('end');
             proc.emit('close', 0, null);
@@ -6778,7 +6855,9 @@ describe('Streaming cache-miss real-time (Suite 15)', () => {
         write: () => {},
         end: () => {
           setImmediate(() => {
-            proc.stdout.emit('data', Buffer.from('multihop-content'));
+            // ADR 0009 Amendment 1: emit NDJSON stream_event + result event
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'multihop-content' } } }) + '\n'));
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'multihop-content' }) + '\n'));
             proc.stdout.emit('end');
             proc.stderr.emit('end');
             proc.emit('close', 0, null);
@@ -7947,13 +8026,15 @@ describe('Spawn timeout (Suite 16)', () => {
       proc.stdin = {
         write: () => {},
         end: () => {
-          // Emit data + close via setImmediate so the event handlers (registered
+          // Emit NDJSON data + close via setImmediate so the event handlers (registered
           // AFTER stdin.end() in the plugin body) are already attached when
           // these events fire. All three items land in the same setImmediate
           // callback, so they're all in chunks[] before the drain loop resumes.
+          // ADR 0009 Amendment 1: must be valid NDJSON stream_events so that the
+          // first chunk yields a delta (enabling the D24 race to occur).
           setImmediate(() => {
-            proc.stdout.emit('data', Buffer.from('partial-chunk-1'));
-            proc.stdout.emit('data', Buffer.from('partial-chunk-2'));
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial-chunk-1' } } }) + '\n'));
+            proc.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial-chunk-2' } } }) + '\n'));
             proc.stderr.emit('end');
             proc.emit('close', 0, null); // exitCode=0, done=true
           });
@@ -17300,5 +17381,285 @@ describe('Suite 40 — F4 CLI/plugin quota_v2 migration + v1.x #7 AUTH_MISSING t
     } finally {
       await srv.close();
     }
+  });
+});
+
+// ── Suite 41 — ADR 0009 Amendment 1: stream-json transport (Phase 6) ────────
+//
+// Tests for: extractSystemPrompt, buildCliArgs (no -p), parseStreamJsonLines,
+//   anthropicStreamJsonEventToIR, and a full end-to-end mock-spawn integration.
+//
+// Authority: claude CLI v2.1.104 § --output-format stream-json / --verbose /
+//   --system-prompt / --no-session-persistence (verified on PI231 2026-05-27).
+//   OLP ADR 0009 Amendment 1 — decision lock + value re-anchoring.
+//   OLP ALIGNMENT.md Rule 1 — provider plugin authority citation.
+
+describe('Suite 41 — ADR 0009 Amendment 1: stream-json transport (Phase 6)', () => {
+
+  // ── 41a: extractSystemPrompt ──────────────────────────────────────────
+
+  it('41a-1: extractSystemPrompt — no client system messages → OLP_SYSTEM_PROMPT_WRAPPER alone', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+    const result = extractSystemPrompt(ir);
+    assert.equal(result, OLP_SYSTEM_PROMPT_WRAPPER,
+      'Without system messages, result must be exactly OLP_SYSTEM_PROMPT_WRAPPER');
+    assert.ok(result.includes('OLP HTTP proxy'),
+      'OLP_SYSTEM_PROMPT_WRAPPER must mention "OLP HTTP proxy"');
+    assert.ok(result.includes('Do not infer or invent'),
+      'OLP_SYSTEM_PROMPT_WRAPPER must include the anti-hallucination clause');
+  });
+
+  it('41a-2: extractSystemPrompt — one client system message → wrapper + blank + client content', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'system', content: 'You are a pirate.' },
+        { role: 'user', content: 'Ahoy' },
+      ],
+    });
+    const result = extractSystemPrompt(ir);
+    assert.ok(result.startsWith(OLP_SYSTEM_PROMPT_WRAPPER),
+      'Result must start with OLP_SYSTEM_PROMPT_WRAPPER');
+    assert.ok(result.includes('\n\nYou are a pirate.'),
+      'Client system content must be appended after blank line');
+    // OLP wrapper and client content separated by exactly \n\n
+    assert.equal(result, `${OLP_SYSTEM_PROMPT_WRAPPER}\n\nYou are a pirate.`);
+  });
+
+  it('41a-3: extractSystemPrompt — multiple client system messages → wrapper + blank + concatenated content', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'system', content: 'Be concise.' },
+        { role: 'system', content: 'Speak in French.' },
+        { role: 'user', content: 'Bonjour' },
+      ],
+    });
+    const result = extractSystemPrompt(ir);
+    assert.ok(result.startsWith(OLP_SYSTEM_PROMPT_WRAPPER),
+      'Result must start with OLP_SYSTEM_PROMPT_WRAPPER');
+    assert.ok(result.includes('Be concise.'), 'First system message must be included');
+    assert.ok(result.includes('Speak in French.'), 'Second system message must be included');
+    // Multiple system messages joined with \n\n
+    assert.ok(result.includes('Be concise.\n\nSpeak in French.'),
+      'Multiple system messages must be joined with \\n\\n');
+  });
+
+  // ── 41b: irToAnthropic skips role:system (ADR 0009 Amendment 1) ──────
+
+  it('41b: irToAnthropic — role:system messages are skipped (go via --system-prompt)', () => {
+    const ir = makeIR({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'system', content: 'Be a weather bot.' },
+        { role: 'user', content: 'What is the weather?' },
+        { role: 'assistant', content: 'Sunny.' },
+        { role: 'user', content: 'Thanks.' },
+      ],
+    });
+    const prompt = irToAnthropic(ir);
+    // System messages must NOT appear in the stdin prompt
+    assert.ok(!prompt.includes('[System]'), 'irToAnthropic must not emit [System] prefix (ADR 0009 Amendment 1)');
+    assert.ok(!prompt.includes('Be a weather bot.'), 'System content must not leak to stdin');
+    // Other roles must still appear
+    assert.ok(prompt.includes('What is the weather?'), 'User message must be present');
+    assert.ok(prompt.includes('[Assistant] Sunny.'), 'Assistant message must be annotated');
+    assert.ok(prompt.includes('Thanks.'), 'Second user message must be present');
+  });
+
+  // ── 41c: buildCliArgs ─────────────────────────────────────────────────
+
+  it('41c: buildCliArgs — no -p flag, includes stream-json + verbose + system-prompt', () => {
+    const args = buildCliArgs('claude-sonnet-4-6', 'You are a test assistant.');
+    // Must NOT include -p
+    assert.ok(!args.includes('-p'), 'buildCliArgs must NOT include -p (ADR 0009 Amendment 1)');
+    // Must include all required flags
+    assert.ok(args.includes('--output-format'), 'must include --output-format');
+    assert.ok(args.includes('stream-json'), 'must use stream-json output format');
+    assert.ok(args.includes('--verbose'), 'must include --verbose');
+    assert.ok(args.includes('--no-session-persistence'), 'must include --no-session-persistence');
+    assert.ok(args.includes('--system-prompt'), 'must include --system-prompt');
+    assert.ok(args.includes('You are a test assistant.'), 'system prompt text must be in args');
+    // Model flag
+    assert.ok(args.includes('--model'), 'must include --model');
+    assert.ok(args.includes('claude-sonnet-4-6'), 'must include model value');
+  });
+
+  // ── 41d: parseStreamJsonLines ─────────────────────────────────────────
+
+  it('41d-1: parseStreamJsonLines — single complete line → 1 event + empty remainder', () => {
+    const line = JSON.stringify({ type: 'system', subtype: 'init' });
+    const { events, remainder } = parseStreamJsonLines(line + '\n');
+    assert.equal(events.length, 1, 'Should parse 1 event');
+    assert.equal(events[0].type, 'system', 'Event type must be system');
+    assert.equal(remainder, '', 'Remainder must be empty after complete line');
+  });
+
+  it('41d-2: parseStreamJsonLines — incomplete trailing line → events from complete lines + remainder', () => {
+    const line1 = JSON.stringify({ type: 'system', subtype: 'init' });
+    const line2Partial = '{"type":"stream_eve'; // incomplete
+    const input = line1 + '\n' + line2Partial;
+    const { events, remainder } = parseStreamJsonLines(input);
+    assert.equal(events.length, 1, 'Should parse only the complete line');
+    assert.equal(events[0].type, 'system');
+    assert.equal(remainder, line2Partial, 'Incomplete line must be the remainder');
+  });
+
+  it('41d-3: parseStreamJsonLines — JSON parse error on one line → other lines parsed, error event returned', () => {
+    const line1 = JSON.stringify({ type: 'system', subtype: 'init' });
+    const badLine = 'not-valid-json{{{';
+    const line3 = JSON.stringify({ type: 'result', subtype: 'success' });
+    const input = line1 + '\n' + badLine + '\n' + line3 + '\n';
+    const { events, remainder } = parseStreamJsonLines(input);
+    assert.equal(events.length, 3, 'Should return 3 events (including parse_error)');
+    assert.equal(events[0].type, 'system', 'First event: system/init');
+    assert.equal(events[1].type, 'parse_error', 'Second event: parse_error for bad line');
+    assert.equal(events[1].raw, badLine, 'parse_error.raw must be the bad line');
+    assert.equal(events[2].type, 'result', 'Third event: result (parsed successfully)');
+    assert.equal(remainder, '', 'Remainder must be empty');
+  });
+
+  it('41d-4: parseStreamJsonLines — blank lines between events are skipped', () => {
+    const line1 = JSON.stringify({ type: 'system', subtype: 'init' });
+    const line2 = JSON.stringify({ type: 'result', subtype: 'success' });
+    // Extra blank line between them (common in some NDJSON writers)
+    const input = line1 + '\n\n' + line2 + '\n';
+    const { events, remainder } = parseStreamJsonLines(input);
+    assert.equal(events.length, 2, 'Blank lines must be skipped; 2 events expected');
+    assert.equal(events[0].type, 'system');
+    assert.equal(events[1].type, 'result');
+  });
+
+  // ── 41e: anthropicStreamJsonEventToIR ────────────────────────────────
+
+  it('41e-1: anthropicStreamJsonEventToIR — content_block_delta → delta chunk with text', () => {
+    const event = {
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hello' } },
+    };
+    const chunk = anthropicStreamJsonEventToIR(event, false);
+    assert.ok(chunk !== null, 'content_block_delta must yield an IR chunk');
+    assert.equal(chunk.type, 'delta', 'IR chunk type must be "delta"');
+    assert.equal(chunk.content, 'Hello', 'IR chunk content must match text_delta.text');
+    assert.ok(!('role' in chunk), 'Non-first delta must not include role');
+  });
+
+  it('41e-2: anthropicStreamJsonEventToIR — first content_block_delta includes role=assistant', () => {
+    const event = {
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hello' } },
+    };
+    const chunk = anthropicStreamJsonEventToIR(event, true /* isFirstDelta */);
+    assert.equal(chunk.type, 'delta');
+    assert.equal(chunk.content, 'Hello');
+    assert.equal(chunk.role, 'assistant', 'First delta must include role=assistant');
+  });
+
+  it('41e-3: anthropicStreamJsonEventToIR — result success → stop chunk', () => {
+    const event = { type: 'result', subtype: 'success', is_error: false, result: 'hello', total_cost_usd: 0.001 };
+    const chunk = anthropicStreamJsonEventToIR(event, false);
+    assert.ok(chunk !== null, 'result/success must yield an IR stop chunk');
+    assert.equal(chunk.type, 'stop', 'IR chunk type must be "stop"');
+    assert.equal(chunk.finish_reason, 'stop', 'finish_reason must be "stop"');
+  });
+
+  it('41e-4: anthropicStreamJsonEventToIR — result is_error → throws ProviderError', () => {
+    const event = { type: 'result', is_error: true, error_message: 'rate limited by upstream' };
+    assert.throws(
+      () => anthropicStreamJsonEventToIR(event, false),
+      err => err instanceof ProviderError && err.code === 'PROVIDER_ERROR',
+      'result with is_error must throw ProviderError(PROVIDER_ERROR)',
+    );
+  });
+
+  it('41e-5: anthropicStreamJsonEventToIR — system/init → null (consumed)', () => {
+    const event = { type: 'system', subtype: 'init', cwd: '/home/user', tools: [] };
+    const chunk = anthropicStreamJsonEventToIR(event, false);
+    assert.equal(chunk, null, 'system/init must return null (consumed, no yield)');
+  });
+
+  it('41e-6: anthropicStreamJsonEventToIR — rate_limit_event → null (consumed)', () => {
+    const event = { type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } };
+    const chunk = anthropicStreamJsonEventToIR(event, false);
+    assert.equal(chunk, null, 'rate_limit_event must return null (future audit/dashboard work)');
+  });
+
+  it('41e-7: anthropicStreamJsonEventToIR — assistant (aggregate) → null', () => {
+    const event = { type: 'assistant', message: { content: [{ type: 'text', text: 'OK' }] } };
+    const chunk = anthropicStreamJsonEventToIR(event, false);
+    assert.equal(chunk, null, 'assistant aggregate event must return null (deltas already streamed)');
+  });
+
+  it('41e-8: anthropicStreamJsonEventToIR — parse_error event → null (already logged)', () => {
+    const event = { type: 'parse_error', raw: 'bad json' };
+    const chunk = anthropicStreamJsonEventToIR(event, false);
+    assert.equal(chunk, null, 'parse_error must return null');
+  });
+
+  // ── 41f: Full end-to-end mock spawn integration ───────────────────────
+
+  it('41f: full NDJSON stream-in → IR chunks-out integration via __setSpawnImpl', async () => {
+    // Simulates real claude CLI output: system/init + content_block_deltas + result/success.
+    // Verifies the complete pipeline: stdin write → NDJSON parse → IR yield → stop.
+    const fakeSpawn = makeMockSpawnNDJSON(['Answer: ', '42']);
+    __setSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [
+          { role: 'system', content: 'Be precise.' },
+          { role: 'user', content: 'What is 6 × 7?' },
+        ],
+      });
+      const authCtx = { accessToken: '<fake-oauth-token>' };
+      const chunks = [];
+      for await (const chunk of anthropic.spawn(ir, authCtx)) {
+        chunks.push(chunk);
+      }
+
+      // Expected: 2 delta chunks + 1 stop chunk from result event
+      const deltas = chunks.filter(c => c.type === 'delta');
+      const stops = chunks.filter(c => c.type === 'stop');
+      assert.equal(deltas.length, 2, `Expected 2 deltas, got ${deltas.length}`);
+      assert.equal(stops.length, 1, `Expected 1 stop, got ${stops.length}`);
+
+      // Content must be the streamed text
+      const content = deltas.map(c => c.content).join('');
+      assert.equal(content, 'Answer: 42');
+
+      // First delta must carry role=assistant
+      assert.equal(deltas[0].role, 'assistant', 'First delta must include role=assistant');
+      // Subsequent deltas must not carry role
+      assert.ok(!('role' in deltas[1]), 'Subsequent deltas must not carry role');
+
+      // Stop must have finish_reason='stop'
+      assert.equal(stops[0].finish_reason, 'stop');
+    } finally {
+      __resetSpawnImpl();
+    }
+  });
+
+  it('41g: buildCliArgs arg order check — model flag before output-format (predictable arg order)', () => {
+    const args = buildCliArgs('claude-opus-4-7', 'Test prompt');
+    const modelIdx = args.indexOf('--model');
+    const formatIdx = args.indexOf('--output-format');
+    const verboseIdx = args.indexOf('--verbose');
+    const nspIdx = args.indexOf('--no-session-persistence');
+    const spIdx = args.indexOf('--system-prompt');
+
+    assert.ok(modelIdx >= 0, '--model must be present');
+    assert.ok(formatIdx >= 0, '--output-format must be present');
+    assert.ok(verboseIdx >= 0, '--verbose must be present');
+    assert.ok(nspIdx >= 0, '--no-session-persistence must be present');
+    assert.ok(spIdx >= 0, '--system-prompt must be present');
+
+    // --no-session-persistence must come before --system-prompt
+    assert.ok(nspIdx < spIdx, '--no-session-persistence must precede --system-prompt');
+    // model value must follow immediately after --model
+    assert.equal(args[modelIdx + 1], 'claude-opus-4-7', '--model value must follow the flag');
   });
 });

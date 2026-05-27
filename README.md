@@ -283,7 +283,7 @@ See [ADR 0004 (Fallback Engine)](./docs/adr/0004-fallback-engine.md), [ADR 0007 
 
 OLP v0.5.0+ surfaces live subscription quota for Anthropic Pro/Max subscribers on the owner-only `/dashboard`. Per-provider rows show 5-hour and 7-day utilization bars with reset countdowns, status badges, representative-claim hints, and a manual refresh button. The panel auto-refreshes every 60 seconds and pauses when the tab is hidden.
 
-![OLP v0.5.0 dashboard — Plan Usage panel with live anthropic quota](./docs/img/dashboard-v0.5.0.png)
+![OLP v0.5.1 dashboard — Plan Usage panel with live anthropic quota (utilization 5h: 6%, 7d: 38%, status: live)](./docs/img/dashboard-v0.5.1.png)
 
 ### How it works
 

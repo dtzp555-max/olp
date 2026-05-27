@@ -7,6 +7,23 @@
 
 ## Amendments
 
+### Amendment 3 — 2026-05-27: Accept OpenAI `role: "developer"` at entry surface, normalize to `system` in IR
+
+- **Finding:** Hermes Agent v0.13/v0.14 (and likely Cline, Continue.dev, and other modern openai-completions clients) default to `role: "developer"` for what was historically the `system`-role slot when the model id matches OpenAI's o1/o3+ reasoning family. The `developer` role was introduced by OpenAI's Responses-API spec for reasoning models (high-priority developer-authored instructions; semantically a peer of `system`). OLP IR's role allow-list at v0.1 was the original four roles (`system|user|assistant|tool`); the IR validator rejected `developer` with `400 IR validation failed: role must be one of system|user|assistant|tool, got "developer"`. Reproduced 2026-05-27 on PI230 Hermes v0.14.0 → OLP v0.5.1 routing path.
+- **Decision:** Extend `openai-to-ir.mjs:normalizeRole()` to map `developer` → `system` at the entry boundary. The IR's canonical-four-roles invariant is preserved; every provider plugin's role-handling stays unchanged. The normalize-at-entry pattern matches the existing `function` → `tool` normalization that already lives in the same function (function-role-deprecation was the precedent for entry-boundary normalization vs. IR schema bloat).
+- **Why not "add `developer` to VALID_ROLES + handle in every provider":** That alternative would require:
+  - Expanding `VALID_ROLES` in `lib/ir/types.mjs`.
+  - Adding `developer` branch in `anthropic.mjs:irToAnthropic` (which would map to `[System]` annotation anyway).
+  - Adding `developer` branch in `codex.mjs:irToCodex` (would map to `[System]` annotation anyway).
+  - Adding `developer` branch in `mistral.mjs:irToMistral` (same).
+  - Coordinating every future role addition (e.g., if OpenAI adds another role tomorrow) across N provider plugins.
+  - Wider IR surface area = more drift-prone over time.
+  Normalize-at-entry centralizes role-spec-evolution handling in one file. ADR 0003's IR-design principle ("encode the common subset every provider plugin can consume") supports keeping the IR minimal.
+- **Forward note:** Future OpenAI role additions follow the same pattern: extend `normalizeRole()`. If a role genuinely conveys provider-distinguishable semantics (e.g., a hypothetical role that meaningfully changes anthropic vs codex behavior), the calculus flips and a IR-level addition would be justified. That decision goes through a new ADR 0003 amendment.
+- **Cache-key impact:** After this amendment, a request whose first message uses `role: "developer"` and one using `role: "system"` with otherwise-identical content produce the **same** IR (because normalization happens before IR construction) → the **same** cache key (per ADR 0005 cache key composition). This is intentional and matches OpenAI's own backward-compat behavior ("system message with reasoning models is treated as developer"). If a future debug session is investigating "why does my new `developer` request hit a cache entry from an old `system` request" — this is by design.
+- **Tests:** Suite IR translation in `test-features.mjs` gains three pin tests: (a) `role: "developer"` → `role: "system"` translation, (b) mixed-role array including developer validates cleanly through to IR, (c) negative control — an unknown role (e.g. `"admin"`) still raises `BadRequestError`, confirming the normalize-at-entry mapping did not accidentally widen the role allow-list.
+- **Authority:** OpenAI Responses API spec — developer role documented as high-priority developer-authored instructions for o1/o3+ reasoning models (https://platform.openai.com/docs/api-reference/responses). Hermes Agent / Cline / Continue.dev tracking the same convention. Reproduced live on PI230 → PI231 OLP 2026-05-27.
+
 ### Amendment 2 — 2026-05-24: Correct model-mapping example; document verbatim-pass-through design (D32 F2)
 
 - **Finding:** Round-4 cold-audit F2 (P3 ADR example vs implementation drift) — § Decision "Required fields" item `model` reads: "The provider plugin maps this to the provider-native model identifier (e.g., `claude-sonnet-4-6` → `claude-sonnet-4-6-20260301` for Anthropic)." This is WRONG per the D17 SPOT decision (commit `cb86807`): OLP does NOT perform a model-alias mapping inside the provider plugin. `irRequest.model` is passed verbatim to the provider CLI (`claude -p --model <model>`, `codex exec --model <model>`, etc.); each provider's CLI resolves its own aliases natively per its documented behaviour.

@@ -319,6 +319,45 @@ describe('openAIToIR translation', () => {
     assert.equal(ir.messages[0].name, 'my_fn');
   });
 
+  it('maps role=developer to role=system (OpenAI o1/o3+ reasoning shape)', () => {
+    const ir = openAIToIR({
+      model: 'm',
+      messages: [{ role: 'developer', content: 'High-priority instructions.' }],
+    });
+    assert.equal(ir.messages[0].role, 'system', 'developer should normalize to system');
+    assert.equal(ir.messages[0].content, 'High-priority instructions.');
+  });
+
+  it('mixed roles including developer all validate cleanly through IR', () => {
+    const ir = openAIToIR({
+      model: 'm',
+      messages: [
+        { role: 'developer', content: 'Be terse.' },
+        { role: 'user', content: 'Hi.' },
+        { role: 'assistant', content: 'Hello.' },
+      ],
+    });
+    assert.equal(ir.messages.length, 3);
+    assert.equal(ir.messages[0].role, 'system');
+    assert.equal(ir.messages[1].role, 'user');
+    assert.equal(ir.messages[2].role, 'assistant');
+  });
+
+  it('rejects an unknown role at entry — normalize didn\'t accidentally widen allow-list', () => {
+    // Negative control for Amendment 3 — without this pin, a future addition
+    // to normalizeRole that returns `role` as-is for unknown inputs would silently
+    // widen the IR role allow-list. Confirms developer→system mapping is the only
+    // entry-surface escape hatch.
+    assert.throws(
+      () => openAIToIR({
+        model: 'm',
+        messages: [{ role: 'admin', content: 'I am god.' }],
+      }),
+      err => err instanceof BadRequestError && /role must be one of/.test(err.message),
+      'unknown role should still produce BadRequestError'
+    );
+  });
+
   it('translates request with tools', () => {
     const ir = openAIToIR({
       model: 'm',

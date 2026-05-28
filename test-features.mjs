@@ -4454,11 +4454,18 @@ import {
   __snapshotRecentErrors,
   __resetRequestCounters,
   __resetSandboxStatusCache,
+  __resetSandboxManagerForTests,
 } from './server.mjs';
 import {
   checkSandboxAvailability,
   describeSandboxStatus,
 } from './lib/sandbox/doctor.mjs';
+import {
+  bootstrapSandbox,
+  isSandboxActive,
+  wrapSpawn,
+  __resetSandboxManagerForTests as _resetSandboxMgr,
+} from './lib/sandbox/manager.mjs';
 
 // ── Phase 2 / D45+D46 server-side default override ────────────────────────
 // Override the production-off defaults so that existing pre-D45 HTTP
@@ -18010,5 +18017,312 @@ describe('Suite 42 — Phase 7 PR-A: lib/sandbox/doctor.mjs + /health.sandbox', 
       `/health sandbox.available (${sb.available}) must match checkSandboxAvailability() (${libResult.available})`);
     assert.equal(sb.platform, libResult.details.platform,
       '/health sandbox.platform must match checkSandboxAvailability().details.platform');
+  });
+});
+
+// ── Suite 43 — Phase 7 PR-B: lib/sandbox/manager.mjs unit tests ─────────────
+//
+// Tests for: bootstrapSandbox (availability gating), isSandboxActive,
+//   wrapSpawn (pass-through when inactive, transform when active),
+//   __resetSandboxManagerForTests state isolation.
+//
+// Strategy: mock checkSandboxAvailability and SandboxManager.initialize via
+//   module-level state manipulations through the manager's exported functions.
+//   We cannot mock ES module imports directly, so we drive the manager through
+//   its public API and use __resetSandboxManagerForTests to ensure test isolation.
+//
+// Authority:
+//   @anthropic-ai/sandbox-runtime v0.0.52
+//   https://github.com/anthropic-experimental/sandbox-runtime
+//   OLP ADR 0014 § PR-B acceptance criteria
+//   ALIGNMENT.md Rule 1 — provider plugin authority citation
+
+describe('Suite 43 — Phase 7 PR-B: lib/sandbox/manager.mjs', () => {
+
+  // ── 43a: bootstrapSandbox returns { active:false } when doctor says unavailable ──
+
+  it('43a: bootstrapSandbox returns { active:false, reason } when sandbox not available (macOS/no-deps path)', async () => {
+    await _resetSandboxMgr();
+    // On macOS (dev machine), checkSandboxAvailability() returns available=false
+    // because bwrap+socat are Linux-only deps. bootstrapSandbox() must return
+    // active:false with a non-empty reason string.
+    //
+    // If somehow this runs on a fully-equipped Linux host where all deps ARE
+    // installed and SandboxManager.initialize() succeeds, we allow active:true.
+    const result = await bootstrapSandbox();
+    assert.ok(typeof result === 'object' && result !== null, 'result must be an object');
+    assert.ok(typeof result.active === 'boolean', 'result.active must be boolean');
+
+    if (!result.active) {
+      assert.ok(typeof result.reason === 'string' && result.reason.length > 0,
+        'When active=false, reason must be a non-empty string');
+    } else {
+      // active=true is valid on a Linux host with bwrap+socat+rg installed
+      assert.ok(typeof result.summary === 'string' && result.summary.length > 0,
+        'When active=true, summary must be a non-empty string');
+    }
+    await _resetSandboxMgr();
+  });
+
+  // ── 43b: bootstrapSandbox is idempotent ──
+
+  it('43b: bootstrapSandbox returns the same result on second call (idempotent, uses cached state)', async () => {
+    await _resetSandboxMgr();
+    const r1 = await bootstrapSandbox();
+    const r2 = await bootstrapSandbox();   // second call — should use cached state
+    assert.equal(r1.active, r2.active, 'active must be consistent across idempotent calls');
+    await _resetSandboxMgr();
+  });
+
+  // ── 43c: bootstrapSandbox with force=true re-runs bootstrap ──
+
+  it('43c: bootstrapSandbox({ force:true }) re-runs bootstrap (does not use cached state)', async () => {
+    await _resetSandboxMgr();
+    const r1 = await bootstrapSandbox();
+    const r2 = await bootstrapSandbox({ force: true }); // force re-run
+    assert.equal(r1.active, r2.active,
+      'active must be the same value on re-run (same environment)');
+    await _resetSandboxMgr();
+  });
+
+  // ── 43d: isSandboxActive returns false before bootstrap ──
+
+  it('43d: isSandboxActive returns false before bootstrapSandbox is called', async () => {
+    await _resetSandboxMgr();
+    assert.equal(isSandboxActive(), false,
+      'isSandboxActive must return false before bootstrapSandbox is called');
+    await _resetSandboxMgr();
+  });
+
+  // ── 43e: wrapSpawn returns inputs unchanged when sandbox inactive ──
+
+  it('43e: wrapSpawn returns inputs unchanged (sandboxed:false) when sandbox inactive', async () => {
+    await _resetSandboxMgr();
+    // Ensure inactive (no bootstrap called)
+    assert.equal(isSandboxActive(), false, 'precondition: sandbox inactive');
+
+    const result = await wrapSpawn({
+      bin: 'claude',
+      args: ['--model', 'claude-sonnet-4-6'],
+      env: { HOME: '/tmp' },
+      cwd: '/tmp',
+      allowedDomains: ['api.anthropic.com'],
+    });
+
+    assert.equal(result.bin, 'claude', 'bin must be unchanged when sandbox inactive');
+    assert.deepEqual(result.args, ['--model', 'claude-sonnet-4-6'],
+      'args must be unchanged when sandbox inactive');
+    assert.deepEqual(result.env, { HOME: '/tmp' },
+      'env must be unchanged when sandbox inactive');
+    assert.equal(result.sandboxed, false, 'sandboxed must be false when sandbox inactive');
+    await _resetSandboxMgr();
+  });
+
+  // ── 43f: wrapSpawn with sandboxed active (mock test — skip if sandbox inactive) ──
+
+  it('43f: wrapSpawn returns { bin:/bin/sh, args:[-c, ...], sandboxed:true } when sandbox active', async () => {
+    await _resetSandboxMgr();
+    const bootResult = await bootstrapSandbox();
+
+    if (!bootResult.active) {
+      // Skip: sandbox not available on this machine (macOS without bwrap+socat)
+      // This test requires PI231 with bwrap+socat installed.
+      // Suite 44 covers the PI231-gated end-to-end path.
+      console.log('  [43f] SKIP — sandbox not available on this machine; sandbox=inactive');
+      await _resetSandboxMgr();
+      return;
+    }
+
+    // Sandbox is active — verify wrapSpawn transforms the command
+    const result = await wrapSpawn({
+      bin: 'echo',
+      args: ['hello'],
+      env: { HOME: '/tmp' },
+      cwd: undefined,
+      allowedDomains: ['api.anthropic.com'],
+    });
+
+    assert.equal(result.bin, '/bin/sh', 'bin must be /bin/sh when sandbox active');
+    assert.ok(Array.isArray(result.args), 'args must be an array');
+    assert.equal(result.args[0], '-c', 'args[0] must be -c (shell invocation)');
+    assert.ok(typeof result.args[1] === 'string' && result.args[1].length > 0,
+      'args[1] must be the wrapped shell command string');
+    assert.equal(result.sandboxed, true, 'sandboxed must be true when sandbox active');
+    // env passed through unchanged
+    assert.deepEqual(result.env, { HOME: '/tmp' }, 'env must be passed through unchanged');
+    // cwd is an ephemeral /tmp/olp-spawn/<id>/ dir
+    assert.ok(result.cwd && result.cwd.startsWith('/tmp/olp-spawn/'),
+      `cwd must be under /tmp/olp-spawn/; got ${result.cwd}`);
+    await _resetSandboxMgr();
+  });
+
+  // ── 43g: __resetSandboxManagerForTests clears state ──
+
+  it('43g: __resetSandboxManagerForTests clears state — isSandboxActive returns false after reset', async () => {
+    await _resetSandboxMgr();
+    // Bootstrap to set some state
+    await bootstrapSandbox();
+    // Now reset
+    await _resetSandboxMgr();
+    // State must be cleared
+    assert.equal(isSandboxActive(), false,
+      'isSandboxActive must return false after __resetSandboxManagerForTests');
+  });
+
+  // ── 43h: /health includes sandbox.active field ──
+
+  it('43h: /health.sandbox includes active:boolean field (PR-B extension of PR-A sandbox field)', async () => {
+    await _resetSandboxMgr();
+    __resetSandboxStatusCache();
+    __setAuthConfig({
+      allow_anonymous: true,
+      owner_only_endpoints: [],
+      fallback_detail_header_policy: 'all',
+    });
+    const port = 22900 + Math.floor(Math.random() * 100);
+    const server = createOlpServer();
+    await new Promise((resolve, reject) => {
+      server.listen(port, '127.0.0.1', resolve);
+      server.once('error', reject);
+    });
+    try {
+      const r = await fetch({ port, method: 'GET', path: '/health' });
+      assert.equal(r.status, 200);
+      const body = JSON.parse(r.body);
+      assert.ok('sandbox' in body, '/health must include sandbox field');
+      assert.ok('active' in body.sandbox, '/health.sandbox must include active field (PR-B)');
+      assert.ok(typeof body.sandbox.active === 'boolean',
+        '/health.sandbox.active must be boolean');
+    } finally {
+      await new Promise(r => server.close(r));
+      await _resetSandboxMgr();
+      __resetSandboxStatusCache();
+      __resetAuthConfig();
+    }
+  });
+});
+
+// ── Suite 44 — Phase 7 PR-B: sandbox negative security test (PI231 only) ───────
+//
+// Load-bearing acceptance test per ADR 0014 § 4.1.
+// SKIPPED by default — requires OLP_E2E_SANDBOX=1 environment variable.
+// Run on PI231 after apt-get install bubblewrap socat + server restart:
+//
+//   OLP_E2E_SANDBOX=1 npm test
+//
+// 44a: in-sandbox spawn of `cat ~/.olp/keys.json` MUST fail — confirms isolation.
+//      Any pass (file content leaked) is a blocking security failure.
+// 44b: in-sandbox spawn of `echo SANDBOX_PROOF` MUST succeed — confirms sandbox
+//      does not break basic spawn execution.
+//
+// Authority:
+//   @anthropic-ai/sandbox-runtime v0.0.52 + ADR 0014 § 4.1 PR-B acceptance criteria
+//   cc-mem incident 2026-05-27 § 3 (OAuth token exposure via prompt injection)
+//   spike-deny.mjs (PI231 2026-05-28) — reference PoC confirming deny semantics
+
+const _RUN_SANDBOX_E2E = Boolean(process.env.OLP_E2E_SANDBOX);
+
+describe('Suite 44 — sandbox negative security test (PI231 only)', { skip: !_RUN_SANDBOX_E2E }, () => {
+
+  before(async () => {
+    await _resetSandboxMgr();
+    const boot = await bootstrapSandbox();
+    if (!boot.active) {
+      throw new Error(
+        `Suite 44 requires sandbox active but bootstrapSandbox returned active:false. ` +
+        `Reason: ${boot.reason}. ` +
+        `Install bubblewrap + socat + ripgrep and re-run.`,
+      );
+    }
+  });
+
+  after(async () => {
+    await _resetSandboxMgr();
+  });
+
+  it('44a: in-sandbox spawn of `cat ~/.olp/keys.json` MUST fail — confirms filesystem isolation', async () => {
+    // Security requirement: the sandboxed process must NOT be able to read
+    // ~/.olp/keys.json (or any file under ~/.olp/). If it can, sandbox is broken.
+    //
+    // Verification: wrap a `cat` command for the keys path, spawn it, verify
+    // exit code != 0 AND stdout does not contain file content.
+    const keysPath = `${homedir()}/.olp/keys.json`;
+    const { spawn: realSpawn } = await import('node:child_process');
+
+    const wrapped = await wrapSpawn({
+      bin: 'cat',
+      args: [keysPath],
+      env: { ...process.env },
+      cwd: undefined,
+      allowedDomains: [],  // no network needed for this test
+    });
+
+    assert.equal(wrapped.sandboxed, true,
+      'Precondition: wrapped.sandboxed must be true');
+
+    const exitCode = await new Promise((resolve) => {
+      let stdout = '';
+      let stderr = '';
+      const child = realSpawn(wrapped.bin, wrapped.args, {
+        env: wrapped.env,
+        cwd: wrapped.cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      child.stdout.on('data', d => { stdout += d.toString(); });
+      child.stderr.on('data', d => { stderr += d.toString(); });
+      child.on('exit', (code) => {
+        // Security check: stdout must NOT contain any recognizable key material
+        // (key IDs contain 'olp_' prefix or structured JSON).
+        const leaked = stdout.includes('"id"') || stdout.includes('"token"') || stdout.length > 200;
+        if (leaked) {
+          // Force test to fail with clear message
+          resolve(-999);
+        } else {
+          resolve(code ?? 1);
+        }
+      });
+    });
+
+    // Exit code must be non-zero (permission denied / no such file in sandbox)
+    assert.notEqual(exitCode, 0,
+      `SECURITY FAILURE: sandboxed cat of ${keysPath} returned exit code 0. ` +
+      `File content was accessible inside sandbox — sandbox is NOT isolating. ` +
+      `This is a blocking PR-B acceptance failure.`);
+    assert.notEqual(exitCode, -999,
+      `SECURITY FAILURE: sandboxed cat of ${keysPath} produced output that looks like key content. ` +
+      `Sandbox is NOT isolating file reads.`);
+  });
+
+  it('44b: in-sandbox spawn of `echo SANDBOX_PROOF` MUST succeed (basic sandbox function check)', async () => {
+    // Positive test: verify the sandbox does not break basic command execution.
+    // echo is a shell builtin / standard binary; must always succeed.
+    const { spawn: realSpawn } = await import('node:child_process');
+
+    const wrapped = await wrapSpawn({
+      bin: 'echo',
+      args: ['SANDBOX_PROOF'],
+      env: { ...process.env },
+      cwd: undefined,
+      allowedDomains: [],
+    });
+
+    assert.equal(wrapped.sandboxed, true,
+      'Precondition: wrapped.sandboxed must be true');
+
+    const { exitCode, stdout } = await new Promise((resolve) => {
+      let stdout = '';
+      const child = realSpawn(wrapped.bin, wrapped.args, {
+        env: wrapped.env,
+        cwd: wrapped.cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      child.stdout.on('data', d => { stdout += d.toString(); });
+      child.on('exit', (code) => resolve({ exitCode: code, stdout }));
+    });
+
+    assert.equal(exitCode, 0,
+      `echo SANDBOX_PROOF inside sandbox exited with code ${exitCode} — basic spawn function broken`);
+    assert.ok(stdout.includes('SANDBOX_PROOF'),
+      `stdout must contain SANDBOX_PROOF; got: ${stdout.slice(0, 100)}`);
   });
 });

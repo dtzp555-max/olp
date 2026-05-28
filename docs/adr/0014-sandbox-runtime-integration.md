@@ -65,7 +65,7 @@ The sandbox integration is split into four discrete PRs, each independently revi
 | PR | Scope | Blocking condition | Status |
 |---|---|---|---|
 | **PR-A** (this PR) | npm dep `@anthropic-ai/sandbox-runtime ^0.0.52` + `lib/sandbox/doctor.mjs` (preflight module) + `/health` `sandbox` field + ADR 0014 | None — no runtime initialization | ✅ Accepted |
-| **PR-B** | `lib/providers/anthropic.mjs` spawn wrapped in `SandboxManager.wrapWithSandbox` | `bubblewrap` + `socat` + `rg` installed on PI231 (`sudo apt-get install -y bubblewrap socat ripgrep`) | 🔲 Blocked on apt install |
+| **PR-B** | `lib/sandbox/manager.mjs` (bootstrap + spawn-wrap) + `lib/providers/anthropic.mjs` spawn wrapped + server startup wiring + `/health.sandbox.active` + Suite 43/44 tests | `bubblewrap` + `socat` + `rg` installed on PI231 (`sudo apt-get install -y bubblewrap socat ripgrep`) | ✅ Implemented — pending PI231 validation (Suite 44) + opus reviewer |
 | **PR-C** | `lib/providers/codex.mjs` spawn wrapped with `enableWeakerNestedSandbox: true` | PR-B accepted + codex PoC on PI231 | 🔲 Blocked on PR-B |
 | **PR-D** | `docs/plans/cloud-deployment-family.md` § "Phase 7 prerequisite met" update; cloud rollout unblocked | PR-B + PR-C accepted | 🔲 Blocked on PR-C |
 
@@ -142,25 +142,34 @@ The result is memoized process-wide via `_sandboxStatusCache` in `server.mjs`. T
 }
 ```
 
-When available (after apt install + process restart):
+When available (after apt install + process restart) and PR-B bootstrapped:
 
 ```json
 {
   "sandbox": {
     "available": true,
+    "active": true,
     "missing": [],
     "platform": "linux"
   }
 }
 ```
 
+(PR-A shape did not include `active`. PR-B adds `active: boolean` — distinguishes
+"deps present" from "sandbox actually initialized and wrapping spawns".)
+
 ---
 
-## 4. PR-B/C/D acceptance criteria (preview — locked in later PRs)
+## 4. PR-B/C/D acceptance criteria
 
-These criteria are recorded here to prevent scope creep in the later PRs. Criteria may be refined by subsequent ADR amendments.
+### 4.1 PR-B (anthropic.mjs spawn wrap) — ✅ Implementation shipped, PI231 validation pending
 
-### 4.1 PR-B (anthropic.mjs spawn wrap)
+**PR-B implementation (commit pending reviewer):**
+- `lib/sandbox/manager.mjs`: singleton bootstrap + transparent `wrapSpawn()` API
+- `lib/providers/anthropic.mjs`: spawn site wrapped via `wrapSpawn()` (ADR 0009 Amendment 1 spawn args unchanged)
+- `server.mjs`: `bootstrapSandbox()` called before `server.listen()`, `/health.sandbox.active` field added
+- `test-features.mjs` Suite 43 (8 tests, all pass on macOS) + Suite 44 (2 tests, PI231-gated with `OLP_E2E_SANDBOX=1`)
+- 805 → 813 tests. Suite 44 skipped by default; runs on PI231 after apt install.
 
 **Load-bearing negative test (required for PR-B to merge):**
 

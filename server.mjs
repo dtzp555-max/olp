@@ -75,6 +75,11 @@ import { appendAuditEvent } from './lib/audit.mjs';
 // process-wide (bwrap/socat install state does not change at runtime; we don't
 // want a child_process.execFileSync per /health call).
 import { checkSandboxAvailability } from './lib/sandbox/doctor.mjs';
+// Phase 7 / PR-B — sandbox manager bootstrap + spawn-wrap (ADR 0014 § PR-B).
+// bootstrapSandbox() is called at server startup (before listen) and sets up
+// the process-wide SandboxManager singleton. isSandboxActive() is used by
+// /health to report sandbox.active.
+import { bootstrapSandbox, isSandboxActive, __resetSandboxManagerForTests } from './lib/sandbox/manager.mjs';
 // Phase 3 / D50 — management endpoints consume the audit aggregate query layer.
 // D81 (Phase 5) — adds aggregateProviderQuota for quota_v2 shape.
 import {
@@ -896,6 +901,11 @@ async function handleHealth(req, res) {
   }
   const sandboxField = {
     available: _sandboxStatusCache.available,
+    // Phase 7 PR-B: active = sandbox was bootstrapped and SandboxManager is
+    // ready to wrap spawns. available=true + active=true means every provider
+    // spawn is actually sandboxed. available=true + active=false means deps
+    // present but bootstrap failed at runtime (see server startup log).
+    active: isSandboxActive(),
     missing: _sandboxStatusCache.missing ?? [],
     platform: _sandboxStatusCache.details?.platform ?? process.platform,
   };
@@ -2358,6 +2368,8 @@ export function createOlpServer() {
 }
 
 export { router, loadedProviders, VERSION };
+// Phase 7 PR-B: re-export sandbox manager test seam so tests can reset state.
+export { __resetSandboxManagerForTests };
 
 // Main guard: only listen when invoked as the entrypoint. ESM equivalent of
 // `require.main === module` is comparing import.meta.url against argv[1].
@@ -2370,6 +2382,22 @@ const isMain = (() => {
 })();
 
 if (isMain) {
+  // Phase 7 PR-B (ADR 0014 § PR-B): bootstrap sandbox before listening.
+  // bootstrapSandbox() is idempotent + error-safe — server always starts even
+  // if sandbox initialization fails (degrades to unsandboxed, logs a warning).
+  // The /health.sandbox.active field reflects the result.
+  const sandboxBoot = await bootstrapSandbox();
+  if (sandboxBoot.active) {
+    process.stdout.write(
+      `OLP sandbox active (config-at-boot): ${sandboxBoot.summary}\n`,
+    );
+  } else {
+    process.stderr.write(
+      `OLP sandbox NOT active: ${sandboxBoot.reason} — ` +
+      `provider spawns will run UNSANDBOXED (test/dev only; not safe for cloud)\n`,
+    );
+  }
+
   const server = createOlpServer();
   server.listen(PORT, BIND, () => {
     const enabledCount = loadedProviders.size;

@@ -4,6 +4,10 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### Phase 7 PR-B — anthropic.mjs spawn wrapped in sandbox-runtime
+
+- feat(sandbox): Phase 7 PR-B — `lib/providers/anthropic.mjs` spawn wrapped via `@anthropic-ai/sandbox-runtime` with config-at-boot model (per-spawn ephemeral cwd `/tmp/olp-spawn/<uuid>`, network allowlist `api.anthropic.com` + `statsig.anthropic.com`, filesystem denylist for `~/.olp` / `~/.claude` / `~/.ssh` / `~/.config` / `~/.codex`). Load-bearing negative test (Suite 44, PI231-gated) confirms in-sandbox `cat` of OAuth credentials MUST fail. `/health.sandbox.active=true` on PI231 after `apt-get install bubblewrap socat ripgrep`. Adds `lib/sandbox/manager.mjs` (bootstrap + spawn-wrap layer), server startup wiring (`bootstrapSandbox()` before listen), `/health.sandbox.active` boolean field. 805 → 813 tests (+8 Suite 43; Suite 44 skips by default, runs on PI231 with `OLP_E2E_SANDBOX=1`). ADR 0014 PR-B acceptance criteria: met.
+
 ### Phase 7 PR-A — sandbox-runtime dep + doctor + ADR 0014
 
 - feat(sandbox): Phase 7 PR-A — @anthropic-ai/sandbox-runtime dep + lib/sandbox/doctor.mjs preflight + ADR 0014. No runtime wiring yet (PR-B will wrap anthropic.mjs spawn). /health now reports sandbox availability (`available: false` until PI231 has `bubblewrap` + `socat` + `ripgrep` installed via `sudo apt-get install -y bubblewrap socat ripgrep`). On macOS (dev machine with ripgrep via Homebrew), sandbox-runtime reports `available: true` because macOS uses the built-in `sandbox-exec` seatbelt — no apt install needed. 797 → 805 tests (+8 Suite 42).

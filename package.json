@@ -49,5 +49,8 @@
     "mistral",
     "fallback",
     "cache"
-  ]
+  ],
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.52"
+  }
 }

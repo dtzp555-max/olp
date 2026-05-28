@@ -4,6 +4,10 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
+### Phase 7 PR-A — sandbox-runtime dep + doctor + ADR 0014
+
+- feat(sandbox): Phase 7 PR-A — @anthropic-ai/sandbox-runtime dep + lib/sandbox/doctor.mjs preflight + ADR 0014. No runtime wiring yet (PR-B will wrap anthropic.mjs spawn). /health now reports sandbox availability (`available: false` until PI231 has `bubblewrap` + `socat` + `ripgrep` installed via `sudo apt-get install -y bubblewrap socat ripgrep`). On macOS (dev machine with ripgrep via Homebrew), sandbox-runtime reports `available: true` because macOS uses the built-in `sandbox-exec` seatbelt — no apt install needed. 797 → 805 tests (+8 Suite 42).
+
 ### Phase 6 D-day — stream-json transport for Anthropic provider (ADR 0009 Amendment 1)
 
 - feat(anthropic): stream-json output + --system-prompt suppression of env-block / tool descriptions (ADR 0009 Amendment 1). Cuts ~64% per-request cost on Sonnet 4.6 via 30% input-token reduction ($0.0216 → $0.0078), fixes bot self-check hallucination (model no longer claims server cwd / OS / tool names), exposes rate_limit + usage events from NDJSON for future audit/dashboard work. Per-key API + cache + audit semantics unchanged. claude CLI v2.1.104 verified; warn if claude-version outside v2.1.100–v2.1.149.

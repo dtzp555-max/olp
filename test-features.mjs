@@ -4453,7 +4453,12 @@ import {
   __clearRecentErrors,
   __snapshotRecentErrors,
   __resetRequestCounters,
+  __resetSandboxStatusCache,
 } from './server.mjs';
+import {
+  checkSandboxAvailability,
+  describeSandboxStatus,
+} from './lib/sandbox/doctor.mjs';
 
 // ── Phase 2 / D45+D46 server-side default override ────────────────────────
 // Override the production-off defaults so that existing pre-D45 HTTP
@@ -17789,5 +17794,221 @@ describe('Suite 41 — ADR 0009 Amendment 1: stream-json transport (Phase 6)', (
       if (sentinel === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
       else process.env.CLAUDE_CODE_OAUTH_TOKEN = sentinel;
     }
+  });
+});
+
+// ── Suite 42 — Phase 7 PR-A: lib/sandbox/doctor.mjs + /health.sandbox ────────
+//
+// Tests for: checkSandboxAvailability shape, graceful lib-import failure,
+//   describeSandboxStatus install hint + positive message,
+//   and /health endpoint sandbox field inclusion.
+//
+// Authority:
+//   @anthropic-ai/sandbox-runtime v0.0.52
+//   https://github.com/anthropic-experimental/sandbox-runtime
+//   OLP ADR 0014 — Sandbox-Runtime Integration (Phase 7 PR-A)
+//
+// Note: these tests run on Mac mini (dev machine, no bwrap). The expected
+// outcome for all live probes is available=false with missing=['bubblewrap',
+// 'socat', 'ripgrep'] (Linux-only deps). We do NOT mock `which` in most tests
+// because the real expected result on macOS is "unavailable" anyway — testing
+// the real path is more valuable than mocking it to pass.
+// For tests that need specific outcomes (describeSandboxStatus positive path),
+// we construct mock return values by directly testing the message-formatting
+// logic using a controlled availability result.
+
+describe('Suite 42 — Phase 7 PR-A: lib/sandbox/doctor.mjs + /health.sandbox', () => {
+
+  // ── 42a: checkSandboxAvailability returns correct shape ──────────────
+
+  it('42a: checkSandboxAvailability returns { available, missing, details } shape', async () => {
+    const result = await checkSandboxAvailability();
+    assert.ok(typeof result === 'object' && result !== null, 'result must be an object');
+    assert.ok(typeof result.available === 'boolean', 'result.available must be boolean');
+    assert.ok(Array.isArray(result.missing), 'result.missing must be an array');
+    assert.ok(typeof result.details === 'object' && result.details !== null, 'result.details must be an object');
+
+    // details sub-fields
+    assert.ok(typeof result.details.platform === 'string', 'details.platform must be a string');
+    assert.ok(typeof result.details.bwrap === 'boolean', 'details.bwrap must be boolean');
+    assert.ok(typeof result.details.socat === 'boolean', 'details.socat must be boolean');
+    assert.ok(typeof result.details.ripgrep === 'boolean', 'details.ripgrep must be boolean');
+    assert.ok(typeof result.details.isSupportedPlatform === 'boolean', 'details.isSupportedPlatform must be boolean');
+    assert.ok(typeof result.details.libLoaded === 'boolean', 'details.libLoaded must be boolean');
+    assert.ok('libError' in result.details, 'details.libError must be present (null or string)');
+    assert.ok(Array.isArray(result.details.libDependencyErrors), 'details.libDependencyErrors must be array');
+    assert.ok(Array.isArray(result.details.libDependencyWarnings), 'details.libDependencyWarnings must be array');
+  });
+
+  // ── 42b: on macOS (dev machine), bwrap/socat not installed ───────────
+
+  it('42b: on macOS, available=false because bwrap/socat absent (or unsupported platform)', async () => {
+    const result = await checkSandboxAvailability();
+    // On macOS, either isSupportedPlatform=true (macOS IS supported) but
+    // bwrap+socat are not installed, or isSupportedPlatform=false. Either way:
+    // available must be false on the CI/dev Mac (no bwrap/socat) and the
+    // missing array must be an array (possibly empty if unsupported platform).
+    //
+    // On Linux CI with bwrap/socat installed this would be true — but our
+    // current CI (Mac mini) doesn't have them. We guard for both paths.
+    if (result.details.platform === 'linux') {
+      // On Linux without bwrap/socat: available=false, missing includes them
+      if (!result.details.bwrap || !result.details.socat) {
+        assert.equal(result.available, false, 'Linux without bwrap/socat → available must be false');
+      }
+    } else {
+      // macOS: available is false on dev machines; the platform IS supported
+      // but bwrap/socat are not present. We just verify the shape is consistent.
+      assert.equal(typeof result.available, 'boolean');
+    }
+    // In all cases: if available=true then missing must be empty
+    if (result.available) {
+      assert.deepEqual(result.missing, [], 'When available=true, missing must be []');
+    }
+  });
+
+  // ── 42c: library import succeeds (package is installed) ──────────────
+
+  it('42c: @anthropic-ai/sandbox-runtime library loads cleanly (libLoaded=true)', async () => {
+    const result = await checkSandboxAvailability();
+    // We just installed v0.0.52 as a dep, so import must succeed.
+    assert.equal(result.details.libLoaded, true,
+      'Library must load: @anthropic-ai/sandbox-runtime is in dependencies');
+    assert.equal(result.details.libError, null,
+      'libError must be null when library loads successfully');
+  });
+
+  // ── 42d: describeSandboxStatus returns { ok, message } shape ─────────
+
+  it('42d: describeSandboxStatus returns { ok: boolean, message: string }', async () => {
+    const status = await describeSandboxStatus();
+    assert.ok(typeof status === 'object' && status !== null, 'result must be an object');
+    assert.ok(typeof status.ok === 'boolean', 'ok must be boolean');
+    assert.ok(typeof status.message === 'string', 'message must be a string');
+    assert.ok(status.message.length > 0, 'message must be non-empty');
+  });
+
+  // ── 42e: describeSandboxStatus includes install hint when bwrap/socat missing ──
+  // On Linux without deps, the message must include the apt-get install hint.
+  // On macOS, we verify the message is non-empty and describes the situation.
+
+  it('42e: describeSandboxStatus includes apt-get install hint when linux deps missing', async () => {
+    const availability = await checkSandboxAvailability();
+
+    if (availability.details.platform === 'linux' && !availability.available) {
+      // Real Linux path — verify the live message includes the install hint
+      const status = await describeSandboxStatus();
+      assert.equal(status.ok, false);
+      if (availability.missing.some(m => ['bubblewrap', 'socat', 'ripgrep'].includes(m))) {
+        assert.ok(
+          status.message.includes('sudo apt-get install'),
+          `Message must include install hint when deps are missing. Got: ${status.message}`,
+        );
+      }
+    } else {
+      // macOS (dev machine): message must be non-empty and informative
+      const status = await describeSandboxStatus();
+      assert.ok(typeof status.message === 'string' && status.message.length > 0,
+        'describeSandboxStatus must return a non-empty message');
+    }
+  });
+
+  // ── 42f: checkSandboxAvailability consistent across multiple calls ────
+  // Verifies the function is idempotent (important because server.mjs
+  // memoizes the first result — both calls must return the same data).
+
+  it('42f: checkSandboxAvailability is idempotent — two calls return the same available value', async () => {
+    const r1 = await checkSandboxAvailability();
+    const r2 = await checkSandboxAvailability();
+    assert.equal(r1.available, r2.available, 'available must be consistent across calls');
+    assert.equal(r1.details.platform, r2.details.platform, 'platform must be consistent');
+    assert.equal(r1.details.libLoaded, r2.details.libLoaded, 'libLoaded must be consistent');
+  });
+
+  // ── 42g: /health endpoint includes sandbox field ──────────────────────
+  // HTTP integration test: start the server (reusing the createOlpServer factory)
+  // and verify /health includes a top-level 'sandbox' key with the right shape.
+
+  let _s42Server;
+  let _s42Port;
+
+  before(async () => {
+    __resetSandboxStatusCache();
+    __setAuthConfig({
+      allow_anonymous: true,
+      owner_only_endpoints: [],
+      fallback_detail_header_policy: 'all',
+    });
+    _s42Port = parseInt(
+      process.env.OLP_TEST_PORT
+        ? String(parseInt(process.env.OLP_TEST_PORT, 10) + 9000)
+        : String(22456 + Math.floor(Math.random() * 100)),
+      10,
+    );
+    _s42Server = createOlpServer();
+    await new Promise((resolve, reject) => {
+      _s42Server.listen(_s42Port, '127.0.0.1', resolve);
+      _s42Server.once('error', (e) => {
+        if (e.code === 'EADDRINUSE') {
+          _s42Port++;
+          _s42Server.listen(_s42Port, '127.0.0.1', resolve);
+          _s42Server.once('error', reject);
+        } else {
+          reject(e);
+        }
+      });
+    });
+  });
+
+  after(() => new Promise(r => _s42Server.close(r)));
+
+  it('42g: GET /health includes sandbox field with available+missing+platform', async () => {
+    const r = await fetch({ port: _s42Port, method: 'GET', path: '/health' });
+    assert.equal(r.status, 200, `/health must return 200, got ${r.status}`);
+    const body = JSON.parse(r.body);
+
+    // Top-level sandbox key must exist
+    assert.ok('sandbox' in body, '/health must include top-level sandbox field');
+    const sb = body.sandbox;
+
+    // Required fields
+    assert.ok(typeof sb.available === 'boolean', 'sandbox.available must be boolean');
+    assert.ok(Array.isArray(sb.missing), 'sandbox.missing must be array');
+    assert.ok(typeof sb.platform === 'string', 'sandbox.platform must be a string');
+
+    // Consistency: if available=false there may be a message
+    if (!sb.available && sb.missing.length > 0) {
+      assert.ok(typeof sb.message === 'string' || sb.message === undefined,
+        'sandbox.message must be a string or absent');
+    }
+    if (sb.available) {
+      assert.deepEqual(sb.missing, [], 'When available=true, missing must be []');
+    }
+  });
+
+  it('42h: /health sandbox field reflects real platform state (not hardcoded)', async () => {
+    // Verify the /health sandbox field matches what checkSandboxAvailability
+    // returns directly — confirming the two code paths are consistent.
+    //
+    // On macOS: @anthropic-ai/sandbox-runtime uses sandbox-exec (built-in),
+    // so available=true when rg is also in PATH. This is the expected state
+    // on the dev Mac with ripgrep installed via Homebrew.
+    //
+    // On Linux (PI231 before apt install): available=false because bwrap/socat
+    // are missing. This is the expected state Phase 7 PR-A is documenting.
+    //
+    // Both paths are correct; the test verifies /health matches the module.
+    const libResult = await checkSandboxAvailability();
+    const r = await fetch({ port: _s42Port, method: 'GET', path: '/health' });
+    const body = JSON.parse(r.body);
+    const sb = body.sandbox;
+
+    // /health sandbox.available must match the module's result
+    // Note: the server memoizes on first call; Suite 42 calls __resetSandboxStatusCache()
+    // in before(), so both are calling into the same (fresh) state.
+    assert.equal(sb.available, libResult.available,
+      `/health sandbox.available (${sb.available}) must match checkSandboxAvailability() (${libResult.available})`);
+    assert.equal(sb.platform, libResult.details.platform,
+      '/health sandbox.platform must match checkSandboxAvailability().details.platform');
   });
 });

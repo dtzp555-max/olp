@@ -70,6 +70,11 @@ import {
   ENV_OWNER_KEY_ID,
 } from './lib/keys.mjs';
 import { appendAuditEvent } from './lib/audit.mjs';
+// Phase 7 / PR-A — sandbox availability preflight module (ADR 0014).
+// checkSandboxAvailability is called lazily at first /health hit and memoized
+// process-wide (bwrap/socat install state does not change at runtime; we don't
+// want a child_process.execFileSync per /health call).
+import { checkSandboxAvailability } from './lib/sandbox/doctor.mjs';
 // Phase 3 / D50 — management endpoints consume the audit aggregate query layer.
 // D81 (Phase 5) — adds aggregateProviderQuota for quota_v2 shape.
 import {
@@ -219,6 +224,20 @@ const _serverStartMs = Date.now();
 export function __resetRequestCounters() {
   _totalRequests = 0;
   _activeRequests = 0;
+}
+
+// ── Phase 7 PR-A: sandbox availability cache ──────────────────────────────
+// checkSandboxAvailability() forks `which bwrap` / `which socat` / `which rg`
+// and imports @anthropic-ai/sandbox-runtime. Neither can change at runtime —
+// bwrap is either installed or it isn't. Memoize the first result to avoid
+// repeated child_process.execFileSync calls on every /health hit.
+//
+// _sandboxStatusCache: null  → not yet fetched
+//                      object → memoized result from checkSandboxAvailability()
+let _sandboxStatusCache = null;
+/** @internal — test seam: reset sandbox cache between tests. */
+export function __resetSandboxStatusCache() {
+  _sandboxStatusCache = null;
 }
 
 // ── Startup config ────────────────────────────────────────────────────────
@@ -859,10 +878,48 @@ async function handleHealth(req, res) {
       providerStatuses[name] = { ok: false, error: e.message, activeSpawns };
     }
   }
+  // Phase 7 PR-A (ADR 0014): sandbox availability field.
+  // Result is memoized process-wide in _sandboxStatusCache — bwrap/socat
+  // install state does not change at runtime. If the library call throws for
+  // any reason, the field is still included with available: false + error
+  // (don't crash /health).
+  if (_sandboxStatusCache === null) {
+    try {
+      _sandboxStatusCache = await checkSandboxAvailability();
+    } catch (e) {
+      _sandboxStatusCache = {
+        available: false,
+        missing: [],
+        details: { platform: process.platform, error: String(e?.message ?? e) },
+      };
+    }
+  }
+  const sandboxField = {
+    available: _sandboxStatusCache.available,
+    missing: _sandboxStatusCache.missing ?? [],
+    platform: _sandboxStatusCache.details?.platform ?? process.platform,
+  };
+  if (!_sandboxStatusCache.available) {
+    // Include human-readable install hint for owner-tier callers.
+    const missingDeps = (_sandboxStatusCache.missing ?? []).filter(
+      m => m === 'bubblewrap' || m === 'socat' || m === 'ripgrep',
+    );
+    if (missingDeps.length > 0) {
+      sandboxField.message =
+        `Sandbox dependencies not available: ${missingDeps.map(m => `${m} not installed`).join(', ')}.` +
+        ` Install: sudo apt-get install -y ${missingDeps.join(' ')}`;
+    } else if (_sandboxStatusCache.details?.error) {
+      sandboxField.message = `Sandbox check error: ${_sandboxStatusCache.details.error}`;
+    } else if (_sandboxStatusCache.details?.libError) {
+      sandboxField.message = `Sandbox library error: ${_sandboxStatusCache.details.libError}`;
+    }
+  }
+
   const fullPayload = {
     ok: true,
     version: VERSION,
     providers: { enabled, available, status: providerStatuses },
+    sandbox: sandboxField,
   };
   if (anonymousKey !== null) fullPayload.anonymousKey = anonymousKey;
   sendJSON(res, 200, fullPayload);

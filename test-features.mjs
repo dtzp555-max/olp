@@ -17581,6 +17581,26 @@ describe('Suite 41 — ADR 0009 Amendment 1: stream-json transport (Phase 6)', (
     assert.equal(chunk, null, 'system/init must return null (consumed, no yield)');
   });
 
+  it('41e-5b: anthropicStreamJsonEventToIR — system/<other-subtype> → null (regression guard)', () => {
+    // 2026-05-28: 401 cascade transcripts on PI231 showed claude emitting
+    // system events with subtypes other than 'init' (e.g. api_retry). The
+    // original parser matched only subtype==='init' and routed everything
+    // else to the "unknown event type" log, spamming the server log.
+    for (const subtype of ['api_retry', 'shutdown', undefined]) {
+      const event = { type: 'system', subtype, note: 'whatever' };
+      const chunk = anthropicStreamJsonEventToIR(event, false);
+      assert.equal(chunk, null, `system/${subtype} must return null (consumed, no IR yield)`);
+    }
+  });
+
+  it('41e-5c: anthropicStreamJsonEventToIR — user (echoed user-message) → null', () => {
+    // claude emits {type:'user'} echo events in some stream-json modes
+    // (analogous to --replay-user-messages). Must be consumed, never yielded.
+    const event = { type: 'user', message: { role: 'user', content: 'hi' } };
+    const chunk = anthropicStreamJsonEventToIR(event, false);
+    assert.equal(chunk, null, 'user echo events must return null');
+  });
+
   it('41e-6: anthropicStreamJsonEventToIR — rate_limit_event → null (consumed)', () => {
     const event = { type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } };
     const chunk = anthropicStreamJsonEventToIR(event, false);

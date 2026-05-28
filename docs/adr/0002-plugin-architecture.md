@@ -302,7 +302,7 @@ The remainder of this amendment specifies each field's semantics, default-when-a
 - The function is NOT invoked at load time — its return shape is not validated until first spawn. Load-time invocation would require synthetic dummy arguments and would couple the validator to the orchestrator's argument shape (which itself may evolve under future ADR 0014 amendments).
 - First-spawn invocation MUST validate the return value is a plain object whose values are all strings. Non-string values (numbers, booleans, undefined) MUST cause the spawn to abort with a clear error rather than coerce silently — the env block crosses a kernel boundary and silent coercion is a footgun.
 
-**Authority citation requirement.** Each env var returned must correspond to a documented credential-resolution lookup in the underlying provider CLI. For example, `HOME` is a POSIX convention for credential lookup (well-established, no citation needed beyond the POSIX umbrella). `CODEX_HOME` is documented (primary) at https://developers.openai.com/codex/auth/ — the `/codex/config-reference` page is broader configuration context and does not currently enumerate `CODEX_HOME` in its body. `VIBE_HOME` is **PROVISIONAL — pending Task #4 spike verification**; the docs page https://docs.mistral.ai/mistral-vibe/terminal/configuration does not currently enumerate `VIBE_HOME` in its body, and the mistral declaration in § Per-provider concrete instances is marked PROVISIONAL accordingly. The provider plugin author MUST cite the underlying CLI's env-var documentation in the plugin file's header (the same place existing CLI-flag citations live, per Rule 1 of `ALIGNMENT.md`).
+**Authority citation requirement.** Each env var returned must correspond to a documented credential-resolution lookup in the underlying provider CLI. For example, `HOME` is a POSIX convention for credential lookup (well-established, no citation needed beyond the POSIX umbrella). `CODEX_HOME` is documented (primary) at https://developers.openai.com/codex/config-reference (2 occurrences verified 2026-05-29: `$CODEX_HOME/profile-name.config.toml` and `$CODEX_HOME/log` path templates), with secondary corroboration at https://developers.openai.com/codex/auth/ (2 occurrences in the credential-storage section: `auth.json under CODEX_HOME`). `VIBE_HOME` is documented at https://docs.mistral.ai/mistral-vibe/terminal/configuration (3 occurrences verified 2026-05-29: descriptive sentence "Override the location with the `VIBE_HOME` environment variable", canonical `export VIBE_HOME="/path/to/custom/vibe/home"` example, and an enumeration of files/directories `VIBE_HOME` affects). The provider plugin author MUST cite the underlying CLI's env-var documentation in the plugin file's header (the same place existing CLI-flag citations live, per Rule 1 of `ALIGNMENT.md`).
 
 Inventing an env var the provider CLI does not actually honor (e.g., setting `MISTRAL_HOME=...` when no such env var exists) is a Rule 2 violation and is unalignable per Rule 4 of `ALIGNMENT.md`.
 
@@ -553,32 +553,21 @@ export const ISOLATION = {
 //   state per ALIGNMENT.md Rule 3 (Match the Implementation): no protection
 //   is encoded because none has been established.
 
-// **PROVISIONAL DECLARATION — pending Task #4 spike verification.**
-// VIBE_HOME and the mount path below are NOT yet pinned to a primary
-// source. The Mistral Vibe terminal docs page (cited below) does not
-// currently enumerate VIBE_HOME in its body. This block is shipped as
-// a target shape for the spike, not as a verified contract. The
-// orchestrator MUST treat mistral as ISOLATION-absent (falls back to
-// legacy unsandboxed shape per § Backward compatibility) until the
-// spike confirms the env var works; the declaration here exists so the
-// spike has a concrete shape to verify, and so the surrounding
-// constitution is honest about what is unverified per ALIGNMENT.md
-// Rule 2 (No Invention) and Rule 3 (Match the Implementation).
 export const ISOLATION = {
   ephemeralEnvOverrides: ({ ephemeralRoot, keyId, reqId }) => ({
-    // VIBE_HOME — PROVISIONAL: target env var for vibe state directory
-    // relocation. Pending verification against
-    // https://docs.mistral.ai/mistral-vibe/terminal/configuration
-    // (currently zero occurrences in the docs body — spike will check
-    // observed CLI behaviour against env-var attempts).
+    // VIBE_HOME is documented at
+    // https://docs.mistral.ai/mistral-vibe/terminal/configuration as the
+    // env var that overrides the default ~/.vibe/ base directory
+    // (3 occurrences verified 2026-05-29: descriptive sentence,
+    // canonical export example, and an enumeration of files/dirs the
+    // variable affects). Task #4 PI231 spike verifies observed CLI
+    // behaviour matches the documented contract.
     VIBE_HOME: `${ephemeralRoot}/.vibe`,
     HOME: ephemeralRoot,
   }),
   credentialMounts: [
     // ~/.vibe/.env per existing mistral.mjs `auth.path` field, sourced from
-    // https://docs.mistral.ai/mistral-vibe/terminal/configuration (the
-    // auth.path field IS documented there; VIBE_HOME is what is
-    // unverified).
+    // https://docs.mistral.ai/mistral-vibe/terminal/configuration.
     [/* resolved at load: */ '<homedir>/.vibe/.env', '.vibe/.env'],
   ],
   requiredHomePaths: [
@@ -593,9 +582,9 @@ export const ISOLATION = {
 ```
 
 **Authority pin for the mistral ISOLATION declaration:**
-- `VIBE_HOME`: **PROVISIONAL — pending Task #4 verification.** Cited docs page (https://docs.mistral.ai/mistral-vibe/terminal/configuration) does not currently enumerate the env var; declaration retained as the spike's target shape. If the spike falsifies the env var assumption, this entry is removed and the mistral provider's ISOLATION block is deleted (per ALIGNMENT.md Rule 4 — unalignable fields are deleted, not feature-flagged), reverting mistral to ISOLATION-absent legacy spawn.
-- `~/.vibe/.env`: same source (existing `auth.path` citation in mistral.mjs — this field IS pinned in the docs; only `VIBE_HOME` is unverified).
-- **Open spike (Phase 7 follow-up, Task #4):** verify (a) whether Vibe CLI honours `VIBE_HOME` env var (if not, the env override block is dropped); (b) whether Vibe CLI exposes any tool surface (shell, file-read, etc.) during a `vibe --prompt` spawn; (c) whether the CLI provides any sandbox or tool-suppression flag. Findings update this declaration and may transition `crossTenantReadProtection` from `'none'` to `'tool-suppression'` or `'inner-sandbox'`.
+- `VIBE_HOME`: https://docs.mistral.ai/mistral-vibe/terminal/configuration (3 occurrences verified 2026-05-29: descriptive sentence "Override the location with the `VIBE_HOME` environment variable", canonical `export VIBE_HOME="/path/to/custom/vibe/home"` example, and the enumeration of files/directories `VIBE_HOME` affects).
+- `~/.vibe/.env`: same source (existing `auth.path` citation in mistral.mjs).
+- **Open spike (Phase 7 follow-up, Task #4):** verify *observed CLI behaviour* matches *documented behaviour* — (a) Vibe CLI actually honours the documented `VIBE_HOME` env var during spawn; (b) Vibe CLI's tool surface (shell, file-read, etc.) during a `vibe --prompt` spawn; (c) any CLI sandbox or tool-suppression flag. Findings may transition `crossTenantReadProtection` from `'none'` to `'tool-suppression'` or `'inner-sandbox'` if a hardening regime is discovered. The spike is verification-grade, not authority-pin work.
 
 #### Backward compatibility
 

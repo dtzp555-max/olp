@@ -17703,4 +17703,71 @@ describe('Suite 41 — ADR 0009 Amendment 1: stream-json transport (Phase 6)', (
     // model value must follow immediately after --model
     assert.equal(args[modelIdx + 1], 'claude-opus-4-7', '--model value must follow the flag');
   });
+
+  // ── 41h: OAuth env-injection regression guard (2026-05-28) ───────────
+  // Previously _spawnAndStream injected env.CLAUDE_CODE_OAUTH_TOKEN from
+  // readAuthArtifact() unconditionally. That defeated the CLI's built-in
+  // refresh: with env var present, claude never reads credentials.json,
+  // so expired accessTokens are never swapped via refreshToken. Result:
+  // hard 401 cascade every ~8h requiring manual keychain copy.
+  // Fix: don't inject. Spawned process inherits process.env via
+  // buildSpawnEnv; the CLI handles file + refresh natively.
+
+  it('41h: _spawnAndStream does NOT set env.CLAUDE_CODE_OAUTH_TOKEN when only file/keychain auth available', async () => {
+    // Capture the env passed to spawn
+    let capturedEnv = null;
+    const fakeSpawn = (_bin, _args, opts) => {
+      capturedEnv = opts.env;
+      // Minimal valid NDJSON: result/success → stop
+      return makeMockSpawnNDJSON([], { skipEarlySpawn: false })(_bin, _args, opts);
+    };
+    // Ensure the process.env CLAUDE_CODE_OAUTH_TOKEN is unset for this test
+    const sentinel = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    __setSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      // Provide auth context directly so readAuthArtifact path doesn't matter
+      const it = anthropic.spawn(ir, { accessToken: 'sentinel-should-not-leak-to-env' });
+      try { for await (const _ of it) { /* drain */ } } catch { /* ignored */ }
+      assert.ok(capturedEnv, 'spawn must have been called');
+      assert.equal(
+        capturedEnv.CLAUDE_CODE_OAUTH_TOKEN, undefined,
+        'env.CLAUDE_CODE_OAUTH_TOKEN must NOT be injected — CLI reads credentials.json natively and auto-refreshes',
+      );
+    } finally {
+      __resetSpawnImpl();
+      if (sentinel !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = sentinel;
+    }
+  });
+
+  it('41h-2: _spawnAndStream forwards process.env.CLAUDE_CODE_OAUTH_TOKEN when explicitly set at OLP boot', async () => {
+    let capturedEnv = null;
+    const fakeSpawn = (_bin, _args, opts) => {
+      capturedEnv = opts.env;
+      return makeMockSpawnNDJSON([], { skipEarlySpawn: false })(_bin, _args, opts);
+    };
+    const sentinel = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'operator-explicit-token';
+    __setSpawnImpl(fakeSpawn);
+    try {
+      const ir = makeIR({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      const it = anthropic.spawn(ir, { accessToken: 'from-file' });
+      try { for await (const _ of it) { } } catch { }
+      assert.equal(
+        capturedEnv.CLAUDE_CODE_OAUTH_TOKEN, 'operator-explicit-token',
+        'process.env override must propagate through buildSpawnEnv unchanged',
+      );
+    } finally {
+      __resetSpawnImpl();
+      if (sentinel === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      else process.env.CLAUDE_CODE_OAUTH_TOKEN = sentinel;
+    }
+  });
 });

@@ -18222,6 +18222,11 @@ describe('Suite 43 — Phase 7 PR-B: lib/sandbox/manager.mjs', () => {
 
 const _RUN_SANDBOX_E2E = Boolean(process.env.OLP_E2E_SANDBOX);
 
+// Suite 44c (fold-in 2026-05-28) needs `join`. statSync already imported at
+// the Suite 17 boundary above. We just need a local `join` alias here since
+// the file-top `join` was bound as `_pathJoinForSetup`.
+const join = _pathJoinForSetup;
+
 describe('Suite 44 — sandbox negative security test (PI231 only)', { skip: !_RUN_SANDBOX_E2E }, () => {
 
   before(async () => {
@@ -18324,5 +18329,49 @@ describe('Suite 44 — sandbox negative security test (PI231 only)', { skip: !_R
       `echo SANDBOX_PROOF inside sandbox exited with code ${exitCode} — basic spawn function broken`);
     assert.ok(stdout.includes('SANDBOX_PROOF'),
       `stdout must contain SANDBOX_PROOF; got: ${stdout.slice(0, 100)}`);
+  });
+
+  it('44c: in-sandbox spawn CAN read ~/.claude/.credentials.json (regression guard for fold-in 2026-05-28)', async () => {
+    // Phase 7 PR-B fold-in (commit pending): ~/.claude removed from denyRead.
+    // The spawn's own OAuth file MUST be readable, otherwise claude CLI fails
+    // with "Not logged in" — and live PI231 verification produces empty
+    // response bodies via the anthropic fallback path.
+    //
+    // The cross-tenant protection for ~/.claude relies on Phase 6c
+    // --system-prompt suppressing tool descriptions, not on sandbox denyRead.
+    // See manager.mjs comment block above denyRead for full rationale.
+    const { spawn: realSpawn } = await import('node:child_process');
+    const credPath = join(homedir(), '.claude', '.credentials.json');
+
+    // If the credentials file isn't present (e.g. dev machine without OAuth),
+    // this test is meaningless — skip the assertion but log.
+    let credStat;
+    try { credStat = statSync(credPath); } catch { credStat = null; }
+    if (!credStat) {
+      // No OAuth file present; cannot test read. Pass with note.
+      assert.ok(true, `No ${credPath} on this host — skipping read-allowed verification`);
+      return;
+    }
+
+    const wrapped = await wrapSpawn({
+      bin: 'cat',
+      args: [credPath],
+      env: { ...process.env },
+      cwd: undefined,
+      allowedDomains: [],
+    });
+
+    const { exitCode } = await new Promise((resolve) => {
+      const child = realSpawn(wrapped.bin, wrapped.args, {
+        env: wrapped.env,
+        cwd: wrapped.cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      child.on('exit', code => resolve({ exitCode: code }));
+    });
+
+    assert.equal(exitCode, 0,
+      `cat ${credPath} inside sandbox exited with code ${exitCode} — sandbox is denying read on a path the spawn legitimately needs. ` +
+      `~/.claude must NOT be in denyRead per the 2026-05-28 fold-in.`);
   });
 });

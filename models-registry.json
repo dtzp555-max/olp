@@ -45,6 +45,13 @@
       "candidate": true,
       "models": [
         {
+          "id": "claude-opus-4-8",
+          "displayName": "Claude Opus 4.8",
+          "contextWindow": 200000,
+          "deprecated": false,
+          "created": 1779840000
+        },
+        {
           "id": "claude-opus-4-7",
           "displayName": "Claude Opus 4.7",
           "contextWindow": 200000,
@@ -69,7 +76,7 @@
       "aliases": {
         "claude": "claude-sonnet-4-6",
         "sonnet": "claude-sonnet-4-6",
-        "opus": "claude-opus-4-7",
+        "opus": "claude-opus-4-8",
         "haiku": "claude-haiku-4-5"
       }
     },

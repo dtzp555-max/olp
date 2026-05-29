@@ -79,7 +79,7 @@ import { checkSandboxAvailability } from './lib/sandbox/doctor.mjs';
 // bootstrapSandbox() is called at server startup (before listen) and sets up
 // the process-wide SandboxManager singleton. isSandboxActive() is used by
 // /health to report sandbox.active.
-import { bootstrapSandbox, isSandboxActive, __resetSandboxManagerForTests } from './lib/sandbox/manager.mjs';
+import { bootstrapSandbox, isSandboxActive, prepareIsolatedEnvironment, __resetSandboxManagerForTests } from './lib/sandbox/manager.mjs';
 // Phase 3 / D50 — management endpoints consume the audit aggregate query layer.
 // D81 (Phase 5) — adds aggregateProviderQuota for quota_v2 shape.
 import {
@@ -1338,9 +1338,21 @@ async function handleChatCompletions(req, res) {
       // chain hops whose model matches the request). Authority: ADR 0004 §
       // Chain advancement step 1 (per-hop config supplies provider AND model).
       const hopIrReq = irReq.model === hopModel ? irReq : { ...irReq, model: hopModel };
+
+      // Task #8 — Phase 7 Solution 1: per-spawn isolation primitives.
+      // Compose ephemeral home + credential mounts + hardenedArgs + wrapForLayer3
+      // via prepareIsolatedEnvironment. For providers without ISOLATION declared,
+      // this returns the identity shape (no-op). cleanup fires in finally below.
+      // Authority: ADR 0014 Amendment 1 § A1.2 + ADR 0002 Amendment 9.
+      const hopIsolationCtx = await prepareIsolatedEnvironment({
+        provider: hopProviderPlugin,
+        keyId,
+        reqId: requestId,
+      });
+
       try {
         try {
-          for await (const irChunk of hopProviderPlugin.spawn(hopIrReq, authContext)) {
+          for await (const irChunk of hopProviderPlugin.spawn(hopIrReq, authContext, hopIsolationCtx)) {
             // D16: check error chunks BEFORE pushing — preserves the invariant that
             // chunks array contains only delta/stop chunks. Without this, the catch
             // block's `chunks.length > 0` would mistake a single error chunk for
@@ -1382,6 +1394,10 @@ async function handleChatCompletions(req, res) {
         // guarantees no other caller has incremented this provider's count
         // between our tryAcquireSpawn() above and this releaseSpawn().
         releaseSpawn(hopProvider);
+        // Task #8: cleanup ephemeral home created by prepareIsolatedEnvironment.
+        // Best-effort (cleanup swallows errors internally). Fires on both happy
+        // path and error path via finally. No-op for providers without ISOLATION.
+        await hopIsolationCtx.cleanup();
       }
     }
 
@@ -1540,12 +1556,24 @@ async function handleChatCompletions(req, res) {
       // full F7 rationale + authority citation.
       const streamIr = ir.model === streamModel ? ir : { ...ir, model: streamModel };
       return (async function* sourceWithRelease() {
+        // Task #8 — Phase 7 Solution 1: per-spawn isolation (streaming path).
+        // prepareIsolatedEnvironment is called inside the async generator so the
+        // await is legal. cleanup fires in finally below (happy + error + early-
+        // return via iterator.return() from cache-layer abort propagation).
+        // Authority: ADR 0014 Amendment 1 § A1.2 + ADR 0002 Amendment 9.
+        const streamIsolationCtx = await prepareIsolatedEnvironment({
+          provider: streamPlugin,
+          keyId,
+          reqId: requestId,
+        });
         try {
-          for await (const irChunk of streamPlugin.spawn(streamIr, authContext)) {
+          for await (const irChunk of streamPlugin.spawn(streamIr, authContext, streamIsolationCtx)) {
             yield irChunk;
           }
         } finally {
           releaseSpawn(streamProvider);
+          // Best-effort cleanup of ephemeral home. No-op for providers without ISOLATION.
+          await streamIsolationCtx.cleanup();
         }
       })();
     };

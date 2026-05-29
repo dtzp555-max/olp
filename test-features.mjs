@@ -18140,6 +18140,12 @@ describe('Suite 43 — Phase 7 PR-B: lib/sandbox/manager.mjs', () => {
   it('43f: prepareIsolatedEnvironment creates ephemeralRoot + envOverrides from ISOLATION', async () => {
     await _resetSandboxMgr();
 
+    // Opt out of the test-context bypass that lib/sandbox/manager.mjs
+    // applies to keep upstream cache tests (Suite 15/28) deterministic.
+    // This test is specifically exercising the active ISOLATION shape, so
+    // we set the globalThis flag for the test body only.
+    globalThis.__OLP_FORCE_ISOLATION_IN_TEST = true;
+
     const mockProvider = {
       name: 'mock-isolated',
       ISOLATION: {
@@ -18192,6 +18198,9 @@ describe('Suite 43 — Phase 7 PR-B: lib/sandbox/manager.mjs', () => {
 
     // cleanup must not throw and must remove the ephemeral dir
     await result.cleanup();
+
+    // Reset opt-out flag so subsequent tests get the bypass again
+    delete globalThis.__OLP_FORCE_ISOLATION_IN_TEST;
 
     await _resetSandboxMgr();
   });

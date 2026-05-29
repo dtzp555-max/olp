@@ -9,6 +9,8 @@
 
 > **Note on numbering.** Sequence is 1, 3, 4, 5, 6, 7 — Amendment 2 was never written. The reserved slot was originally planned for a separate `maxConcurrent` ratification, but that content was folded into Amendment 1 (the retroactive contract-sync amendment) at filing time and the gap was not backfilled. The gap is intentional and load-bearing — no missing content; do not renumber Amendments 3+ to close it (cross-references to Amendment N from other docs would silently break).
 
+> **Forward-pointer:** Amendment 9 (2026-05-29) — Provider `ISOLATION` Contract for Multi-Tenant Spawn Isolation — is located at the **end of this file** (after § Sources), not in this Amendments block. The placement is documented in Amendment 9's editorial note; the substance is the addition of an OPTIONAL `ISOLATION` named export to provider plugin modules, consumed by `lib/sandbox/manager.mjs` (per ADR 0014 Amendment 1) to compose per-spawn ephemeral-home + per-provider isolation primitives. Co-merge with ADR 0014 Amendment 1.
+
 ### Amendment 8 — 2026-05-26: Permit `quotaStatus()` direct-API access (READ-ONLY exemption) for plan-usage probes (D79–D80 — Phase 5)
 
 - **Context:** ADR 0012 (Phase 5 charter) opens 2026-05-26 to port OCP's plan-usage probe (`ocp/server.mjs:842-1109`) into `lib/providers/anthropic.mjs:quotaStatus()`. The probe calls `POST https://api.anthropic.com/v1/messages` directly with an OAuth bearer and parses `anthropic-ratelimit-unified-*` response headers. This violates the plugin contract's implicit assumption that ALL provider interaction goes through `spawn` (the binary CLI). `ALIGNMENT.md` Rule 2 (provider-CLI-as-authority) further constrains plugins to operations the provider CLI itself performs. The OCP-derived plan-usage probe satisfies neither of these — it bypasses `claude -p` and hits the public API directly. **Without an explicit exemption Amendment, D80 is unalignable.**
@@ -210,3 +212,469 @@ Every provider plugin exports an object conforming to:
 - OLP v0.1 spec §4.2 (Plugin-based provider system, including the v1.0 Provider contract definition)
 - OCP ADR 0003 (`models.json` as SPOT) — informs the "static enumeration, not filesystem scan" loading model
 - OCP ADR 0005 — the context paragraph references OCP's `server.mjs` reaching 1667 lines at one provider; the plugin architecture is the structural response to that complexity scaling N×
+
+---
+
+### Amendment 9 — 2026-05-29: Provider `ISOLATION` Contract for Multi-Tenant Spawn Isolation (Phase 7, ADR 0014 Amendment 1 co-merge)
+
+> **Editorial note.** Per the existing "amendments most-recent-first" convention near the top of this file, Amendment 9 logically slots between Amendment 8 and the original body. It is physically located at the file's tail (after § Sources) to honor the constitution's "append, do not rewrite" discipline for this addition — the rationale is that the contract surface added here is large enough (a structured per-provider sub-export, not just a hint-bag field) that an in-line edit of the § Decision body would constitute a rewrite of the v1.0 contract listing rather than an amendment over it. Future readers consulting the amendment-history block at the top of the file will find a stub forward-pointer to this section.
+>
+> The amendment is otherwise a peer of Amendments 1–8 (same `###` heading depth, same shape).
+
+#### Context
+
+The OLP spawn pipeline currently treats every provider as a plain `child_process.spawn` of the provider's CLI binary with a homogeneous env block and the server process's working directory. This works on a single-tenant developer laptop. It does **not** work on the family-LAN PI231 deployment (multi-key, multi-caller, single OS user) and is a hard blocker for the cloud rollout described in `docs/plans/cloud-deployment-family.md` § 5 — both for the reasons captured in the 2026-05-27 incident memory at `~/.cc-rules/memory/projects/olp/incident_2026_05_27_spawn_cli_security.md` (OAuth-token exfiltration, codex `shell` tool real execution, cross-tenant filesystem read leakage).
+
+The parallel ADR 0014 Amendment 1 retires the **outer-bwrap PR-B approach** — which initialized `@anthropic-ai/sandbox-runtime` `SandboxManager` once at server startup and wrapped every provider spawn through a global namespace — and replaces it with a **per-spawn ephemeral-home + per-provider isolation primitives** architecture. The new shape of `lib/sandbox/manager.mjs` is no longer a thin wrapper around `wrapSpawn()`; it is an orchestrator that, on each spawn, asks the provider plugin *what isolation primitives this provider needs*, composes them, and hands the spawn a ready-to-execute environment.
+
+The thing the orchestrator asks for is the subject of this amendment: the **Provider `ISOLATION` contract**.
+
+#### The interaction surface this amendment governs
+
+```text
+                  ┌──────────────────────────────────────┐
+                  │ server.mjs handleChatCompletions     │
+                  │   → executeHopFn                     │
+                  │   → provider.spawn(irRequest, ...)   │
+                  └────────────────────┬─────────────────┘
+                                       │
+                                       ▼
+                  ┌──────────────────────────────────────┐
+                  │ lib/sandbox/manager.mjs              │
+                  │   prepareIsolatedEnvironment(        │
+                  │     provider,                        │
+                  │     { keyId, reqId, ... }            │
+                  │   )                                  │
+                  │     ↓ reads provider.ISOLATION       │
+                  │     ↓ mkdtemp ephemeralRoot          │
+                  │     ↓ mkdir requiredHomePaths        │
+                  │     ↓ symlink/copy credentialMounts  │
+                  │     ↓ compose ephemeralEnvOverrides  │
+                  │     ↓ wrap args via toolHardening    │
+                  └────────────────────┬─────────────────┘
+                                       │
+                                       ▼
+                  ┌──────────────────────────────────────┐
+                  │ child_process.spawn(bin, args, {     │
+                  │   env: composedEnv, cwd: epRoot, ... │
+                  │ })                                   │
+                  └──────────────────────────────────────┘
+```
+
+The provider plugin is the **authority** for what isolation primitives are needed. The provider knows what env var its CLI honors for credential lookup (`HOME`, `CODEX_HOME`, `VIBE_HOME`, …). The provider knows whether the CLI has an inner sandbox that must be permitted to clone user namespaces. The provider knows the cross-tenant read protection regime it ships under. The orchestrator's job is purely composition; it must not know that "for codex, use `CODEX_HOME`" — that knowledge belongs in `lib/providers/codex.mjs`.
+
+This is the same separation-of-concerns principle that has governed every prior amendment to this ADR: provider-specific knowledge lives in the provider file; the orchestrator stays generic. Amendment 7's `doctorChecks()` followed it (per-provider repair recipes); Amendment 8's `quotaStatus()` followed it (per-provider probe authorities); this amendment follows it for isolation primitives.
+
+#### Decision — add OPTIONAL `ISOLATION` named export to the Provider plugin module
+
+Each provider plugin module (`lib/providers/<name>.mjs`) MAY export, in addition to the default-exported provider object, a named const `ISOLATION` describing the isolation primitives the orchestrator should compose for spawns of this provider. The shape is:
+
+```javascript
+export const ISOLATION = {
+  ephemeralEnvOverrides: ({ ephemeralRoot, keyId, reqId }) => ({ /* env var map */ }),
+  credentialMounts: [ [srcAbsPath, dstRelativeToEphemeralRoot], ... ],
+  requiredHomePaths: [ /* dirs to mkdir empty under ephemeralRoot */ ],
+  hasInnerSandbox: boolean,
+  crossTenantReadProtection: 'tool-suppression' | 'inner-sandbox' | 'none',
+  recommendedDeploymentTier: 'shared-os-user' | 'per-os-user' | 'separate-vm',
+  toolHardeningArgs: (existingArgs) => modifiedArgs,  // optional
+}
+```
+
+The export is **optional**. A plugin that omits `ISOLATION` continues to spawn under the legacy unsandboxed shape exactly as it does today — see § Backward compatibility below. The opt-in surface is consistent with Amendment 7's `doctorChecks()` treatment (additive, no breakage for plugins that haven't been touched).
+
+The remainder of this amendment specifies each field's semantics, default-when-absent behavior, validation rules, and authority citations. The three currently-shipped providers' concrete declarations are specified in § Per-provider concrete instances.
+
+#### Field specification
+
+##### 1. `ephemeralEnvOverrides({ ephemeralRoot, keyId, reqId }) → { [envVar]: string }`
+
+**Type and semantics.** A pure (no-side-effect, no-fs-touch) function that, given the orchestrator's composed context (`ephemeralRoot`: absolute path to the spawn-scoped temp dir; `keyId`: the OLP key identity from `lib/keys.mjs` driving the request; `reqId`: the per-request UUID), returns a flat object of environment variables that the orchestrator will merge into the spawn env. The returned env vars are how the provider CLI is steered to read its credentials from the ephemeral root rather than the server process's actual home directory.
+
+**Why a function and not a static object.** Because `ephemeralRoot` is generated per-spawn by `mkdtemp` and is not known at plugin load time. Because `keyId` and `reqId` are not known until the request arrives. A static object cannot carry the dependency on these values; a function carries it cleanly.
+
+**Purity contract.** The function MUST be referentially transparent w.r.t. its argument object: identical input arguments yield identical output env maps. It MUST NOT read the filesystem, spawn subprocesses, or mutate the input arguments. It MUST NOT close over module-level mutable state. This contract is what makes the spawn pipeline auditable: a reviewer reading `provider.ISOLATION.ephemeralEnvOverrides({ ephemeralRoot: '/tmp/x', keyId: 'k1', reqId: 'r1' })` can know the full env mutation without running the system.
+
+**Default behavior when absent.** When `ISOLATION` is absent or `ISOLATION.ephemeralEnvOverrides` is missing, the orchestrator MUST emit no environment overrides for that provider — `child_process.spawn` runs with `process.env` (possibly modified by other contract layers such as the existing `spawn()` method's env cleanup, ADR 0009 Amendment 1's `--system-prompt` injection, etc.). This preserves Phase 6c / pre-Phase 7 behavior exactly.
+
+**Validation rules.** At plugin load (in `validateProvider` or a sibling `validateIsolation` helper):
+- If `ISOLATION` is defined and `ephemeralEnvOverrides` is defined, it MUST be a function. A non-function value (e.g., a static object) is a load-time error.
+- The function is NOT invoked at load time — its return shape is not validated until first spawn. Load-time invocation would require synthetic dummy arguments and would couple the validator to the orchestrator's argument shape (which itself may evolve under future ADR 0014 amendments).
+- First-spawn invocation MUST validate the return value is a plain object whose values are all strings. Non-string values (numbers, booleans, undefined) MUST cause the spawn to abort with a clear error rather than coerce silently — the env block crosses a kernel boundary and silent coercion is a footgun.
+
+**Authority citation requirement.** Each env var returned must correspond to a documented credential-resolution lookup in the underlying provider CLI. For example, `HOME` is a POSIX convention for credential lookup (well-established, no citation needed beyond the POSIX umbrella). `CODEX_HOME` is documented (primary) at https://developers.openai.com/codex/config-reference (2 occurrences verified 2026-05-29: `$CODEX_HOME/profile-name.config.toml` and `$CODEX_HOME/log` path templates), with secondary corroboration at https://developers.openai.com/codex/auth/ (2 occurrences in the credential-storage section: `auth.json under CODEX_HOME`). `VIBE_HOME` is documented at https://docs.mistral.ai/mistral-vibe/terminal/configuration (3 occurrences verified 2026-05-29: descriptive sentence "Override the location with the `VIBE_HOME` environment variable", canonical `export VIBE_HOME="/path/to/custom/vibe/home"` example, and an enumeration of files/directories `VIBE_HOME` affects). The provider plugin author MUST cite the underlying CLI's env-var documentation in the plugin file's header (the same place existing CLI-flag citations live, per Rule 1 of `ALIGNMENT.md`).
+
+Inventing an env var the provider CLI does not actually honor (e.g., setting `MISTRAL_HOME=...` when no such env var exists) is a Rule 2 violation and is unalignable per Rule 4 of `ALIGNMENT.md`.
+
+##### 2. `credentialMounts: [ [srcAbsPath, dstRelativeToEphemeralRoot], ... ]`
+
+**Type and semantics.** An array of `[src, dst]` tuples describing how the server process's real on-disk credential artifacts (OAuth tokens, API keys, refresh artifacts) are made available inside the ephemeral home. The orchestrator iterates this list and, for each tuple, ensures `<ephemeralRoot>/<dst>` resolves (via symlink, copy, or bind-mount depending on platform and constraints) to the data at `<src>`.
+
+The mount strategy is a property of the orchestrator, not the provider — `lib/sandbox/manager.mjs` decides between symlink (cheapest, on macOS and unconfined Linux), copy (when crossing a namespace boundary that breaks symlinks), and bind-mount (under a future bwrap-equipped path). The provider only declares the source-destination correspondence.
+
+**Why this is a list, not a function.** The mounts are static per-provider: anthropic always mounts `~/.claude/.credentials.json`, codex always mounts `~/.codex/auth.json`. A function form would invite plugin authors to compute mount paths from per-request state, which would be a security hazard (per-request mount lists are harder to audit at code-review time). Forcing the static form makes the credential surface visible by `grep ISOLATION lib/providers/*.mjs`.
+
+**Default behavior when absent.** Empty mount list — the spawn sees no credential files in its ephemeral home. For most providers this means authentication fails and the spawn errors out cleanly; the orchestrator MUST log a clear "no credentialMounts declared" message before allowing the spawn to proceed, since the most common cause is "plugin author forgot to declare the mount."
+
+**Validation rules.**
+- Each entry MUST be a 2-tuple (length-2 array). Single-element entries or 3+-tuples are load-time errors.
+- `srcAbsPath` MUST be an absolute path (starts with `/`). Relative paths or `~/`-prefixed paths are load-time errors — the plugin author must call `os.homedir()` explicitly. Rationale: `~/` expansion semantics vary between Node and shells and would silently break under the per-spawn ephemeral home (where `HOME` is rewritten).
+- `dstRelativeToEphemeralRoot` MUST NOT start with `..` (no parent-directory escape) and MUST NOT be absolute (no `/etc/passwd` overlay attempts). Both are load-time errors. The orchestrator's path-composition (`path.join(ephemeralRoot, dst)`) is the *only* path-resolution step that touches the destination — the validation forbids constructions that could escape `ephemeralRoot` even before composition.
+- `srcAbsPath` MAY refer to a path that does not exist at plugin-load time. The orchestrator's mount step does a `existsSync(src)` check at spawn-time and logs a "credential source missing" warning rather than failing the spawn — this is consistent with the existing `auth.path` field behavior in the Provider contract (an absent credential file is an auth condition, not a load-time error).
+- Two mounts with the same `dst` is a load-time error (no implicit ordering or override).
+
+**Authority citation requirement.** Each `srcAbsPath` MUST correspond to the credential location documented by the underlying provider CLI. For anthropic: `~/.claude/.credentials.json` is the OAuth artifact per `claude` CLI docs (already cited by the plugin's `auth.path` field). For codex: `~/.codex/auth.json` per https://developers.openai.com/codex/auth/. For mistral: `~/.vibe/.env` per https://docs.mistral.ai/mistral-vibe/terminal/configuration. Plugin authors MUST cite the same authority as the `auth.path` field they already declare — the citations should be consistent.
+
+##### 3. `requiredHomePaths: [ /* relative paths */ ]`
+
+**Type and semantics.** An array of relative paths (e.g., `['.claude', '.claude/logs']`) that the orchestrator MUST `mkdir -p` under `ephemeralRoot` before any `credentialMounts` are processed and before the spawn begins. These are directories the provider CLI expects to exist in `HOME` and will fail or behave incorrectly if they're absent (e.g., logging directories that the CLI doesn't auto-create).
+
+**Why a separate field from `credentialMounts`.** Some providers expect empty directories — not mounted credential files — at certain paths. Treating "empty directory" as a mount with src=null would muddle the validation rules for `credentialMounts`. A dedicated list is cleaner.
+
+**Default behavior when absent.** Empty list — only the directories implied by `credentialMounts[i].dst` (their parent dirs, created by `mkdir -p` during the mount step) exist under `ephemeralRoot`. For most providers this is fine.
+
+**Validation rules.**
+- Each entry MUST be a relative path string. Same anti-escape rules as `credentialMounts[i].dst`: no leading `..`, no absolute paths.
+- Entries MAY overlap with `credentialMounts[i].dst` parent paths (no error; orchestrator's `mkdir -p` is idempotent).
+- Duplicate entries are not an error (idempotent), but the linter / future CI grep should flag them as a code smell.
+
+**Authority citation requirement.** None directly required for the path values themselves — these are typically convention (e.g., `.claude` mirrors the CLI's expected `$HOME/.claude` layout). However, if a plugin declares a `requiredHomePaths` entry that does not correspond to any documented CLI behavior, the plugin's header comment should explain *why* the directory must exist (observed behavior, error message from CLI, etc.). Speculative directories ("just in case the CLI wants this") are a Rule 2 violation — only directories whose absence is known to cause CLI failure should be listed.
+
+##### 4. `hasInnerSandbox: boolean`
+
+**Type and semantics.** A boolean flag declaring whether this provider's CLI spawns its own internal sandbox boundary during normal operation. The orchestrator uses this flag to decide whether the outer isolation primitives need to be loosened to permit nested sandboxing (e.g., allow `clone(CLONE_NEWUSER)` syscalls, permit `bwrap` to nest).
+
+**Why a boolean and not an enum.** "Has inner sandbox or not" is the discriminator the orchestrator needs. The *kind* of inner sandbox (bwrap, sandbox-exec, seccomp-only) is a detail the orchestrator does not need to compose against — it just needs to know whether to relax the outer profile. If a future provider requires per-sandbox-flavor handling, this field can be widened to an enum in a subsequent amendment.
+
+**Default behavior when absent.** Treated as `false`. This is the safer-by-default value — outer isolation stays at its strictest setting. A provider that actually has an inner sandbox but forgets to declare it will fail at spawn time (inner-bwrap attempts denied by outer profile); the failure mode is loud and obvious, which is the desired behavior.
+
+**Validation rules.** MUST be a literal `true` or `false`. Truthy/falsy coercion (e.g., declaring `1` or `'yes'`) is a load-time error — booleans are the documented type and coercion would silently change the orchestrator's composition decision.
+
+**Authority citation requirement.** A `hasInnerSandbox: true` declaration MUST cite the CLI's documented or observed inner-sandbox behavior in the plugin header. For codex, the citation is `openai/codex#16018` (the GitHub issue documenting `codex exec` invoking bubblewrap internally) plus https://developers.openai.com/codex/concepts/sandboxing (the official docs page describing the `--sandbox` flag and `read-only` default). For a hypothetical future provider, the citation is whatever CLI doc or observed-behavior transcript establishes the inner sandbox.
+
+##### 5. `crossTenantReadProtection: 'tool-suppression' | 'inner-sandbox' | 'none'`
+
+**Type and semantics.** A discriminated string declaring the regime under which this provider's spawn is protected against cross-tenant filesystem reads. The three values correspond to the three regimes observed in the 2026-05-27 prior-art / incident analysis (see incident memory § 6):
+
+- `'tool-suppression'` — the provider's CLI exposes no filesystem-reading tools to the model during the spawn, because OLP suppresses them at the request level. For anthropic, this is achieved via ADR 0009 Amendment 1's `--system-prompt` injection combined with the absence of `--tools` flags: the model has no shell, no file-read, no bash, no Read/Write/Edit primitives. The cross-tenant read surface is closed at the prompt-engineering layer; OS-level isolation is a defense in depth but not the primary regime.
+
+- `'inner-sandbox'` — the provider's CLI has tool execution (e.g., codex's `shell` tool, which actually runs commands) but the CLI's own inner sandbox prevents the tool from reading paths outside its declared allow-list. For codex, the inner bwrap sandbox enforces `--sandbox read-only` by default (per https://developers.openai.com/codex/concepts/sandboxing), so even though the model can call `shell`, the shell's reads are confined to the inner namespace. The cross-tenant read surface is closed at the inner-sandbox layer.
+
+- `'none'` — no protection regime is currently established for this provider. The model may have tools that read files, and there is no inner sandbox blocking those reads. Operationally this means the provider should NOT be enabled in a multi-tenant deployment until a regime is established. The orchestrator MUST log a WARN at server boot when a provider with `crossTenantReadProtection: 'none'` is enabled in a deployment with >1 active OLP key — observability, not enforcement (see Rule 4 compliance below).
+
+**Why a discriminated enum, not a free-form string.** The orchestrator and the operator dashboard both consume this field. Free-form values would require every consumer to perform string-matching against a moving target. The enum locks the consumer surface; future regimes are added by amending this list in a subsequent ADR 0002 amendment.
+
+**Default behavior when absent.** Treated as `'none'`. Safer-by-default in the WARN sense (operators get the WARN log) but NOT in the security sense (no protection is actually applied). This is intentional: the orchestrator cannot fabricate a protection regime the plugin hasn't implemented; the WARN nudges the plugin author to declare honestly.
+
+**Validation rules.** MUST be one of the three enum values literally. Any other string is a load-time error. The orchestrator MUST log the field's value at server startup so operators can audit the protection picture across providers at a glance.
+
+**Authority citation requirement.**
+- `'tool-suppression'` declarations MUST cite the suppression mechanism (e.g., for anthropic: ADR 0009 Amendment 1 § "--system-prompt" + the absence-of-tools posture documented at the incident memory § 6.1).
+- `'inner-sandbox'` declarations MUST cite the CLI doc or observed behavior establishing the inner sandbox (e.g., for codex: `openai/codex#16018` + https://developers.openai.com/codex/concepts/sandboxing).
+- `'none'` is the safer default and requires no citation but MUST be accompanied by a header-comment TODO documenting what regime is expected to be established when the provider transitions from Candidate to Enabled (or earlier if the provider is enabled in a multi-tenant context).
+
+##### 6. `recommendedDeploymentTier: 'shared-os-user' | 'per-os-user' | 'separate-vm'`
+
+**Type and semantics.** A discriminated string giving operators a deployment-topology recommendation for this provider in a multi-tenant context. The three values express increasing degrees of operator-side isolation:
+
+- `'shared-os-user'` — the OLP server process runs as a single OS user, and multiple OLP keys share that user. Protection against cross-tenant leakage rests entirely on the provider's `crossTenantReadProtection` regime + the orchestrator's ephemeral-home composition. This is the recommended posture for providers where `crossTenantReadProtection` is `'tool-suppression'` AND `hasInnerSandbox: false` (i.e., the model has no filesystem-touching tools at all).
+
+- `'per-os-user'` — each OLP key (or each tenant) should map to a separate OS user, with file-permission-level isolation between tenants. The recommended posture for providers with `crossTenantReadProtection: 'inner-sandbox'` — the inner sandbox protects against accidental leakage from the model's tools, but a sandbox-escape (e.g., a CVE in bubblewrap, a misconfigured inner profile) would expose the OS-user filesystem; per-OS-user isolation adds defense in depth.
+
+- `'separate-vm'` — the provider should not be co-located with any other tenant on the same VM. The recommended posture for providers with `crossTenantReadProtection: 'none'` AND/OR ones where the operator has reason to distrust the inner sandbox's quality. Practically this means the provider should not be enabled in OLP's family-LAN deployment unless the family-LAN host runs only this tenant.
+
+**Why a recommendation and not a hard policy.** The orchestrator and OLP runtime cannot *enforce* OS-user separation or VM separation — those are properties of the host operator's deployment topology. This field is informational: it surfaces in `/health.providers.<name>.isolation` (a Phase 7 addition planned in a follow-up amendment) and in the dashboard, so operators making deployment decisions have the per-provider recommendation visible. Operator override is the expected normal path: a deployment that knowingly accepts the risk of running an `'separate-vm'` provider in a shared-user context is acceptable, just observable.
+
+**Default behavior when absent.** Treated as `'separate-vm'` — the safest recommendation in the absence of declared analysis. The WARN log emitted for missing `ISOLATION` blocks (see Rule 4 compliance below) covers operator visibility.
+
+**Validation rules.** MUST be one of the three enum values literally. Any other string is a load-time error.
+
+**Authority citation requirement.** The plugin author MUST cite the basis for the recommendation in the plugin header — typically a short paragraph reasoning about the combination of `hasInnerSandbox` and `crossTenantReadProtection` for this provider. The reasoning is not a CLI authority citation (the underlying CLI does not declare deployment topology); it is an OLP-side analysis. The expected citation form is `# isolation rationale: <2-3 sentences> (cf. ADR 0014 Amendment 1 § <relevant section>)`.
+
+##### 7. `toolHardeningArgs: (existingArgs) => modifiedArgs` (OPTIONAL)
+
+**Type and semantics.** An OPTIONAL pure function that, given the plugin's `spawn()` method's CLI args (the array passed to `child_process.spawn`), returns a (possibly modified) args array with additional tool-hardening flags inserted. The orchestrator calls this hook after the plugin's `spawn()` constructs its args but before the actual `child_process.spawn` invocation.
+
+**Purpose.** Some providers expose CLI flags that suppress or restrict the model's tool access at the per-spawn level (e.g., `--disallowedTools` on `claude`, or `--sandbox read-only` on `codex`). These flags are the *enforcement mechanism* corresponding to the `crossTenantReadProtection` *declaration*. Splitting the declaration (a static field) from the enforcement (a function that mutates args) keeps the contract auditable while letting the enforcement evolve as the underlying CLI's flag set changes.
+
+**Why this is OPTIONAL.** For providers where `crossTenantReadProtection: 'tool-suppression'` is achieved entirely via the `spawn()` method's existing args construction (e.g., the existing anthropic.mjs `--system-prompt` injection), no separate hardening step is needed — the field can be omitted. For providers where the orchestrator needs to inject additional flags atop the plugin's base args, the field provides the hook.
+
+**Default behavior when absent.** No args modification — the plugin's `spawn()` method's args are passed through to `child_process.spawn` unchanged. This is the current Phase 6c behavior for anthropic and is appropriate when the `spawn()` method already encodes the hardening.
+
+**Validation rules.**
+- If declared, MUST be a function.
+- First-spawn invocation MUST validate the return value is an array of strings. Non-array or non-string-element returns abort the spawn (silent coercion is unsafe at the kernel boundary).
+- The function MUST be referentially transparent — same input array yields same output array (no module-level state, no fs reads).
+- The orchestrator MUST NOT pass the args by reference in a way that the function could mutate the original `existingArgs`. The hook receives a defensive copy; returning a fresh array is required.
+
+**Authority citation requirement.** The injected flags MUST be documented CLI flags of the underlying provider. Inventing a `--disable-tools` flag that the CLI does not support is a Rule 2 violation. For codex, citing https://developers.openai.com/codex/concepts/sandboxing § `--sandbox` is sufficient. For anthropic, the existing ADR 0009 Amendment 1 citation covers the tool-suppression mechanism.
+
+#### Per-provider concrete instances
+
+The three currently-shipped providers declare `ISOLATION` as follows. Each declaration MUST be present in the corresponding plugin file before that provider can be enabled in any multi-tenant deployment (see § Rule 4 compliance and § Backward compatibility for the transition path).
+
+##### anthropic
+
+```javascript
+// lib/providers/anthropic.mjs
+//
+// isolation rationale: Anthropic Claude reaches OLP via stream-json transport
+// without a tool surface (ADR 0009 Amendment 1's --system-prompt injection
+// suppresses env-block, file tools, bash, and Read/Write/Edit). The model
+// has no documented mechanism to read files during the spawn. Cross-tenant
+// read protection is achieved at the prompt-engineering / CLI-flag layer.
+// The OS-level isolation primitives (HOME redirect + ephemeral credential
+// mount) add defense in depth against future CLI changes that might
+// re-introduce a tool surface.
+//
+// Authority: @anthropic-ai/claude-code v2.1.150 § --system-prompt
+//   (ADR 0009 Amendment 1 + incident memory § 6.1 establishes the
+//   tool-suppression mechanism); HOME env conventional POSIX behavior.
+
+export const ISOLATION = {
+  ephemeralEnvOverrides: ({ ephemeralRoot, keyId, reqId }) => ({
+    HOME: ephemeralRoot,
+    // CLAUDE_CONFIG_DIR is NOT honored as of v2.1.150 — the CLI reads from
+    // $HOME/.claude/.credentials.json. Redirecting HOME is the documented
+    // mechanism. The keyId / reqId arguments are unused here but received for
+    // signature consistency with codex's overrides.
+  }),
+  credentialMounts: [
+    // OAuth artifact location. Authority: existing anthropic.mjs `auth.path`
+    // field — `~/.claude/.credentials.json` is the documented OAuth artifact.
+    // The orchestrator resolves the absolute src path via os.homedir() at
+    // load time (the plugin file shows the literal `join(homedir(), ...)`).
+    [/* resolved at load: */ '<homedir>/.claude/.credentials.json',
+     '.claude/.credentials.json'],
+  ],
+  requiredHomePaths: [
+    '.claude',
+    // No observed behavior requires additional dirs; CLI creates session logs
+    // under .claude/ on demand. If future CLI versions add a mandatory pre-
+    // existing subdir, add it here with an observed-behavior comment.
+  ],
+  hasInnerSandbox: false,
+  crossTenantReadProtection: 'tool-suppression',
+  recommendedDeploymentTier: 'shared-os-user',
+  // toolHardeningArgs omitted — the existing spawn() method's args already
+  // encode the --system-prompt suppression (ADR 0009 Amendment 1).
+};
+```
+
+**Authority pin for the anthropic ISOLATION declaration:**
+- `--system-prompt` mechanism: ADR 0009 Amendment 1 + incident memory `~/.cc-rules/memory/projects/olp/incident_2026_05_27_spawn_cli_security.md` § 6.1
+- `HOME` env redirect: POSIX convention; `claude` CLI v2.1.150 observed to read `~/.claude/.credentials.json` via HOME (verified by the PR-B PI231 spike, confirmed by ADR 0014 Amendment 1's HOME-override verification task)
+
+##### codex
+
+```javascript
+// lib/providers/codex.mjs
+//
+// isolation rationale: OpenAI Codex's `codex exec` exposes a shell tool that
+// actually executes commands during the spawn (incident memory § 3.2). The
+// CLI provides its own inner bubblewrap sandbox (`--sandbox read-only` by
+// default per https://developers.openai.com/codex/concepts/sandboxing) that
+// confines shell tool reads/writes. The orchestrator's outer isolation
+// composes with the inner sandbox: HOME-equivalent redirect via CODEX_HOME
+// (per https://developers.openai.com/codex/config-reference) plus per-spawn
+// ephemeral credential mount. hasInnerSandbox: true so the outer profile is
+// relaxed to permit inner bwrap's user-namespace clone.
+//
+// Authority: openai/codex#16018 (inner bwrap behavior);
+//   https://developers.openai.com/codex/concepts/sandboxing (--sandbox flag);
+//   https://developers.openai.com/codex/config-reference (CODEX_HOME);
+//   https://developers.openai.com/codex/auth/ (~/.codex/auth.json path).
+
+export const ISOLATION = {
+  ephemeralEnvOverrides: ({ ephemeralRoot, keyId, reqId }) => ({
+    // CODEX_HOME overrides the base config / credential dir. Docs:
+    // https://developers.openai.com/codex/config-reference and
+    // https://developers.openai.com/codex/auth/
+    CODEX_HOME: `${ephemeralRoot}/.codex`,
+    // HOME also redirected for codex's own bubblewrap-internal HOME lookup
+    // (the inner sandbox inherits parent HOME unless overridden).
+    HOME: ephemeralRoot,
+  }),
+  credentialMounts: [
+    // Auth artifact location. Authority: existing codex.mjs `auth.path` field
+    // (Codex CLI reference § Authentication, plus
+    // https://developers.openai.com/codex/auth/ canonical pin).
+    [/* resolved at load: */ '<homedir>/.codex/auth.json',
+     '.codex/auth.json'],
+  ],
+  requiredHomePaths: [
+    '.codex',
+    // Inner bwrap may create additional state under .codex/. If observed
+    // behavior shows the CLI failing on absent subdirs, add them here.
+  ],
+  hasInnerSandbox: true,
+  crossTenantReadProtection: 'inner-sandbox',
+  recommendedDeploymentTier: 'per-os-user',
+  toolHardeningArgs: (existingArgs) => {
+    // If the operator has not explicitly passed --sandbox, inject the
+    // documented read-only default. Per
+    // https://developers.openai.com/codex/concepts/sandboxing the default
+    // posture is `read-only`; this hardening hook makes the default explicit
+    // at the spawn args level so a future CLI default change does not
+    // silently weaken the isolation.
+    if (existingArgs.some(arg => arg === '--sandbox' || arg.startsWith('--sandbox='))) {
+      return existingArgs;
+    }
+    return [...existingArgs, '--sandbox', 'read-only'];
+  },
+};
+```
+
+**Authority pin for the codex ISOLATION declaration:**
+- `CODEX_HOME`: https://developers.openai.com/codex/config-reference (retrieved 2026-05-29)
+- `~/.codex/auth.json`: https://developers.openai.com/codex/auth/ (existing `auth.path` citation in codex.mjs)
+- Inner bwrap behavior: `openai/codex#16018` plus https://developers.openai.com/codex/concepts/sandboxing
+- `--sandbox read-only`: https://developers.openai.com/codex/concepts/sandboxing § "Sandboxing modes"
+
+##### mistral
+
+```javascript
+// lib/providers/mistral.mjs
+//
+// isolation rationale: Mistral Vibe ships at OLP Phase 7 with no known
+// equivalent to Anthropic's Phase 6c --system-prompt tool suppression and
+// no known inner sandbox. The IR-level normalization shipped at D8 does not
+// suppress tools at the CLI layer. Cross-tenant read protection is therefore
+// 'none' — the provider should not be enabled in a multi-tenant deployment
+// until a regime is established. The declaration here exists so the
+// orchestrator can compose ephemeral-home credential isolation (which still
+// works) while the operator sees a clear WARN that the tool-side protection
+// is not in place.
+//
+// Authority: TBD — a spike task tracked at Phase 7 follow-up (see Open
+//   Questions section below) will verify Vibe CLI's tool surface and inner
+//   sandbox posture against https://docs.mistral.ai/mistral-vibe/terminal/.
+//   Until that spike lands, this declaration documents the current honest
+//   state per ALIGNMENT.md Rule 3 (Match the Implementation): no protection
+//   is encoded because none has been established.
+
+export const ISOLATION = {
+  ephemeralEnvOverrides: ({ ephemeralRoot, keyId, reqId }) => ({
+    // VIBE_HOME is documented at
+    // https://docs.mistral.ai/mistral-vibe/terminal/configuration as the
+    // env var that overrides the default ~/.vibe/ base directory
+    // (3 occurrences verified 2026-05-29: descriptive sentence,
+    // canonical export example, and an enumeration of files/dirs the
+    // variable affects). Task #4 PI231 spike verifies observed CLI
+    // behaviour matches the documented contract.
+    VIBE_HOME: `${ephemeralRoot}/.vibe`,
+    HOME: ephemeralRoot,
+  }),
+  credentialMounts: [
+    // ~/.vibe/.env per existing mistral.mjs `auth.path` field, sourced from
+    // https://docs.mistral.ai/mistral-vibe/terminal/configuration.
+    [/* resolved at load: */ '<homedir>/.vibe/.env', '.vibe/.env'],
+  ],
+  requiredHomePaths: [
+    '.vibe',
+  ],
+  hasInnerSandbox: false,
+  crossTenantReadProtection: 'none',
+  recommendedDeploymentTier: 'separate-vm',
+  // toolHardeningArgs omitted — no CLI hardening flag is currently known for
+  // Vibe. The Phase 7 spike will revisit.
+};
+```
+
+**Authority pin for the mistral ISOLATION declaration:**
+- `VIBE_HOME`: https://docs.mistral.ai/mistral-vibe/terminal/configuration (3 occurrences verified 2026-05-29: descriptive sentence "Override the location with the `VIBE_HOME` environment variable", canonical `export VIBE_HOME="/path/to/custom/vibe/home"` example, and the enumeration of files/directories `VIBE_HOME` affects).
+- `~/.vibe/.env`: same source (existing `auth.path` citation in mistral.mjs).
+- **Open spike (Phase 7 follow-up, Task #4):** verify *observed CLI behaviour* matches *documented behaviour* — (a) Vibe CLI actually honours the documented `VIBE_HOME` env var during spawn; (b) Vibe CLI's tool surface (shell, file-read, etc.) during a `vibe --prompt` spawn; (c) any CLI sandbox or tool-suppression flag. Findings may transition `crossTenantReadProtection` from `'none'` to `'tool-suppression'` or `'inner-sandbox'` if a hardening regime is discovered. The spike is verification-grade, not authority-pin work.
+
+#### Backward compatibility
+
+A plugin that does NOT export `ISOLATION` continues to work exactly as it does today. The orchestrator's `prepareIsolatedEnvironment(provider, ctx)` function MUST detect the absence of `provider.ISOLATION` (or the absence of any individual field within it) and fall through to the legacy unsandboxed code path for that spawn. The legacy path is:
+
+- No ephemeral root created
+- No env overrides
+- No credential mounts
+- `cwd: process.cwd()` (the server's working directory)
+- `env: process.env` (composed with whatever the plugin's `spawn()` method's existing env logic produces)
+
+This is the same behavior as Phase 6c. No provider plugin is broken by Amendment 9's landing.
+
+Plugins MAY adopt `ISOLATION` incrementally: a plugin that wants the credential-mount benefit but has not yet analyzed its cross-tenant tool surface MAY declare `crossTenantReadProtection: 'none'` and `recommendedDeploymentTier: 'separate-vm'` (the safer-by-default values). The orchestrator will compose the credential isolation correctly; the WARN log nudges follow-up.
+
+#### Rule 4 compliance (ALIGNMENT.md)
+
+ALIGNMENT.md Rule 4 states: "Unalignable plugins / fields are deleted, not feature-flagged." This amendment introduces an OPTIONAL contract field, which on its face could be read as "feature-flagging" isolation. The reading is wrong, and the distinction is important enough to spell out:
+
+- Amendment 9 does NOT introduce an `ISOLATION` feature flag that operators or plugins toggle on/off. The field's presence/absence describes **the provider's truthful isolation posture** at a point in time. A plugin without `ISOLATION` declares (implicitly) that no analysis has been done and the safer-by-default treatment applies.
+- The OPTIONAL nature is purely transitional. Existing plugins ship without it; they continue to spawn (in their existing single-tenant developer-laptop posture). The orchestrator's WARN log surfaces the absence to the operator at server boot. An operator running a multi-tenant deployment with un-declared plugins is operating off-recommendation but not blocked.
+- A plugin that declares `ISOLATION` with values the orchestrator cannot honor (e.g., a `credentialMounts` entry pointing at a path that does not exist, or an `ephemeralEnvOverrides` function that returns non-string values) MUST fail at first spawn — the orchestrator does not silently fall back to the no-ISOLATION path. This is the Rule 4 enforcement vector: a *broken* declaration is unalignable and surfaces loudly; a *missing* declaration is the safer transitional state.
+
+The WARN at server boot is observability, not enforcement. It reads approximately:
+
+```
+[WARN] provider "<name>" does not declare ISOLATION; spawns will run
+       under legacy unsandboxed shape. Recommended in multi-tenant
+       deployments: declare ISOLATION per ADR 0002 Amendment 9.
+```
+
+Operators in single-tenant developer deployments may safely ignore the WARN. Operators in multi-tenant deployments should treat it as a Phase 7 follow-up task.
+
+#### Interaction with prior amendments
+
+- **Amendment 1 (`maxSpawnTimeMs`).** Independent. The spawn-timeout enforcement lives inside each plugin's spawn drain loop; the orchestrator's ISOLATION composition happens *before* the spawn, so the two amendments compose without conflict.
+- **Amendment 3 (`cacheable`).** Independent. The cache layer decides whether to call the orchestrator at all; once the orchestrator is reached, ISOLATION composition is orthogonal to cacheability.
+- **Amendment 4 (`contractVersion`).** Independent. `contractVersion: '1.0'` plugins MAY add an `ISOLATION` export under Amendment 9 without bumping the contract version — `ISOLATION` is an additive named export, not a v1.0 contract surface change. A future Provider contract v1.1 may promote `ISOLATION` to a required field (forcing all enabled plugins to declare); that decision is deferred to a future amendment, gated on the Phase 7 follow-up findings.
+- **Amendment 6 (`maxConcurrent` runtime enforcement).** Independent. The semaphore acquire happens before the orchestrator's `prepareIsolatedEnvironment`; the release happens after the spawn drains. ISOLATION composition is bracketed by the semaphore, not entangled with it.
+- **Amendment 7 (`doctorChecks()`).** Adjacent. A future plugin may add an `<provider>.isolation_declared` doctor check that reports whether `ISOLATION` is declared and whether its referenced credential paths resolve. The check is OPTIONAL per Amendment 7's framework and is appropriate for `olp doctor` operator UX.
+- **Amendment 8 (`quotaStatus()` direct-API exemption).** Independent. The quota probe runs outside the spawn pipeline (direct HTTPS from server process); it does not interact with `ISOLATION` composition.
+
+#### Companion ADR
+
+This amendment is the companion governance piece for **ADR 0014 Amendment 1** (the Phase 7 architectural shift from outer-bwrap PR-B to per-spawn ephemeral-home + per-provider primitives). ADR 0014 Amendment 1 describes the orchestrator's composition algorithm and the rationale for retiring the outer-bwrap approach; ADR 0002 Amendment 9 (this section) describes the contract surface the orchestrator reads.
+
+The two amendments are reviewed and merged together as a single coupled commit (Iron Rule 11 — minimum reviewable unit per layer). Reviewing them separately cannot verify producer-consumer alignment: the orchestrator's algorithm is meaningless without the contract it consumes, and the contract is meaningless without the orchestrator's composition discipline.
+
+#### Tests
+
+Test coverage for Amendment 9 lands as a new Suite in `test-features.mjs` co-merged with ADR 0014 Amendment 1's `lib/sandbox/manager.mjs` refactor. The suite covers:
+
+1. `validateProvider` (or `validateIsolation` helper) rejects each documented invalid shape: non-function `ephemeralEnvOverrides`; non-2-tuple `credentialMounts` entries; `dst` paths starting with `..` or absolute; non-boolean `hasInnerSandbox`; out-of-enum `crossTenantReadProtection`; out-of-enum `recommendedDeploymentTier`; non-function `toolHardeningArgs`.
+2. The legacy code path: a fake provider without `ISOLATION` spawns under the existing shape unchanged. Existing Phase 6c tests for anthropic continue to pass.
+3. The ephemeral-home composition path: a fake provider declaring a minimal `ISOLATION` block has its env overrides applied and its credential mount resolved into a `mkdtemp`-created ephemeral root.
+4. First-spawn return-shape validation: `ephemeralEnvOverrides` returning non-string values aborts the spawn loudly; `toolHardeningArgs` returning a non-array aborts the spawn loudly.
+5. Per-shipped-provider declaration smoke: each of `anthropic`, `codex`, `mistral` declares an `ISOLATION` block; each block's `credentialMounts[i][0]` (when resolved against the running user's `homedir()`) matches the plugin's `auth.path` field.
+
+The full test list is captured in ADR 0014 Amendment 1's PR-B-revised test suite specification.
+
+#### Open questions (Phase 7 follow-up)
+
+1. **Mistral Vibe tool surface and inner sandbox.** The mistral plugin's `ISOLATION` declares `crossTenantReadProtection: 'none'` honestly. A spike task is required to determine whether Vibe CLI exposes any tool surface and/or any sandbox flag; findings update the declaration. Tracked at the Phase 7 work plan.
+2. **HOME-only providers vs CODEX_HOME-style providers.** The current contract assumes credential redirection happens via env-var rewriting (`HOME` or `<PROVIDER>_HOME`). A future provider that hardcodes its credential path (no env override) would be unable to honor the contract and would need a different isolation strategy (e.g., bind-mount of the literal path). This is not a current problem (all three shipped providers honor env overrides) but should be tracked for future inclusion ADRs.
+3. **Promoting `ISOLATION` to required at contract v1.1.** Once all enabled providers declare `ISOLATION`, a future contract-version bump may promote the field from OPTIONAL to REQUIRED. The decision is gated on operational experience after PI231 + cloud deployment — see ADR 0014 Amendment 1 for the rollout milestones.
+4. **Per-spawn vs per-key ephemeral root.** This amendment specifies per-spawn ephemeral roots (one `mkdtemp` per `provider.spawn` call). A future optimization may cache ephemeral roots per-key (one ephemeral root per OLP key identity, reused across spawns) to reduce mkdtemp / mount overhead. The contract surface here is compatible with either strategy; the choice is an orchestrator implementation detail.
+5. **Cleanup discipline.** The orchestrator is responsible for `rm -rf`-ing the ephemeral root after the spawn drains. The cleanup mechanism (synchronous vs deferred, error vs success path symmetry) is specified in ADR 0014 Amendment 1, not here. This amendment notes the dependency for completeness.
+
+#### Authority citations summary
+
+| Field | Authority |
+|---|---|
+| `ephemeralEnvOverrides` (general) | POSIX `HOME` convention; per-provider env-var documentation cited per declaration |
+| `credentialMounts` (general) | Each plugin's existing `auth.path` field citation |
+| `requiredHomePaths` (general) | Observed CLI behavior; no speculative entries (Rule 2) |
+| `hasInnerSandbox` (general) | CLI doc or observed-behavior transcript |
+| `crossTenantReadProtection` (enum) | OLP-side analysis based on prior-art search in incident memory `~/.cc-rules/memory/projects/olp/incident_2026_05_27_spawn_cli_security.md` § 4 + § 6 |
+| `recommendedDeploymentTier` (enum) | OLP-side analysis; ADR 0014 Amendment 1 § Deployment topology |
+| `toolHardeningArgs` (function) | Documented CLI flags of the underlying provider; no invented flags (Rule 2) |
+| anthropic `--system-prompt` tool suppression | ADR 0009 Amendment 1 + incident memory § 6.1 |
+| codex `CODEX_HOME` | https://developers.openai.com/codex/config-reference + https://developers.openai.com/codex/auth/ |
+| codex inner bwrap | openai/codex#16018 + https://developers.openai.com/codex/concepts/sandboxing |
+| codex `--sandbox read-only` default | https://developers.openai.com/codex/concepts/sandboxing § "Sandboxing modes" |
+| mistral `VIBE_HOME` and `.vibe/.env` | https://docs.mistral.ai/mistral-vibe/terminal/configuration |
+
+#### Procedural mechanism
+
+- **Iron Rule 11 (Incremental Diff Review)** — Amendment 9 (governance, ADR 0002) and ADR 0014 Amendment 1 (orchestrator architecture) land as a single coupled PR. Reviewing them separately cannot verify consumer-producer alignment.
+- **Iron Rule 10 (Code Review)** — independent fresh-context reviewer per `CLAUDE.md` hard requirement #3. The reviewer MUST open each cited authority URL (Codex config-reference, sandboxing docs, Mistral configuration docs, the incident memory) and confirm the citation in the review comment.
+- **`ALIGNMENT.md` Rule 1 (Cite First)** — every per-field design choice is cited above. Every per-provider concrete instance is cited to the underlying CLI authority.
+- **`ALIGNMENT.md` Rule 2 (No Invention)** — no invented env vars, no invented CLI flags. The mistral `crossTenantReadProtection: 'none'` declaration is the explicit honest acknowledgment that no protection regime has been established, rather than invention of one.
+- **`ALIGNMENT.md` Rule 4 (Unalignable Plugins / Fields Are Deleted)** — see § Rule 4 compliance above for the explicit reasoning that OPTIONAL `ISOLATION` is not "feature-flagging" but rather "honestly transitional."
+- **`ALIGNMENT.md` Amendment Procedure** — this section (Amendment 9) is the PR-required citation of evidence (the 2026-05-27 incident memory, the ADR 0014 PoC spike report at `/tmp/sandbox-spike/report.md` on PI231) and the structural amendment of the Provider contract documented in this ADR's § Decision.

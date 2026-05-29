@@ -19,6 +19,24 @@ A personal- and family-scale multi-provider LLM proxy. One HTTP endpoint, many s
 
 ---
 
+## Tool execution model
+
+OLP is a **chat/completion proxy**, not a tool runtime. It forwards messages between your client and a provider's LLM and returns the response. It does **not** execute tools (shell commands, filesystem reads, web fetches) on your behalf, and it has no plans to.
+
+When an agentic client (Cline / Cursor / Continue.dev / Aider / Hermes Agent / OpenClaw) needs to call a tool, that tool runs **on the client's host**. The client sends the tool's output back as a follow-up message. OLP sees only the message stream — never an open file handle, an executed command, or a fetched URL.
+
+Why this boundary matters:
+
+- **Multi-tenant safety.** A misbehaving prompt cannot use OLP to read files belonging to another OLP key holder. The threat surface is bounded to "what the model can say in a message" — not "what the model can do on the server."
+- **Stateless operation.** OLP runs the same code path for every request, regardless of which client is calling. Session state, tool state, and conversational memory all live in the client. See [`AGENTS.md`](./AGENTS.md) § "No conversation state".
+- **Provider-CLI honesty.** OLP spawns provider CLIs (`claude`, `codex`, `vibe`) to talk to upstream APIs and translates wire formats via the IR. It does not extend those CLIs with new tools or capabilities — see [`ALIGNMENT.md`](./ALIGNMENT.md) Rule 2 (No Invention).
+
+A few clients (notably OpenClaw in certain configurations) can be wired to route their tool calls *through* the OLP server host rather than executing them locally. This is a client configuration choice, not an OLP feature, and it produces surprising self-check results (the agent describes the OLP server, not your machine). See [§ Known limitations](#known-limitations) for the integrator-level guidance.
+
+For the multi-tenant isolation story, [ADR 0014 Amendment 1](./docs/adr/0014-sandbox-runtime-integration.md) defines a four-layer architecture: each provider-CLI spawn gets a per-request ephemeral `$HOME` (`/tmp/olp-spawn/<keyId>/<reqId>/home/`) with credential files symlinked in, plus per-provider tool-hardening (anthropic's `--system-prompt` suppresses Read/Bash tool descriptions; codex defaults to `--sandbox read-only`). The canonical contract lives in [ADR 0002 Amendment 9](./docs/adr/0002-plugin-architecture.md) (Provider ISOLATION contract) + [ADR 0014 Amendment 1](./docs/adr/0014-sandbox-runtime-integration.md). The full "Security Model" reference will land in a Phase 7 close PR (Task #10).
+
+---
+
 ## Install with your AI (the fast path)
 
 If the manual steps feel like a lot, paste this verbatim into your AI coding assistant (Claude Code / Cursor / Copilot / Aider). It walks you through everything:
@@ -225,6 +243,15 @@ OLP distinguishes **Candidate Providers** (declared as intended, not yet pinned)
 | `minimax` | TBD | MiniMax Token Plan (¥29+/mo) | TBD (Phase 8+) | B | Phase 8+ |
 | `glm` | TBD | Zhipu Coding Plan ($10+/mo) | TBD (Phase 8+) | B | Phase 8+ |
 | `qwen` | TBD | Alibaba Coding Plan ($50/mo) | TBD (Phase 8+) | B | Phase 8+ |
+
+**Anthropic models (sourced from `models-registry.json`):**
+
+| Model ID | Display name | Context window | Notes |
+|---|---|---|---|
+| `claude-opus-4-8` | Claude Opus 4.8 | 200 000 | Newest opus; `opus` alias points here |
+| `claude-opus-4-7` | Claude Opus 4.7 | 200 000 | Still callable by literal id |
+| `claude-sonnet-4-6` | Claude Sonnet 4.6 | 200 000 | `sonnet` + `claude` aliases point here |
+| `claude-haiku-4-5` | Claude Haiku 4.5 | 200 000 | `haiku` alias points here |
 
 **Risk tier guide.** D = permissive / safe (eligible for default-enabled); C = tightening signal, no enforcement history (opt-in); B = service-level key revocation risk (opt-in + consent); A = excluded by default (cannot be opt-in enabled). Tier B providers prompt for explicit consent on first enable and record consent in `~/.olp/config.json`. See [`ALIGNMENT.md` § Risk Tier Framework](./ALIGNMENT.md#risk-tier-framework).
 

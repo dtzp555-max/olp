@@ -580,7 +580,29 @@ Behaviors that work correctly at personal/family scale but have ratified follow-
   - **Cline / Continue.dev / Cursor / Aider** — IDE clients typically run shell / fs tools locally on the user's machine, so self-checks report the user's machine correctly. No OLP-side action needed.
   - **Generic agentic clients** — if your client routes tool execution to the OLP server, expect bot self-reports to describe the OLP server's state. Either: (1) configure your client's tool handler to run tools locally, or (2) document this to your client users as a known limitation.
 
-  See [ADR 0014](./docs/adr/0014-sandbox-runtime-integration.md) for the multi-tenant security counterpart of this issue — even with shell-tool routing, OLP server-side sandboxing prevents one client from reading another client's OAuth tokens (Phase 7 PR-A shipped; PR-B HTTP-path activation pending).
+  See [ADR 0014 Amendment 1](./docs/adr/0014-sandbox-runtime-integration.md) for the multi-tenant security counterpart of this issue. Phase 7 Solution 1 (shipped v0.7.0) per-spawn ephemeral `$HOME` + symlinked credentials redirect all CLI state writes to `/tmp/olp-spawn/<keyId>/<reqId>/home/`, so a prompt-injected `cat ~/.claude.json` reads only the ephemeral file, not other tenants' OAuth tokens.
+
+### Security Model
+
+OLP's multi-tenant isolation has **three deployment tiers**, each suited to a different trust model. The orchestrator reads each provider plugin's `ISOLATION` block (ADR 0002 Amendment 9) to pick the right primitives.
+
+| Tier | Trust assumption | Mechanism | Suitable for |
+|---|---|---|---|
+| **shared-os-user** (default) | All OLP key holders trust each other (family / personal pool) | Per-spawn ephemeral `$HOME` (Layer 1) + symlinked credentials (Layer 2) + provider tool-suppression (Layer 4 — anthropic Phase 6c `--system-prompt`, codex `--sandbox read-only`) | Family LAN, personal multi-device, trusted small teams. ADR 0001 § Mission. |
+| **per-os-user** | Trust boundaries between OLP keys (e.g., distinct family members on a shared host) | All of the above + per-OLP-key OS user (systemd `User=olp-<keyId>`, separate uid for kernel-level fs deny) | Untrusted-key deploy that still pools OAuth subscription. Operator-managed. |
+| **separate-vm** | Adversarial isolation between OLP keys (commercial / public-demo scenarios) | All of the above + dedicated VM per OLP key | OLP outside its stated mission. Each provider plugin's `recommendedDeploymentTier` declares its minimum acceptable tier. |
+
+The provider plugins' `crossTenantReadProtection` field declares **how** each protects against cross-tenant lateral filesystem reads:
+
+| Provider | `crossTenantReadProtection` | Mechanism |
+|---|---|---|
+| anthropic (claude CLI) | `tool-suppression` | Phase 6c `--system-prompt` replaces claude's default system prompt; the model receives no tool descriptions for Read/Bash/etc., so prompt-injection produces no `tool_use` to read other tenants' files. |
+| codex (codex CLI) | `inner-sandbox` | codex's own bubblewrap-based `--sandbox read-only` default confines shell-tool reads to its inner sandbox view. |
+| mistral (vibe CLI) | `none` | No tool-suppression flag known on vibe at present. Recommended deployment tier `separate-vm` until a hardening regime is verified (Task #4 follow-up spike). |
+
+**OLP_SANDBOX_DISABLED=1** env var disables Layer 3 (per-call sandbox-runtime wrapping) while preserving Layers 1+2+4. This is the post-Amendment 1 escape hatch retained for 1-2 releases; production deployments should leave it unset.
+
+**Attribution vs isolation.** ADR 0007 multi-key auth provides **attribution** (per-key audit, per-key cache namespace, per-key provider gating). ADR 0014 Amendment 1 provides **isolation** (the security tier above). Both layer cleanly — attribution always operates; isolation tier is operator-selected per deployment.
 
 ---
 

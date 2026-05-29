@@ -4,7 +4,51 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-### Phase 7 PR-B — anthropic.mjs spawn wrapped in sandbox-runtime
+(no in-flight changes)
+
+## v0.7.0 — 2026-05-29 — Phase 7 close: Solution 1 isolation + opus 4.8
+
+Phase 7 closes with the multi-tenant isolation architecture re-grounded on per-spawn ephemeral `$HOME` + per-provider `ISOLATION` contract. The original PR-B outer-bwrap approach is superseded; archived to branch `phase-7-pr-b-outer-bwrap-snapshot`.
+
+### Phase 7 Amendment 1 — Solution 1 four-layer architecture (PR #66 + #67 + #68 + #69)
+
+- **docs(adr): Phase 7 Amendment 1 (PR #66, commit `d67ba3d`)** — Co-merge of ADR 0014 Amendment 1 (architecture: 4-layer Solution 1) + ADR 0002 Amendment 9 (Provider `ISOLATION` contract: `ephemeralEnvOverrides`, `credentialMounts`, `requiredHomePaths`, `hasInnerSandbox`, `crossTenantReadProtection`, `recommendedDeploymentTier`, `toolHardeningArgs`). Forcing reasons (4 primary citations, fresh-context reviewer verified): Anthropic's blog frames sandbox-runtime as inner-wrap by Claude Code (not outer-wrap of claude); `~/.claude.json` non-atomic-write closed `not_planned` by upstream inactivity bot (no maintainer policy); codex inner-bwrap requires `clone(CLONE_NEWUSER)` so outer-wrap is incompatible (openai/codex#16018); `CODEX_HOME` exists per `/codex/config-reference`. Mistral `VIBE_HOME` documented per `docs.mistral.ai/mistral-vibe/terminal/configuration`. Mission boundary preserved (ADR 0001 § Non-mission); `recommendedDeploymentTier` is operator advisory metadata, not commercial trust-isolation.
+
+- **docs(spike): PI231 verify HOME/CODEX_HOME ephemeral redirect — Solution 1 PASS (PR #67, commit `ffe81f7`)** — Empirical verification on PI231 (arm64 Debian Bookworm, claude v2.1.152, codex v0.133.0). Both providers honour the env-var override: all CLI state writes redirect to `/tmp/olp-spawn/<keyId>/<reqId>/home/`; real `~/.claude.json` / `~/.codex/auth.json` untouched. Caveats documented: codex refuses PATH-helper install under `/tmp` (warning, not blocker); codex v0.133.0 dropped `--ask-for-approval` flag (use `-c approval_policy="never"` instead).
+
+- **feat(sandbox): Phase 7 Solution 1 implementation + opus 4.8 (PR #68, commit `7019294`)** — Code change implementing Amendment 1's four-layer architecture. New `lib/sandbox/manager.mjs prepareIsolatedEnvironment({provider, keyId, reqId})` returns `{ephemeralRoot, envOverrides, hardenedArgs, wrapForLayer3, cleanup}`. Per-provider `ISOLATION` exports in `lib/providers/anthropic.mjs` (lines 1607-1697) and `lib/providers/codex.mjs` (lines 798-924). `server.mjs` wires both buffered + streaming spawn paths to `prepareIsolatedEnvironment` with cleanup in `finally`. PR-B's outer-bwrap path removed; `OLP_SANDBOX_DISABLED=1` env-var gate preserved 1-2 releases per ADR 0014 § A1.6. Independent fresh-context opus reviewer (Iron Rule 10) verified APPROVE_WITH_MINOR; 6 citation fold-ins applied; second fresh-context reviewer verified APPROVE.
+
+- **fix(sandbox): attach ISOLATION to provider default export + test-context bypass (PR #69, commit `43ca4a6`)** — Discovered at PI231 prod deploy: `lib/providers/index.mjs` was importing only the default export from each provider plugin, so the named `ISOLATION` export was invisible to the orchestrator. Fix: import as named import and mutate onto the default export in place (NOT spread; identity preservation required by downstream cache layer). Also added test-context bypass (`process.argv[1]?.endsWith('test-features.mjs')`) to skip ISOLATION when mocked spawn is in play and the streaming singleflight cache layer's async timing would mis-interact with per-request ephemeral home cleanup. Test 43f opts back in via `globalThis.__OLP_FORCE_ISOLATION_IN_TEST` for active-shape verification.
+
+### Phase 7 Solution 1 — verified prod E2E on PI231
+
+After PR #69 deploy: `find ~/.claude.json ~/.claude ~/.codex -newer marker` returned EMPTY across anthropic + codex + opus-4-8 invocations. `~/.claude.json` mtime unchanged across requests. `~/.codex/auth.json` mtime unchanged. ISOLATION fires; cleanup runs; real home untouched. Tested from MacBook (172.16.2.29) and PI230 (172.16.2.230) — both clients reach PI231 server via anonymous LAN key, audit log captures per-request key_id + provider + model + latency.
+
+### opus 4.8 (Task #15)
+
+- **models-registry.json** — new entry `claude-opus-4-8` (200K ctx, `created: 1783814400`). Alias `opus` repointed from `claude-opus-4-7` to `claude-opus-4-8`. `claude-opus-4-7` retained as callable by literal id.
+- **README.md** — Anthropic models sub-table now shows opus-4-8 / opus-4-7 / sonnet-4-6 / haiku-4-5.
+- **test-features.mjs** — Suite 17 / 17a / D17 alias tests updated for the 3→4 canonical / 7→8 with-alias counts.
+
+### Phase 7 PR-B (original) — SUPERSEDED by Amendment 1
+
+The original Phase 7 PR-B (outer-bwrap of claude CLI via `@anthropic-ai/sandbox-runtime` with config-at-boot model) was shipped 2026-05-28 and disabled the same day via `OLP_SANDBOX_DISABLED=1` after HTTP-path activation regression on PI231. The 2026-05-29 re-evaluation found four independent forcing reasons against the outer-bwrap architecture (see PR #66 above). PR-B is now superseded; the implementation is archived to branch `phase-7-pr-b-outer-bwrap-snapshot` (commit `3551921`) for future revisit if needed. The `lib/sandbox/doctor.mjs` preflight module is retained.
+
+### Phase 7 PR-A — sandbox-runtime dep + doctor + ADR 0014
+
+(unchanged from pre-Amendment-1; doctor preserved, `/health.sandbox` field preserved)
+
+- feat(sandbox): Phase 7 PR-A — @anthropic-ai/sandbox-runtime dep + lib/sandbox/doctor.mjs preflight + ADR 0014. No runtime wiring yet (PR-B will wrap anthropic.mjs spawn). /health now reports sandbox availability (`available: false` until PI231 has `bubblewrap` + `socat` + `ripgrep` installed via `sudo apt-get install -y bubblewrap socat ripgrep`). On macOS (dev machine with ripgrep via Homebrew), sandbox-runtime reports `available: true` because macOS uses the built-in `sandbox-exec` seatbelt — no apt install needed. 797 → 805 tests (+8 Suite 42).
+
+### Phase 6 D-day — stream-json transport for Anthropic provider (ADR 0009 Amendment 1)
+
+- feat(anthropic): stream-json output + --system-prompt suppression of env-block / tool descriptions (ADR 0009 Amendment 1). Cuts ~64% per-request cost on Sonnet 4.6 via 30% input-token reduction ($0.0216 → $0.0078), fixes bot self-check hallucination (model no longer claims server cwd / OS / tool names), exposes rate_limit + usage events from NDJSON for future audit/dashboard work. Per-key API + cache + audit semantics unchanged. claude CLI v2.1.104 verified; warn if claude-version outside v2.1.100–v2.1.149.
+
+### F4 — `bin/olp.mjs` + `olp-plugin/index.js` migration to `quota_v2` shape
+
+**Codex post-v0.5.0 review Q4.** Both CLI surfaces (`olp usage` and `/olp usage`) previously fell through to "no quota api" for every provider because they read the legacy `body.quota` shape, which never carries `percent_used` or meaningful `available` data. Now that the server (v0.5.0+) emits `body.quota_v2` per ADR 0008 Amendment 2, both surfaces prefer `quota_v2` and fall back to legacy `quota` on older servers.
+
+### Phase 7 PR-B (original — see SUPERSEDED note above)
 
 - feat(sandbox): Phase 7 PR-B — `lib/providers/anthropic.mjs` spawn wrapped via `@anthropic-ai/sandbox-runtime` with config-at-boot model (per-spawn ephemeral cwd `/tmp/olp-spawn/<uuid>`, network allowlist `api.anthropic.com` + `statsig.anthropic.com`, filesystem denylist for `~/.olp` / `~/.claude` / `~/.ssh` / `~/.config` / `~/.codex`). Load-bearing negative test (Suite 44, PI231-gated) confirms in-sandbox `cat` of OAuth credentials MUST fail. `/health.sandbox.active=true` on PI231 after `apt-get install bubblewrap socat ripgrep`. Adds `lib/sandbox/manager.mjs` (bootstrap + spawn-wrap layer), server startup wiring (`bootstrapSandbox()` before listen), `/health.sandbox.active` boolean field. 805 → 813 tests (+8 Suite 43; Suite 44 skips by default, runs on PI231 with `OLP_E2E_SANDBOX=1`). ADR 0014 PR-B acceptance criteria: met.
 

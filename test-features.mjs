@@ -18318,3 +18318,209 @@ describe('Suite 44 — sandbox Layer 3 E2E test (PI231 only) [SKIP: awaiting Tas
     assert.ok(true, 'placeholder — real test lands in Task #9');
   });
 });
+
+// ── Suite 45 — PR-0 TUI ISOLATION seed ────────────────────────────────────
+//
+// Tests for the tui opt-in param of prepareIsolatedEnvironment:
+//   T-a  default-path-unchanged (tui omitted / false)
+//   T-b  tui-seed (tui:true, valid fixture source)
+//   T-c  missing-source (tui:true, non-existent source → minimal seed)
+//
+// Authority:
+//   spec §7.1 + §5.2 (T6 negative control) — seed does NOT disable managed MCP
+//   spec §5.5 — chmod 700 + mode-600 seed
+//   ADR 0002 Amendment 9 (ISOLATION contract, tuiSeed extension)
+//   claude CLI v2.1.158 first-run onboarding behavior
+
+import { ISOLATION as _ISOLATION_PR0 } from './lib/providers/anthropic.mjs';
+import { mkdtempSync as _mkdtemp45, rmSync as _rmSync45, statSync as _statSync45, writeFileSync as _wfs45, existsSync as _exists45, readFileSync as _rfs45 } from 'node:fs';
+import { join as _join45 } from 'node:path';
+import { tmpdir as _tmpdir45 } from 'node:os';
+
+describe('Suite 45 — PR-0 TUI ISOLATION seed', () => {
+
+  // ── Shared: build a mock provider that has the real anthropic ISOLATION shape
+  // (credentialMounts is overridden to [] so we don't symlink ~/.claude/.credentials.json).
+  function _mockAnthropicProvider() {
+    return {
+      name: 'mock-anthropic-pr0',
+      ISOLATION: {
+        ..._ISOLATION_PR0,
+        // Override credentialMounts to avoid accessing the real home during tests.
+        credentialMounts: [],
+      },
+    };
+  }
+
+  // ── T-a: default-path-unchanged ──────────────────────────────────────────
+  // With tui omitted (or false), prepareIsolatedEnvironment must NOT write
+  // .claude.json in the ephemeralRoot.  The return shape must equal the
+  // existing shape PLUS the additive reqId field.
+
+  it('45a: default-path-unchanged — no .claude.json written when tui is falsy', async () => {
+    await _resetSandboxMgr();
+    globalThis.__OLP_FORCE_ISOLATION_IN_TEST = true;
+    const provider = _mockAnthropicProvider();
+    let ctx;
+    try {
+      ctx = await prepareIsolatedEnvironment({
+        provider,
+        keyId: 'test-key-45a',
+        reqId: 'test-req-45a',
+        // tui intentionally omitted (defaults to false)
+      });
+
+      // ephemeralRoot must exist and be under /tmp/olp-spawn/
+      assert.ok(typeof ctx.ephemeralRoot === 'string' && ctx.ephemeralRoot.length > 0,
+        'ephemeralRoot must be a non-empty string');
+      assert.ok(ctx.ephemeralRoot.startsWith('/tmp/olp-spawn/'),
+        `ephemeralRoot must be under /tmp/olp-spawn/; got ${ctx.ephemeralRoot}`);
+
+      // NO .claude.json must be present
+      const claudeJsonPath = _join45(ctx.ephemeralRoot, '.claude.json');
+      assert.equal(_exists45(claudeJsonPath), false,
+        '.claude.json MUST NOT be present on the default (non-tui) path');
+
+      // reqId is present (additive — does not break existing callers who ignore it)
+      assert.ok('reqId' in ctx, 'reqId must be present in the returned ctx');
+      assert.equal(typeof ctx.reqId, 'string', 'reqId must be a string');
+
+      // Return shape has all original fields
+      assert.equal(typeof ctx.envOverrides, 'object', 'envOverrides must be present');
+      assert.equal(typeof ctx.hardenedArgs, 'function', 'hardenedArgs must be a function');
+      assert.equal(typeof ctx.wrapForLayer3, 'function', 'wrapForLayer3 must be a function');
+      assert.equal(typeof ctx.cleanup, 'function', 'cleanup must be a function');
+
+      await ctx.cleanup();
+    } finally {
+      delete globalThis.__OLP_FORCE_ISOLATION_IN_TEST;
+      if (ctx?.cleanup) { try { await ctx.cleanup(); } catch { /* already cleaned */ } }
+      await _resetSandboxMgr();
+    }
+  });
+
+  // ── T-b: tui-seed ────────────────────────────────────────────────────────
+  // With tui:true + a fixture tuiSeedSource: .claude.json must be written
+  // mode 600, projects stripped, markers present, oauthAccount/userID present.
+  // The <reqId> dir and ephemeralRoot must be mode 700.
+
+  it('45b: tui-seed — .claude.json written mode 600, markers present, projects stripped, dirs mode 700', async () => {
+    await _resetSandboxMgr();
+    globalThis.__OLP_FORCE_ISOLATION_IN_TEST = true;
+
+    // Write a fixture .claude.json to a temp dir (never touches real ~/.claude.json).
+    const fixtureDir = _mkdtemp45(_join45(_tmpdir45(), 'olp-pr0-fixture-'));
+    const fixtureSeedPath = _join45(fixtureDir, 'fixture-claude.json');
+    const fixtureSource = {
+      oauthAccount: { emailAddress: 'test@example.com', organizationUuid: 'org-uuid-fake' },
+      userID: 'user-id-fake',
+      projects: { '/some/real/project': { hasTrustDialogAccepted: true } },
+      someOtherField: 'keep-me',
+    };
+    _wfs45(fixtureSeedPath, JSON.stringify(fixtureSource), 'utf8');
+
+    const provider = _mockAnthropicProvider();
+    let ctx;
+    try {
+      ctx = await prepareIsolatedEnvironment({
+        provider,
+        keyId: 'test-key-45b',
+        reqId: 'test-req-45b',
+        tui: true,
+        tuiSeedSource: fixtureSeedPath,
+      });
+
+      // .claude.json must exist
+      const claudeJsonPath = _join45(ctx.ephemeralRoot, '.claude.json');
+      assert.equal(_exists45(claudeJsonPath), true,
+        '.claude.json must be present when tui:true');
+
+      // mode 600
+      const seedMode = _statSync45(claudeJsonPath).mode & 0o777;
+      assert.equal(seedMode, 0o600,
+        `.claude.json must have mode 0o600; got ${seedMode.toString(8)}`);
+
+      // Parse and check content
+      const seedContent = JSON.parse(_rfs45(claudeJsonPath, 'utf8'));
+      assert.equal(seedContent.hasCompletedOnboarding, true,
+        'hasCompletedOnboarding must be true');
+      assert.equal(seedContent.bypassPermissionsModeAccepted, true,
+        'bypassPermissionsModeAccepted must be true');
+      assert.equal('projects' in seedContent, false,
+        'projects must NOT be present in the seed (stripped to avoid leaking owner history)');
+      assert.deepEqual(seedContent.oauthAccount, fixtureSource.oauthAccount,
+        'oauthAccount must be copied from source');
+      assert.equal(seedContent.userID, fixtureSource.userID,
+        'userID must be copied from source');
+      assert.equal(seedContent.someOtherField, 'keep-me',
+        'other fields must be preserved');
+
+      // Negative assertion: no MCP-disable fields (T6 negative control)
+      assert.equal('claudeAiMcpEverConnected' in seedContent, false,
+        'seed must NOT contain claudeAiMcpEverConnected (MCP disable is spawn-argv, not seed)');
+      assert.equal('mcpServers' in seedContent, false,
+        'seed must NOT contain mcpServers');
+
+      // reqId present
+      assert.ok('reqId' in ctx, 'reqId must be present');
+      assert.equal(ctx.reqId, 'test-req-45b', 'reqId must match the sanitized input');
+
+      // <reqId> dir and ephemeralRoot must be mode 700 (§5.5)
+      const reqIdDir = _join45('/tmp/olp-spawn', 'test-key-45b', 'test-req-45b');
+      const reqIdMode = _statSync45(reqIdDir).mode & 0o777;
+      assert.equal(reqIdMode, 0o700,
+        `<reqId> dir must have mode 0o700; got ${reqIdMode.toString(8)}`);
+      const rootMode = _statSync45(ctx.ephemeralRoot).mode & 0o777;
+      assert.equal(rootMode, 0o700,
+        `ephemeralRoot must have mode 0o700; got ${rootMode.toString(8)}`);
+
+      await ctx.cleanup();
+    } finally {
+      delete globalThis.__OLP_FORCE_ISOLATION_IN_TEST;
+      if (ctx?.cleanup) { try { await ctx.cleanup(); } catch { /* already cleaned */ } }
+      try { _rmSync45(fixtureDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      await _resetSandboxMgr();
+    }
+  });
+
+  // ── T-c: missing-source ──────────────────────────────────────────────────
+  // With tui:true and a non-existent tuiSeedSource, _seedTuiClaudeJson should
+  // write a minimal seed (markers only, no oauthAccount) and NOT throw.
+
+  it('45c: missing-source — minimal seed written when tuiSeedSource does not exist', async () => {
+    await _resetSandboxMgr();
+    globalThis.__OLP_FORCE_ISOLATION_IN_TEST = true;
+
+    const provider = _mockAnthropicProvider();
+    const nonExistentSource = _join45(_tmpdir45(), 'olp-pr0-nonexistent-' + Date.now() + '.json');
+    let ctx;
+    try {
+      // Must not throw even though source is absent
+      ctx = await prepareIsolatedEnvironment({
+        provider,
+        keyId: 'test-key-45c',
+        reqId: 'test-req-45c',
+        tui: true,
+        tuiSeedSource: nonExistentSource,
+      });
+
+      const claudeJsonPath = _join45(ctx.ephemeralRoot, '.claude.json');
+      assert.equal(_exists45(claudeJsonPath), true,
+        'minimal seed must be written even when source is absent');
+
+      const seedContent = JSON.parse(_rfs45(claudeJsonPath, 'utf8'));
+      assert.equal(seedContent.hasCompletedOnboarding, true,
+        'minimal seed must have hasCompletedOnboarding:true');
+      assert.equal(seedContent.bypassPermissionsModeAccepted, true,
+        'minimal seed must have bypassPermissionsModeAccepted:true');
+      assert.equal('oauthAccount' in seedContent, false,
+        'minimal seed must NOT have oauthAccount (source was absent)');
+
+      await ctx.cleanup();
+    } finally {
+      delete globalThis.__OLP_FORCE_ISOLATION_IN_TEST;
+      if (ctx?.cleanup) { try { await ctx.cleanup(); } catch { /* already cleaned */ } }
+      await _resetSandboxMgr();
+    }
+  });
+});

@@ -18318,3 +18318,253 @@ describe('Suite 44 — sandbox Layer 3 E2E test (PI231 only) [SKIP: awaiting Tas
     assert.ok(true, 'placeholder — real test lands in Task #9');
   });
 });
+
+// ── Suite 45 — P1 daemon-crash hardening (fix/olp-p1-crash-hardening) ────
+//
+// Two groups of tests:
+//   45a–45c  Task A: stdin EPIPE guard in provider plugins
+//   45d–45f  Task B: process-level crash handlers in server.mjs
+//
+// Authority citations (Task A):
+//   claude CLI v2.1.104 observed behaviour — fast-failing spawn closes stdin
+//   before OLP finishes writing; Node stdin Writable surfaces EPIPE.
+//   Port of OCP server.mjs:780.
+//   ALIGNMENT.md Rule 2: no CLI operation changed; guard is a Node stream
+//   safety net only.
+//
+// Authority citations (Task B):
+//   OpenAI Chat Completions entry-surface contract unchanged
+//   (https://platform.openai.com/docs/api-reference/chat); happy-path
+//   /v1/chat/completions is unaffected.
+//   Port of OCP server.mjs:2134-2146.
+
+describe('Suite 45 — P1 daemon-crash hardening: stdin EPIPE guard + process crash handlers', () => {
+
+  // ── 45a: anthropic.mjs stdin EPIPE guard ──────────────────────────────
+  // Injects a mock spawn where proc.stdin is an EventEmitter that emits an
+  // EPIPE error immediately after the spawn call. Asserts the guard catches
+  // the error (console.error called with 'stdin_write_error'), the generator
+  // exits cleanly, and no unhandled exception is thrown.
+  it('45a: anthropic stdin-error guard catches EPIPE and logs stdin_write_error without throwing', async () => {
+    const errors = [];
+    const origConsoleError = console.error;
+    console.error = (...args) => errors.push(args.join(' '));
+
+    // Build a mock spawn where stdin is an EventEmitter that fires EPIPE
+    // synchronously after the outer function returns (via setImmediate).
+    // The generator will call proc.stdin.on('error', handler) before write/end,
+    // so the handler is installed when the error event fires.
+    const stdinEE = new EventEmitter();
+    stdinEE.write = () => {};
+    stdinEE.end = () => {
+      // Simulate: child closes stdin immediately (auth error, bad model, etc.)
+      setImmediate(() => stdinEE.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })));
+    };
+
+    let spawnCalled = false;
+    const mockSpawn = (_bin, _args, _opts) => {
+      spawnCalled = true;
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = stdinEE;
+      proc.killed = false;
+      proc.kill = () => {};
+      // Close the process cleanly so the generator can finish
+      stdinEE.end = () => {
+        setImmediate(() => {
+          stdinEE.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+          proc.stdout.emit('end');
+          proc.stderr.emit('end');
+          proc.emit('close', 1, null);
+        });
+      };
+      return proc;
+    };
+
+    __setSpawnImpl(mockSpawn);
+    try {
+      const ir = {
+        irVersion: 1,
+        model: 'claude-sonnet-4-6',
+        stream: false,
+        messages: [{ role: 'user', content: 'hi' }],
+      };
+      // Consume the generator; it will hit EPIPE + throw ProviderError on exit 1.
+      // The EPIPE error must NOT propagate as unhandled — the guard absorbs it.
+      const gen = anthropic.spawn(ir, { accessToken: 'tok' }, null);
+      try {
+        // eslint-disable-next-line no-unused-vars
+        for await (const _chunk of gen) { /* drain */ }
+      } catch {
+        // Provider may throw ProviderError on exit code 1 — that is expected and OK.
+        // What must NOT happen is an unhandled EPIPE propagation.
+      }
+    } finally {
+      __resetSpawnImpl();
+      console.error = origConsoleError;
+    }
+
+    assert.ok(spawnCalled, 'mock spawn must have been called');
+    // At least one console.error call must contain 'stdin_write_error'
+    const stdinErrorLogs = errors.filter(e => e.includes('stdin_write_error'));
+    assert.ok(
+      stdinErrorLogs.length >= 1,
+      `Expected at least one log containing "stdin_write_error"; got: ${JSON.stringify(errors)}`,
+    );
+    // Verify the log is structured JSON with the expected fields
+    const parsed = JSON.parse(stdinErrorLogs[0]);
+    assert.equal(parsed.level, 'warn', 'log level must be warn');
+    assert.equal(parsed.event, 'stdin_write_error', 'log event must be stdin_write_error');
+    assert.ok(typeof parsed.error === 'string', 'log must include error string');
+  });
+
+  // ── 45b: codex.mjs stdin EPIPE guard ──────────────────────────────────
+  it('45b: codex stdin-error guard catches EPIPE and logs stdin_write_error without throwing', async () => {
+    const errors = [];
+    const origConsoleError = console.error;
+    console.error = (...args) => errors.push(args.join(' '));
+
+    const stdinEE = new EventEmitter();
+    stdinEE.write = () => {};
+
+    const mockSpawn = (_bin, _args, _opts) => {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = stdinEE;
+      proc.killed = false;
+      proc.kill = () => {};
+      stdinEE.end = () => {
+        setImmediate(() => {
+          stdinEE.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+          proc.stdout.emit('end');
+          proc.stderr.emit('end');
+          proc.emit('close', 1, null);
+        });
+      };
+      return proc;
+    };
+
+    codexSetSpawnImpl(mockSpawn);
+    try {
+      const ir = {
+        irVersion: 1,
+        model: 'codex-mini-latest',
+        stream: false,
+        // Multi-line prompt triggers useStdin=true path in codex.mjs
+        messages: [{ role: 'user', content: 'line1\nline2' }],
+      };
+      const gen = codex.spawn(ir, { accessToken: 'test-key' }, null);
+      try {
+        for await (const _chunk of gen) { /* drain */ }
+      } catch {
+        // ProviderError on exit 1 — expected; EPIPE must be absorbed by guard.
+      }
+    } finally {
+      codexResetSpawnImpl();
+      console.error = origConsoleError;
+    }
+
+    const stdinErrorLogs = errors.filter(e => e.includes('stdin_write_error'));
+    assert.ok(
+      stdinErrorLogs.length >= 1,
+      `Expected at least one log containing "stdin_write_error"; got: ${JSON.stringify(errors)}`,
+    );
+    const parsed = JSON.parse(stdinErrorLogs[0]);
+    assert.equal(parsed.level, 'warn');
+    assert.equal(parsed.event, 'stdin_write_error');
+    assert.ok(typeof parsed.error === 'string');
+  });
+
+  // ── 45c: mistral.mjs stdin EPIPE guard ────────────────────────────────
+  it('45c: mistral stdin-error guard catches EPIPE and logs stdin_write_error without throwing', async () => {
+    const errors = [];
+    const origConsoleError = console.error;
+    console.error = (...args) => errors.push(args.join(' '));
+
+    const stdinEE = new EventEmitter();
+    stdinEE.write = () => {};
+
+    const mockSpawn = (_bin, _args, _opts) => {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = stdinEE;
+      proc.killed = false;
+      proc.kill = () => {};
+      // mistral only calls proc.stdin.end() — trigger EPIPE on end
+      stdinEE.end = () => {
+        setImmediate(() => {
+          stdinEE.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+          proc.stdout.emit('end');
+          proc.stderr.emit('end');
+          proc.emit('close', 1, null);
+        });
+      };
+      return proc;
+    };
+
+    mistralSetSpawnImpl(mockSpawn);
+    try {
+      const ir = {
+        irVersion: 1,
+        model: 'mistral-medium-latest',
+        stream: false,
+        messages: [{ role: 'user', content: 'hi' }],
+      };
+      const gen = mistral.spawn(ir, { apiKey: 'test-key' }, null);
+      try {
+        for await (const _chunk of gen) { /* drain */ }
+      } catch {
+        // ProviderError on exit 1 — expected; EPIPE must be absorbed by guard.
+      }
+    } finally {
+      mistralResetSpawnImpl();
+      console.error = origConsoleError;
+    }
+
+    const stdinErrorLogs = errors.filter(e => e.includes('stdin_write_error'));
+    assert.ok(
+      stdinErrorLogs.length >= 1,
+      `Expected at least one log containing "stdin_write_error"; got: ${JSON.stringify(errors)}`,
+    );
+    const parsed = JSON.parse(stdinErrorLogs[0]);
+    assert.equal(parsed.level, 'warn');
+    assert.equal(parsed.event, 'stdin_write_error');
+    assert.ok(typeof parsed.error === 'string');
+  });
+
+  // ── 45d: process-level unhandledRejection handler is registered ────────
+  it('45d: process.on(unhandledRejection) handler is registered (at least 1 listener)', () => {
+    // The handler is registered at server.mjs module load time (import-time side
+    // effect). Since server.mjs is already imported at the top of this test file
+    // (via createOlpServer), the listener must already be present.
+    const count = process.listenerCount('unhandledRejection');
+    assert.ok(
+      count >= 1,
+      `Expected at least 1 unhandledRejection listener; got ${count}`,
+    );
+  });
+
+  // ── 45e: process-level uncaughtException handler is registered ─────────
+  it('45e: process.on(uncaughtException) handler is registered (at least 1 listener)', () => {
+    const count = process.listenerCount('uncaughtException');
+    assert.ok(
+      count >= 1,
+      `Expected at least 1 uncaughtException listener; got ${count}`,
+    );
+  });
+
+  // ── 45f: server created by createOlpServer() has a clientError listener ──
+  it('45f: server returned by createOlpServer() has a clientError listener', async () => {
+    const { createOlpServer: createSrv45 } = await import('./server.mjs');
+    const srv = createSrv45();
+    const count = srv.listenerCount('clientError');
+    srv.close();
+    assert.ok(
+      count >= 1,
+      `Expected at least 1 clientError listener on server; got ${count}`,
+    );
+  });
+});

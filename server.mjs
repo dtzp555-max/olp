@@ -2383,6 +2383,23 @@ async function router(req, res) {
   }
 }
 
+// ── Process-level crash handlers ─────────────────────────────────────────
+// Prevent unhandled async rejections and synchronous exceptions from crashing
+// the daemon. Registered once at module level so they are installed before
+// the first request arrives. These are no-ops on the happy path.
+// Port of OCP server.mjs:2134-2146.
+// Authority: OpenAI Chat Completions entry-surface contract unchanged
+//   (https://platform.openai.com/docs/api-reference/chat); happy-path
+//   /v1/chat/completions is unaffected — these handlers only fire on
+//   low-level TCP/parse errors or unhandled promises outside the request cycle.
+// Note: process.exit is intentionally NOT called — log only, daemon stays alive.
+process.on('unhandledRejection', (reason) =>
+  logEvent('error', 'unhandled_rejection', { reason: String(reason) })
+);
+process.on('uncaughtException', (err) =>
+  logEvent('error', 'uncaught_exception', { error: err && err.message, stack: err && err.stack })
+);
+
 // ── Server factory + main guard ───────────────────────────────────────────
 //
 // Factory pattern: `createOlpServer()` returns an http.Server bound to the
@@ -2392,7 +2409,15 @@ async function router(req, res) {
 // import-time side effects when tests pull in server.mjs.
 
 export function createOlpServer() {
-  return createServer(router);
+  const srv = createServer(router);
+  // Destroy the socket on low-level HTTP parse errors (client abort mid-upload,
+  // malformed HTTP header, etc.) so broken connections don't crash the daemon.
+  // Port of OCP server.mjs:2144-2146.
+  // Authority: OpenAI Chat Completions entry-surface contract unchanged
+  //   (https://platform.openai.com/docs/api-reference/chat); happy-path /v1/chat/completions
+  //   is unaffected — clientError only fires on pre-request TCP-level failures.
+  srv.on('clientError', (err, socket) => { try { socket.destroy(); } catch {} });
+  return srv;
 }
 
 export { router, loadedProviders, VERSION };

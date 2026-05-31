@@ -4,7 +4,20 @@ All notable changes to OLP land here. Per `CLAUDE.md` release_kit overlay, this 
 
 ## Unreleased
 
-(no in-flight changes)
+### P1 daemon-crash hardening (fix/olp-p1-crash-hardening)
+
+- **fix(providers): guard stdin EPIPE on fast-failing CLI spawn** — added
+  `proc.stdin.on('error', ...)` guard in `lib/providers/anthropic.mjs`,
+  `lib/providers/codex.mjs`, and `lib/providers/mistral.mjs` before any
+  `stdin.write()` / `stdin.end()` call. Prevents a fast-failing CLI (auth
+  error, bad model, oversized prompt) from crashing the daemon via an
+  unhandled EPIPE on the Node stdin Writable. Port of OCP server.mjs:780.
+
+- **fix(server): process-level crash handlers unhandledRejection / uncaughtException / clientError** —
+  registered `process.on('unhandledRejection', ...)`,
+  `process.on('uncaughtException', ...)`, and `server.on('clientError', ...)`
+  at module level. The daemon logs the event and stays alive; `process.exit`
+  is intentionally not called. Port of OCP server.mjs:2134-2146.
 
 ## v0.7.0 — 2026-05-29 — Phase 7 close: Solution 1 isolation + opus 4.8
 

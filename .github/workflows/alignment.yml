@@ -7,16 +7,12 @@ name: Alignment Guardrail
 # fail" jobs below did not actually stop anything. Every job here is a grep or a JSON check over the
 # tree or the PR's commits (seconds), so running it on a docs-only PR costs nothing and lets them be
 # required. Do not re-add `paths:` under pull_request without also removing these jobs from the
-# required checks. (The push trigger below is not a PR check and keeps its filter.)
+# required checks. The push trigger is unfiltered too: cc-ruleset treats ANY `paths:` key in this
+# `on:` block as "runs on some PRs only" and will not require the jobs while one is present.
 on:
   pull_request:
   push:
     branches: [main]
-    paths:
-      - 'server.mjs'
-      - 'lib/**'
-      - 'models-registry.json'
-      - '.github/workflows/alignment.yml'
 
 jobs:
   blacklist:

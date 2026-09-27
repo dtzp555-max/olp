@@ -1,12 +1,15 @@
 name: Alignment Guardrail
 
+# pull_request runs on EVERY PR, deliberately (2026-09-27). It used to be path-filtered, which left two
+# choices and both were bad. Had these jobs been REQUIRED, a PR touching none of the paths would wait
+# forever for a check that never reports: blocked, not failed. So the branch ruleset did NOT require
+# them, and a check that is not required does not block a merge even when it fails -- so the "hard
+# fail" jobs below did not actually stop anything. Every job here is a grep or a JSON check over the
+# tree or the PR's commits (seconds), so running it on a docs-only PR costs nothing and lets them be
+# required. Do not re-add `paths:` under pull_request without also removing these jobs from the
+# required checks. (The push trigger below is not a PR check and keeps its filter.)
 on:
   pull_request:
-    paths:
-      - 'server.mjs'
-      - 'lib/**'
-      - 'models-registry.json'
-      - '.github/workflows/alignment.yml'
   push:
     branches: [main]
     paths:
